@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "slopkeeper"
-version = "0.2.3"
+version = "0.2.4"
 description = "Someone has to clean up after your agents. Inventory, plan, human gate, all-or-nothing apply with undo: the agent classifies, the human approves, and nothing is ever deleted."
 readme = "README.md"
 requires-python = ">=3.11"
