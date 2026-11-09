@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: 2026 Greg Brandt <brandt.greg@gmail.com>
+#
+# SPDX-License-Identifier: MIT
+
+*.egg-info
+build/
+tmp/
+__pycache__/
+dist/
+.coverage
+htmlcov/
+.ruff_cache/
+.venv/
+docs/site/site/

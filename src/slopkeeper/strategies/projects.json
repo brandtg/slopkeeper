@@ -1,0 +1,25 @@
+{
+  "id": "projects",
+  "name": "Projects",
+  "summary": "Partition by active deliverable or codebase. Use when most content belongs to a discrete piece of work with a lifecycle.",
+  "when_to_use": [
+    "There are repos, builds, demos, or client engagements in the corpus.",
+    "Each cluster has its own tooling (scripts, configs, vendored deps).",
+    "The owner speaks in project names."
+  ],
+  "partitioning_rubric": [
+    "A project folder is self-contained: its scripts, data, and notes move together. Never split a project's internal structure.",
+    "Detect project-ness by signals: README, package/pyproject files, .git dirs, scripts/ layout. Respect the project's internal layout — move it whole.",
+    "Active projects get STATE.md; finished ones become kind=archive with a README saying so.",
+    "Shared utilities used by 2+ projects stay at top level (scripts/, data/) or get promoted to their own project."
+  ],
+  "folder_template": {
+    "kind": "project",
+    "state_md": true,
+    "agents_md_skeleton": "# <Project>\n\n## What this is\n<one paragraph>\n\n## How to work on it\n- <build/test/run commands if any>\n\n## STATE.md\nTrack current status and next moves here."
+  },
+  "example": {
+    "lead-gen": "keyless CPG lead-gen pipeline, orchestrator + importers",
+    "yolo-world-cpu-demo": "ONNX export demo for CPU inference"
+  }
+}

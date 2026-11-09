@@ -1,0 +1,57 @@
+#!/usr/bin/env python3
+
+# SPDX-FileCopyrightText: 2026 Greg Brandt <brandt.greg@gmail.com>
+#
+# SPDX-License-Identifier: MIT
+
+"""Check built wheel metadata: entry point, requires-python, no runtime deps.
+
+Run from the repo root after `uv build`. Exits non-zero on any violation.
+"""
+
+from __future__ import annotations
+
+import email
+import glob
+import sys
+import zipfile
+
+EXPECTED_REQUIRES_PYTHON = ">=3.11"
+EXPECTED_ENTRY_POINT = "slopkeeper = slopkeeper.cli:main"
+
+
+def fail(msg: str) -> int:
+    print(f"metadata check FAILED: {msg}", file=sys.stderr)
+    return 1
+
+
+def main() -> int:
+    wheels = sorted(glob.glob("dist/*.whl"))
+    if not wheels:
+        return fail("no wheel found in dist/ (run `uv build` first)")
+    wheel = wheels[0]
+
+    with zipfile.ZipFile(wheel) as z:
+        names = z.namelist()
+        metadata_names = [n for n in names if n.endswith(".dist-info/METADATA")]
+        if not metadata_names:
+            return fail("no .dist-info/METADATA in wheel")
+        md = email.message_from_bytes(z.read(metadata_names[0]))
+        entry_points = [n for n in names if n.endswith("entry_points.txt")]
+        if not entry_points:
+            return fail("missing entry_points.txt")
+        body = z.read(entry_points[0]).decode()
+
+    if md["Requires-Python"] != EXPECTED_REQUIRES_PYTHON:
+        return fail(f"Requires-Python is {md['Requires-Python']!r}, want {EXPECTED_REQUIRES_PYTHON!r}")
+    if md.get_all("Requires-Dist") not in (None, []):
+        return fail(f"runtime deps present: {md.get_all('Requires-Dist')}")
+    if EXPECTED_ENTRY_POINT not in body:
+        return fail(f"entry point {EXPECTED_ENTRY_POINT!r} not in entry_points.txt")
+
+    print("metadata OK:", md["Name"], md["Version"])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

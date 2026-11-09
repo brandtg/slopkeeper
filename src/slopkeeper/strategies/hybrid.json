@@ -1,0 +1,27 @@
+{
+  "id": "hybrid",
+  "name": "Hybrid (roles + topics + archive)",
+  "summary": "Default for mixed personal corpora: a few role-bots at top level, topic/case folders for reference material, archive/ for finished work. Use when no single strategy covers the corpus.",
+  "when_to_use": [
+    "The corpus mixes active work, reference piles, and finished projects.",
+    "The owner can't name a single organizing principle — most real corpora.",
+    "In doubt between two strategies."
+  ],
+  "partitioning_rubric": [
+    "Top level holds ONLY: role-bot folders (max 4), research/ (topics+cases), archive/, and shared scripts/data.",
+    "Classify every file by one question: is it ALIVE (someone will act on it again) or DEAD (finished, only for reference)? Alive goes to a bot or active project; dead goes to a topic folder or archive/.",
+    "Within research/, one folder per topic cluster; within archive/, one per finished effort, named by year-month if unknown.",
+    "The roster (root AGENTS.md) is mandatory in this strategy: one line per folder — name, kind, one-line role, state pointer.",
+    "When two folders both seem right, choose the one whose AGENTS.md scope statement the file would satisfy verbatim; if neither, add to unresolved."
+  ],
+  "folder_template": {
+    "kind": "bot",
+    "state_md": true,
+    "agents_md_skeleton": "# <Name>\n\n## Kind\n<bot|topic|case|project|archive>\n\n## Role / scope\n<one paragraph>\n\n## Boundaries\n- <what belongs elsewhere, and where>"
+  },
+  "example": {
+    "bots": "spark/, lead-gen/ — alive, recurring",
+    "research/market-reports": "dead reference pile, one topic",
+    "archive/wisy-leadgen": "superseded project"
+  }
+}
