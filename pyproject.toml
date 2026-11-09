@@ -1,0 +1,71 @@
+# SPDX-FileCopyrightText: 2026 Greg Brandt <brandt.greg@gmail.com>
+#
+# SPDX-License-Identifier: MIT
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slopkeeper"
+version = "0.2.3"
+description = "Someone has to clean up after your agents. Inventory, plan, human gate, all-or-nothing apply with undo: the agent classifies, the human approves, and nothing is ever deleted."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Greg Brandt" }]
+keywords = ["agent", "corpus", "organization", "cli"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Utilities",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/brandtg/slopkeeper"
+Repository = "https://github.com/brandtg/slopkeeper"
+Issues = "https://github.com/brandtg/slopkeeper/issues"
+
+[project.scripts]
+slopkeeper = "slopkeeper.cli:main"
+
+[dependency-groups]
+# Dev-only tooling. Zero-dep is a RUNTIME rule: these ride in via
+# `uv sync --group dev` and never touch the project's runtime dependencies.
+dev = [
+  "mkdocs-material>=9.5",
+  "pytest>=8.0.0",
+  "pytest-cov>=6.1.1",
+  "reuse>=5.0.2",
+  "ruff>=0.9.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+slopkeeper = ["strategies/*.json", "AGENT_GUIDE.md", "SKILL.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "bench: slow benchmark, excluded from the default suite (run tests/bench_reference_scan.py directly)",
+]
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+# Minimal gate: errors + pyflakes. Style policing is not the point;
+# undefined names and unused imports are. Dev-only: rides in the `dev`
+# dependency-group, never a runtime dependency.
+select = ["E", "F"]

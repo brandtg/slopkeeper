@@ -1,0 +1,26 @@
+{
+  "id": "topics",
+  "name": "Logical topics",
+  "summary": "Partition by subject matter. Use when the corpus is a pile of reference material about distinct subjects and nothing is 'running'.",
+  "when_to_use": [
+    "Files cluster cleanly by subject (prefixes, titles, citation webs).",
+    "Nothing has ongoing state — these are documents, not workspaces.",
+    "The owner says 'these dossiers/briefs/notes are a mess'."
+  ],
+  "partitioning_rubric": [
+    "Partition by subject; prefer few broad topics over many narrow ones.",
+    "Topic folders get AGENTS.md (scope: what belongs here, what does not) but NOT STATE.md — topics have no state.",
+    "Cite titles and heads, not just names, when classifying: an ambiguous filename with a clear head goes by the head.",
+    "Files with no signal (empty, scraps, binary with opaque names) go to 'unresolved', never guessed.",
+    "Keep top-level topic count <= 8."
+  ],
+  "folder_template": {
+    "kind": "topic",
+    "state_md": false,
+    "agents_md_skeleton": "# <Topic>\n\n## Scope\n<what belongs here>\n\n## Not in scope\n<where related things went instead>\n\n## Key files\n- <the 2-5 files a newcomer should read first>"
+  },
+  "example": {
+    "research/market-reports": "market share dossiers on acme and globex",
+    "research/2026-forecast": "industry forecasts, reports, projections data"
+  }
+}

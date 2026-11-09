@@ -1,0 +1,26 @@
+{
+ "id": "by-kind",
+ "name": "By kind",
+ "summary": "Mechanical baseline: sort every file by what it is. Use when nothing else has signal, or as the comparison point when choosing a layout (`slopkeeper propose`).",
+ "when_to_use": [
+  "The corpus is a shapeless dump with no project or topic structure at all.",
+  "You want the cheapest defensible layout before the owner weighs in.",
+  "You are comparing layouts and need the mechanical baseline's costs."
+ ],
+ "partitioning_rubric": [
+  "docs/ takes markdown, text, PDFs, HTML and office documents.",
+  "data/ takes structured formats: JSON, YAML, TOML, CSV, logs, SQL.",
+  "scripts/ takes code; media/ takes images, audio, video and archives.",
+  "Files with no recognizable kind go to misc/ and are listed as unresolved.",
+  "This layout flattens structure — subdirectories do not survive it. Prefer projects or hybrid whenever any signal exists; by-kind is the floor, not the goal."
+ ],
+ "folder_template": {
+  "kind": "topic",
+  "state_md": false,
+  "agents_md_skeleton": "# <Kind>\n\nEverything of this file kind, sorted mechanically. Reclassify by hand where the kind is wrong — the sort knows extensions, not meaning."
+ },
+ "example": {
+  "docs": "every markdown note, PDF and docx",
+  "scripts": "every .py, .sh and .ts file"
+ }
+}

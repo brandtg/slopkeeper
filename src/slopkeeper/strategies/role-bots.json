@@ -1,0 +1,26 @@
+{
+  "id": "role-bots",
+  "name": "Role-oriented bots",
+  "summary": "Each folder is a standing agent role with its own memory and outputs. Use when the owner works with agents across many sessions on overlapping concerns.",
+  "when_to_use": [
+    "The owner repeatedly starts chats that need the same standing context.",
+    "Work is ongoing (watchdogs, research desks, ops), not one-shot deliverables.",
+    "The owner says 'bot', 'team', 'agent', or 'persistent'."
+  ],
+  "partitioning_rubric": [
+    "Partition by WHO the worker is and what it is responsible for, not by subject.",
+    "Each role folder gets: AGENTS.md (role, conventions, pointers), STATE.md (current status, open questions, next moves), and an outputs/ or docs/ subfolder.",
+    "A role folder is a workplace, not a dump: if a file is a finished artifact with no ongoing role, it belongs in a case or archive folder, not a bot.",
+    "Cap the number of bot folders at ~6. More than that and the owner has a roster problem, not an organization problem."
+  ],
+  "folder_template": {
+    "kind": "bot",
+    "state_md": true,
+    "agents_md_skeleton": "# <Role name>\n\n## Purpose\n<one paragraph: what this worker owns>\n\n## Standing instructions\n- <conventions every session should follow>\n\n## Canonical files\n- STATE.md — current status; update it when work completes\n- outputs/ — finished artifacts\n\n## Boundaries\n- <what this role should NOT touch>",
+    "state_md_skeleton": "# STATE — <Role name>\n\nUpdated: <date>\n\n## Current status\n- \n\n## Open questions\n- \n\n## Next moves\n- "
+  },
+  "example": {
+    "research-desk": "long-running research: dossiers in docs/, STATE.md tracks open questions",
+    "ops-watchdog": "cron-fed monitoring: STATE.md holds current rack/incident model"
+  }
+}
