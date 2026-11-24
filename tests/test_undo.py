@@ -179,7 +179,7 @@ class TestPrune(TempCase):
 
 
 class TestManifestRefresh(TempCase):
-    """§5.4: `undo --execute` rewrites the manifest; dry-run never does."""
+    """`undo --execute` rewrites the manifest; dry-run never does."""
 
     def test_undo_execute_rewrites_manifest_unresolved_survive(self):
         plan_path = write_plan(

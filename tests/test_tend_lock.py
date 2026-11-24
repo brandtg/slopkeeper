@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: MIT
 
-"""§5.5 tending lock: concurrent tends serialize, readers stay free.
+"""Tending lock: concurrent tends serialize, readers stay free.
 
 The lock is simulated exactly the way a second agent would hold it:
 raw fcntl on `.slopkeeper/tend.lock` from the test process. Everything
@@ -199,7 +199,7 @@ class TestTendLock(TempCase):
 
     def test_missing_fcntl_fails_soft_and_executes(self):
         # Windows path: no fcntl in stdlib → proceed WITHOUT the lock,
-        # per §5.5 (zero-dep: no msvcrt fallback). sys.modules[None] is
+        # (zero-dep: no msvcrt fallback). sys.modules[None] is
         # the documented CPython way to make an import raise ImportError.
         plan_path = write_plan(self.root)
         sentry = sys.modules.get("fcntl")

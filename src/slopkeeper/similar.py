@@ -81,7 +81,7 @@ def vectors_from_tf(docs: dict[str, Counter]) -> dict[str, Counter]:
     set, then sublinear-tf * idf weighting per doc.
 
     Vectors are not per-doc functions — idf depends on every other doc —
-    so the vector cache (§5.3) stores raw per-doc tf only and this step
+    so the vector cache stores raw per-doc tf only and this step
     is recomputed over the full corpus at match time. Given the same
     docs, the result is exactly what build_vectors produces.
     """
@@ -105,7 +105,7 @@ def build_vectors(files: list[dict]) -> dict[str, Counter]:
     return vectors_from_tf(docs)
 
 
-# --- vector cache (DESIGN.md §5.3) ------------------------------------------
+# --- vector cache ------------------------------------------
 #
 # .slopkeeper/vectors.json maps relpath -> {sha256, tf} so a re-tend
 # vectorizes only new/changed files. The cache is DERIVED state: a
@@ -168,7 +168,7 @@ def write_vector_cache(
 def build_vectors_cached(
     files: list[dict], cache_docs: dict | None, sha_of
 ) -> tuple[dict[str, Counter], dict]:
-    """build_vectors with per-doc tf reuse keyed by content hash (§5.3).
+    """build_vectors with per-doc tf reuse keyed by content hash.
 
     `sha_of(rel)` supplies the hash to key on — the manifest@2 hash on
     the draft path, a fresh sha256_file on the clusters path. A None
@@ -319,13 +319,30 @@ def _content_hash(root: Path, rel: str) -> str | None:
         return None
 
 
+# Version-y name signals. mtime alone is a coin flip after rsync, git
+# checkout, or any sync tool that resets timestamps wholesale — an
+# intentional version pair says so in the name (report_final.docx vs
+# report_final.pdf), and that is the corroboration we require.
+_VERSIONISH_RE = re.compile(
+    r"(?:~|(?<![a-z])final(?![a-z])|(?<![a-z])copy(?![a-z])"
+    r"|(?<![a-z])backup(?![a-z])|(?<![a-z])bak(?![a-z])|(?<![a-z])old(?![a-z])"
+    r"|(?<![a-z])v\d+(?![a-z0-9]))",
+    re.IGNORECASE,
+)
+
+
 def stale_version_pairs(root: Path, paths: list[str]) -> list[dict]:
-    """Same stem, different content, older mtime → likely older version.
+    """Same stem, different content, older mtime, version-y name → pair.
 
     The field report's md5sum/mtime archaeology, as data: for each
     same-stem group whose hashes are NOT all equal, every file older
-    than the newest (and differing from it) is flagged. Identical
-    copies are identical_groups' business, not versions.
+    than the newest (and differing from it) is flagged — but only when
+    either basename carries a version signal (v\\d, final, copy,
+    backup/bak, old, trailing ~). Without it, a sync tool's wholesale
+    mtime reset manufactures "older versions" out of unrelated same-stem
+    files (the touch-reset false positive); mtime ranks, the name
+    agrees. Identical copies are identical_groups' business, not
+    versions.
     """
     out: list[dict] = []
     for group in same_stem_groups(paths):
@@ -343,13 +360,19 @@ def stale_version_pairs(root: Path, paths: list[str]) -> list[dict]:
             continue
         entries.sort(key=lambda e: (-e[2], e[0]))  # newest first
         newest_p, newest_h, _ = entries[0]
+        if not (
+            _VERSIONISH_RE.search(Path(newest_p).name)
+            or any(_VERSIONISH_RE.search(Path(p).name) for p, h, _m in entries[1:])
+        ):
+            continue  # nothing in the group claims to be a version
         for p, h, _mt in entries[1:]:
             if h != newest_h:
                 out.append(
                     {
                         "file": p,
                         "likely_newer": newest_p,
-                        "reason": "same stem, different content, older mtime",
+                        "reason": "same stem, different content, older mtime, "
+                        "version-y name",
                     }
                 )
     return sorted(out, key=lambda e: e["file"])
@@ -417,7 +440,7 @@ def hubs(refs: dict[str, list[str]], min_referrers: int = 3) -> list[dict]:
 def collect_similarity(root: Path, files: list[dict], with_dupes: bool = True) -> dict:
     """Full hint document for the clusters command.
 
-    Vectors reuse .slopkeeper/vectors.json keyed by content hash (§5.3)
+    Vectors reuse .slopkeeper/vectors.json keyed by content hash
     and write the refreshed cache back; output is identical with or
     without a warm cache.
     """
@@ -443,7 +466,13 @@ def collect_similarity(root: Path, files: list[dict], with_dupes: bool = True) -
         if str(Path(p).parent) == d
     }
     cluster_files = [f for f in files if f["path"] not in collapsed]
-    params = {"t1": DEFAULT_T1}
+    # The cached payload is per-doc tf — pure function of file CONTENT.
+    # t1/ratio affect matching only, never vectorization, so they are
+    # NOT part of the cache key (they were: `clusters` and
+    # `draft --min-sim X` alternated and full-missed each other every
+    # run). load_vector_cache still round-trips `params`, so any future
+    # parameter that DOES change tf invalidates mechanically.
+    params: dict = {}
     cache_docs = load_vector_cache(root, params)
     vecs, fresh = build_vectors_cached(
         cluster_files, cache_docs, lambda rel: sha256_file(root / rel)

@@ -61,14 +61,6 @@ license-check: ## Check that all files have REUSE license headers.
 build: ## Build the sdist + wheel into dist/.
 	uv build
 
-.PHONY: docs
-docs: ## Build the docs site strictly (mkdocs-material, dev-only).
-	uv run mkdocs build --strict -f docs/site/mkdocs.yml
-
-.PHONY: docs-serve
-docs-serve: ## Serve the docs site locally at http://localhost:8000.
-	uv run mkdocs serve -f docs/site/mkdocs.yml
-
 .PHONY: install
 install: ## Install the package into the active/default environment (plain pip).
 	$(PYTHON) -m pip install .
@@ -79,13 +71,18 @@ install-pipx: ## Install the package as a pipx tool (the `slopkeeper` binary on 
 
 .PHONY: dist-check
 dist-check: ## Build sdist+wheel, then verify BOTH install and run via plain pip + pipx on $(PYTHON).
+	rm -rf dist
 	uv build
 	set -e; \
 	venv=$$(mktemp -d)/venv; \
 	$(PYTHON) -m venv $$venv && \
 	$$venv/bin/pip install --quiet dist/*.whl && \
 	$$venv/bin/slopkeeper --version && \
-	$$venv/bin/slopkeeper strategies show hybrid >/dev/null && echo "wheel: strategies package-data OK"; \
+	$$venv/bin/slopkeeper strategies show hybrid >/dev/null && echo "wheel: strategies package-data OK" && \
+	$$venv/bin/slopkeeper guide >/dev/null && echo "wheel: guide artifact OK" && \
+	skills=$$(mktemp -d) && \
+	$$venv/bin/slopkeeper skill install $$skills >/dev/null && \
+	test -s $$skills/slopkeeper/SKILL.md && echo "wheel: packaged SKILL.md OK"; \
 	venv2=$$(mktemp -d)/venv; \
 	$(PYTHON) -m venv $$venv2 && \
 	$$venv2/bin/pip install --quiet dist/*.tar.gz && \

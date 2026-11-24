@@ -28,7 +28,7 @@ def _opencode_skills_dir() -> Path:
 
 
 # Well-known agents. Hermes nests skills under a category directory;
-# everything else is a flat skills dir (each README example, §Agent setup).
+# everything else is a flat skills dir (each README example).
 AGENT_SKILLS_DIRS: dict[str, callable] = {
     "claude": lambda: Path.home() / ".claude" / "skills",
     "opencode": _opencode_skills_dir,

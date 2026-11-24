@@ -249,7 +249,7 @@ class TestStatusGates(TempCase):
 
     def test_modified_detection_same_size_edit(self):
         # A real content edit with identical byte size must still be
-        # flagged: detection compares content hashes (§5.2), which
+        # flagged: detection compares content hashes, which
         # differ even when size and mtime were somehow identical.
         plan_path = write_plan(self.root)
         apply_plan(plan_path, self.root, execute=True)
@@ -259,7 +259,7 @@ class TestStatusGates(TempCase):
         self.assertIn("lead-gen/README.md", s["modified"])
 
 
-# --- manifest@2: content hashes, touch immunity, v1 refusal (§5.2) ---
+# --- manifest@2: content hashes, touch immunity, v1 refusal ---
 
 
 class TestManifestV2(TempCase):

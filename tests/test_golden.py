@@ -5,8 +5,8 @@
 """Golden files: committed snapshots of the two human-facing surfaces.
 
 render_markdown IS the human approval gate and the AGENTS.md/STATE.md pair
-is the layer the owner lives in — their shape is API (TEST_PLAN.md,
-"Golden files"). Any change to the rendered output fails here with a full
+is the layer the owner lives in — their shape is API. Any change to the
+rendered output fails here with a full
 multiline diff in the assert message; update the snapshots deliberately
 and review the diff:
 
@@ -177,8 +177,7 @@ class TestGoldenGuideDrift(unittest.TestCase):
             missing,
             set(),
             "codes raised in src/ but missing a row in AGENT_GUIDE.md's "
-            "'Error codes you will see' table (DESIGN §4.1): "
-            + ", ".join(sorted(missing)),
+            "'Error codes you will see' table: " + ", ".join(sorted(missing)),
         )
 
 

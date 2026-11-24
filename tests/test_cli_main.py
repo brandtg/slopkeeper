@@ -39,8 +39,8 @@ def run_main_raw(argv: list[str]) -> tuple[int, str]:
 
 class TestCliMainReadOnly(TempCase):
     def test_plan_schema(self):
-        # T6: the bare template artifact, not an envelope (DESIGN §2
-        # exception, plan render's markdown precedent).
+        # T6: the bare template artifact, not an envelope (markdown
+        # exception, plan render's precedent).
         code, out = run_main(["plan", "schema"])
         self.assertEqual(code, 0)
         self.assertEqual(out["schema"], "slopkeeper/plan@1")

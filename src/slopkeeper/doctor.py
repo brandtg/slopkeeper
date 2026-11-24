@@ -215,7 +215,7 @@ def doctor(root: Path) -> dict:
             "Not a git repo — run `git init && git add -A && git commit` "
             "first, or accept journal-only reversibility."
         )
-    # §6.6: make the invisible set visible — never a silent empty walk.
+    # Make the invisible set visible — never a silent empty walk.
     ig = load_ignore(root)
     if ig.active():
         advice.append(

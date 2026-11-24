@@ -29,7 +29,10 @@ def main() -> int:
     wheels = sorted(glob.glob("dist/*.whl"))
     if not wheels:
         return fail("no wheel found in dist/ (run `uv build` first)")
-    wheel = wheels[0]
+    # Newest, not first: dist/ is not cleaned between builds, and the
+    # lexicographic front is whatever ancient wheel a dev session left
+    # behind — checking it would certify the wrong artifact.
+    wheel = wheels[-1]
 
     with zipfile.ZipFile(wheel) as z:
         names = z.namelist()

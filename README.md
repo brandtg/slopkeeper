@@ -64,7 +64,7 @@ slopkeeper doctor ~/workspace                        # preflight: size, mess, st
 slopkeeper inventory ~/workspace --fast --summary    # what's there (token-conscious)
 slopkeeper draft ~/workspace                         # or: the agent authors plan.json itself
 slopkeeper plan validate plan.json ~/workspace
-slopkeeper plan render plan.json                     # the human gate — read this
+slopkeeper plan render plan.json ~/workspace          # the human gate — read this
 slopkeeper apply plan.json ~/workspace --execute     # all-or-nothing, journaled
 slopkeeper scaffold plan.json ~/workspace --execute  # writes AGENTS.md/STATE.md
 ```
@@ -99,6 +99,10 @@ The commands:
   a plan. `--out` lands the full payload in a file, counts on stdout.
 - **refs** — every site that cites a given filename; the
   grep-before-move check behind reference integrity.
+- **propose** — the layout fork as data: mechanical candidate partitions
+  (by-project, by-kind, hybrid), each priced with move counts,
+  citation-break counts, and unresolved estimates. Read-only; the agent
+  compares, then authors the real plan.
 - **status** — diff since the last tend (manifest in `.slopkeeper/`):
   new/modified/removed files, folder health, still-unresolved items.
   `--all` returns one count-level digest over every registered root.
@@ -116,15 +120,23 @@ The commands:
   corpus whose fingerprint changed since planning; pre-flights every
   destination before touching anything; journals every move with a
   content hash; flags every move cited from stay-put files.
+- **move** — one bulk move (src dst root): builds the one-move plan,
+  runs it through the same validate → gate → journal machinery, and
+  renders the human gate. Dry-run by default; `--execute` runs it.
 - **scaffold** — writes the folder-bot layer: root `AGENTS.md` roster,
   per-folder `AGENTS.md` and `STATE.md`. Never overwrites — existing
   files get a `*.slopkeeper-suggested` sibling instead.
 - **undo** — reverses a journal exactly (restores, prunes empty dirs).
   Takes one journal; name it (see `.slopkeeper/journal-*.jsonl`).
 - **strategies** — partitioning rubric packs the agent reads: `role-bots`
-  (folder-as-bot), `topics`, `projects`, `hybrid` (default).
+  (folder-as-bot), `topics`, `projects`, `by-kind` (mechanical baseline),
+  `hybrid` (default).
 - **guide** — prints the full agent protocol (also readable via the
-  installed skill, AGENT_GUIDE.md, and the docs site).
+  installed skill and AGENT_GUIDE.md, shipped in the wheel).
+- **skill** — `skill install <agent|dir>` copies the packaged SKILL.md
+  into an agent's skills directory (`claude`, `opencode`, `hermes`, or a
+  path); existing files are left alone unless `--force`. The one-time
+  setup that teaches your agent the protocol.
 
 ### The REPL (bare `slopkeeper`)
 
@@ -199,10 +211,9 @@ The canonical gate — lint, tests, license headers; what CI runs:
 make check
 ```
 
-Design docs live under docs/ (DESIGN.md, GARDEN.md, TEST_PLAN.md), the
-published site under docs/site/, and the agent protocol in
-AGENT_GUIDE.md — shipped in the wheel and printable via `slopkeeper
-guide`.
+The agent protocol lives in AGENT_GUIDE.md — shipped in the wheel and
+printable via `slopkeeper guide`. Design rationale lives in module
+docstrings and comments; audit reports land under docs/.
 
 ## License
 

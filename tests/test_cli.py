@@ -4,10 +4,10 @@
 
 """cli.py — exit codes, envelope shape, --out (subprocess).
 
-Subprocess-level CLI cases per TEST_PLAN.md's cli section.
+Subprocess-level cases against the documented CLI contract.
 """
 
-# --- subprocess-level CLI contract (TEST_PLAN "cli.py (currently 0%)") ---
+# --- subprocess-level CLI contract ---
 import json
 import os
 import subprocess
@@ -153,7 +153,7 @@ class TestCLI(TempCase):
     def test_plan_schema_prints_bare_template(self):
         # T6: `slopkeeper plan schema > plan.json` must yield a plan skeleton —
         # the bare template JSON, NOT an envelope around it (the envelope
-        # form failed plan_bad_schema; DESIGN §2 documents the exception
+        # form failed plan_bad_schema; the guide documents the exception
         # on plan render's markdown precedent).
         r = run_cli("plan", "schema")
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -908,9 +908,10 @@ class TestMoveCommand(TempCase):
     def test_move_refuses_existing_destination(self):
         write(self.root / "taken.md", "# taken\n")
         r = run_cli("move", "acme_dossier.md", "taken.md", str(self.root), "--execute")
-        self.assertEqual(r.returncode, 1, r.stdout)
+        # plan_dst_exists is a plan_* code → the validation exit (2).
+        self.assertEqual(r.returncode, 2, r.stdout)
         out = json.loads(r.stdout)
-        self.assertEqual(out["error"]["code"], "dst_exists")
+        self.assertEqual(out["error"]["code"], "plan_dst_exists")
         self.assertTrue((self.root / "acme_dossier.md").exists())
 
 

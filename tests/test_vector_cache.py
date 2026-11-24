@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: MIT
 
-"""vectors.json cache (DESIGN.md §5.3) — the re-tend loop stops
+"""vectors.json cache — the re-tend loop stops
 re-vectorizing the whole catalog.
 
 The cache is load-bearing: a corrupted-but-dict-shaped tf entry must be
@@ -105,7 +105,10 @@ class TestDraftVectorCache(TempCase):
         cache = read_cache(self.root)
         self.assertEqual(cache["schema"], VECTOR_CACHE_SCHEMA)
         datetime.fromisoformat(cache["built_at"])
-        self.assertEqual(cache["params"], {"t1": 0.25})
+        # Content-keyed: tf is a pure function of file bytes (+ the
+        # per-command title/head), so NO tuning parameter keys the
+        # cache. The params field still round-trips for future use.
+        self.assertEqual(cache["params"], {})
         self.assertEqual(set(cache["docs"]), FILED)
         manifest = json.loads((self.root / ".slopkeeper" / "manifest.json").read_text())
         entry = cache["docs"][EDITED]
@@ -165,18 +168,46 @@ class TestDraftVectorCache(TempCase):
         self.assertEqual(cache["docs"][EDITED]["sha256"], new_sha)
         self.assertEqual(cache["docs"][EDITED]["tf"].get("setlist"), 1)
 
-    def test_params_change_invalidates_whole_cache(self):
+    def test_min_sim_is_not_a_cache_key(self):
+        # B8: t1 tunes MATCHING, never vectorization. Drafting the same
+        # corpus twice with different thresholds must reuse the cache
+        # (before: alternating DEFAULT_T1 values full-missed and rewrote
+        # vectors.json every single run).
         self._tend_and_slop()
         draft(self.root)
-        self.assertEqual(read_cache(self.root)["params"], {"t1": 0.25})
+        self.assertEqual(read_cache(self.root)["params"], {})
 
         recorded = []
         with tf_spy(recorded), mock.patch.object(draft_module, "DEFAULT_T1", 0.4):
             draft(self.root)
-        # A different t1 is a WHOLE-cache miss: every filed file is
-        # re-vectorized (never a mixed-parameter match).
-        self.assertEqual(set(recorded), FILED | SLOP)
-        self.assertEqual(read_cache(self.root)["params"], {"t1": 0.4})
+        # Only the always-fresh slop is tokenized; every filed entry
+        # was REUSED despite the threshold change.
+        self.assertEqual(set(recorded), SLOP)
+        self.assertEqual(read_cache(self.root)["params"], {})
+
+    def test_params_mismatch_still_invalidates_the_mechanism(self):
+        # The mechanism load_vector_cache compares on stays strict:
+        # a cache stored under different params is a full miss, never a
+        # mixed-parameter match. Nothing in the tool writes non-{}
+        # params today — this guards the day something does.
+        self._tend_and_slop()
+        draft(self.root)
+        from slopkeeper.similar import load_vector_cache, write_vector_cache
+
+        self.assertIsNone(load_vector_cache(self.root, {"t1": 0.25}))
+        self.assertIsNotNone(load_vector_cache(self.root, {}))
+        # A foreign-params cache, once written, is invisible to {} readers.
+        write_vector_cache(
+            self.root,
+            {"tf_algo": "v2"},
+            None,
+            {"x.md": {"sha256": "aa", "tf": {"x": 1}}},
+        )
+        self.assertIsNone(load_vector_cache(self.root, {}))
+        self.assertEqual(
+            load_vector_cache(self.root, {"tf_algo": "v2"}),
+            {"x.md": {"sha256": "aa", "tf": {"x": 1}}},
+        )
 
     def test_deleted_cache_is_a_full_miss_with_identical_results(self):
         self._tend_and_slop()
@@ -238,6 +269,7 @@ class TestClustersVectorCache(TempCase):
         docs = self._docs()
         self.assertFalse(cache_path(self.root).exists())
         cold = collect_similarity(self.root, docs)  # writes the cache
+        self.assertEqual(read_cache(self.root)["params"], {})  # content-keyed
         self.assertTrue(cache_path(self.root).exists())
         self.assertEqual(collect_similarity(self.root, docs), cold)
         os.unlink(cache_path(self.root))

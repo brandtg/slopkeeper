@@ -101,7 +101,9 @@ class TestApply(TempCase):
         (self.root / "archive" / "scraps" / "ledger_wb.html").write_text("x")
         plan_path = write_plan(self.root)  # fingerprint computed AFTER mutation
         expect_code(
-            self, lambda: apply_plan(plan_path, self.root, execute=True), "dst_exists"
+            self,
+            lambda: apply_plan(plan_path, self.root, execute=True),
+            "plan_dst_exists",
         )
         # nothing moved (all-or-nothing pre-flight)
         self.assertTrue((self.root / "acme_dossier.md").exists())
@@ -297,7 +299,7 @@ class TestForceGate(TempCase):
 
 
 class TestContentHashGate(TempCase):
-    """§5.2: staleness is content-based, not timestamp-based."""
+    """Staleness is content-based, not timestamp-based."""
 
     def test_touch_does_not_invalidate_plan(self):
         # Flipped pin (was: touch → corpus_changed). A bare mtime bump
@@ -1681,34 +1683,46 @@ class TestPhase16MergeMoves(TempCase):
             "merge_collision",
         )
 
-    def test_existing_dst_dir_is_dst_exists(self):
+    def test_existing_dst_dir_is_plan_dst_exists(self):
         # A destination that exists on disk before the plan is the
-        # dst_exists pre-flight's business — never a merge, never a
-        # nest (validate passes it; apply refuses before any move).
+        # plan_dst_exists pre-flight's business — never a merge, never
+        # a nest. A8 made it a SHARED gate: validate refuses too (the
+        # human gate cannot bless what apply would refuse), and apply
+        # re-checks on disk under the tend lock.
         write(self.root / "b/inner.md", "existing\n")
         plan_path = self._merge_plan()
-        validate_plan(load_plan(plan_path), self.root)
+        expect_code(
+            self,
+            lambda: validate_plan(load_plan(plan_path), self.root),
+            "plan_dst_exists",
+        )
         expect_code(
             self,
             lambda: apply_plan(plan_path, self.root, execute=True),
-            "dst_exists",
+            "plan_dst_exists",
         )
 
     def test_merge_into_existing_dir_still_refused(self):
         # A destination that exists BEFORE the plan is a plain
-        # dst_exists collision (never a merge, never a nest) — refused
-        # before any move, in the dry run too.
+        # plan_dst_exists collision (never a merge, never a nest) —
+        # refused before any move, in the dry run too, and now at
+        # validate as well.
         write(self.root / "b/existing.md", "# b\n")
         plan_path = self._merge_plan()
         expect_code(
             self,
+            lambda: validate_plan(load_plan(plan_path), self.root),
+            "plan_dst_exists",
+        )
+        expect_code(
+            self,
             lambda: apply_plan(plan_path, self.root),
-            "dst_exists",
+            "plan_dst_exists",
         )
         expect_code(
             self,
             lambda: apply_plan(plan_path, self.root, execute=True),
-            "dst_exists",
+            "plan_dst_exists",
         )
 
 

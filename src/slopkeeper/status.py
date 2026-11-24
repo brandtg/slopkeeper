@@ -91,7 +91,7 @@ def write_manifest(
     """Snapshot the corpus. Called by `apply --execute`, `status --record`,
     scaffold --execute, and undo.
 
-    §5.6: plan_sha256 binds the manifest to the exact plan bytes that
+    plan_sha256 binds the manifest to the exact plan bytes that
     were executed (None when the snapshot comes from status --record,
     scaffold, or an undo — no plan involved there).
 
@@ -162,7 +162,7 @@ def write_manifest(
 def _walk_now(root: Path) -> dict[str, tuple[int, int, str | None]]:
     """Current disk state per file: [size, mtime_ns, sha256_or_null].
 
-    The hash slot mirrors the manifest (§5.2): null for files past
+    The hash slot mirrors the manifest: null for files past
     sha256_file's 64 MiB cap, which then compare on size+mtime only.
     """
     out: dict[str, tuple[int, int, str | None]] = {}
@@ -183,7 +183,7 @@ def _walk_now(root: Path) -> dict[str, tuple[int, int, str | None]]:
 
 
 def _entry_changed(old: list, now: tuple) -> bool:
-    """Manifest-vs-disk staleness for one path (§5.2).
+    """Manifest-vs-disk staleness for one path.
 
     Entries are [size, mtime_ns, sha256_or_null]. When both sides carry
     a hash, the hash decides — so a bare `touch` is NOT modified and a
@@ -225,7 +225,7 @@ def _head_for(root: Path, rel: str) -> dict:
 
 
 def status(root: Path, record: bool = False) -> dict:
-    """Diff the corpus against the last tend (§5.5 tending lock).
+    """Diff the corpus against the last tend (tending lock).
 
     Plain reads take NO lock — status must stay safe beside a running
     tend. Only --record (a manifest write) acquires .slopkeeper/tend.lock.
@@ -334,7 +334,7 @@ def _status(root: Path, record: bool = False) -> dict:
     removed = sorted(old_keys - now_keys)
     modified = sorted(k for k in old_keys & now_keys if _entry_changed(old[k], now[k]))
 
-    # §6.6 honesty: a file that was tended and is now ignored neither
+    # Honesty: a file that was tended and is now ignored neither
     # vanished nor changed — the tool stopped looking at it. Report it
     # under removed_now_ignored instead of crying `removed`.
     ignore = load_ignore(root)

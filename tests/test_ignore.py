@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: MIT
 
-"""`.slopkeeperignore` — the per-corpus invisible set (DESIGN.md §6.6).
+"""`.slopkeeperignore` — the per-corpus invisible set.
 
 One rule everywhere: ignored = invisible. The matcher, the walk, the
 fingerprint, the validator and the tending loop are all pinned here.
@@ -97,7 +97,7 @@ class TestMatcher(unittest.TestCase):
         self.assertFalse(ig.is_ignored("# a comment"))
 
     def test_negation_is_not_supported_v1(self):
-        # Documented gap (DESIGN §6.6): a leading '!' is a literal
+        # Documented gap: a leading '!' is a literal
         # fnmatch character until a real corpus asks for negation.
         ig = CorpusIgnore(["!keep.log"])
         self.assertFalse(ig.is_ignored("keep.log"))

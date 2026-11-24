@@ -245,8 +245,8 @@ class TestPlanValidation(TempCase):
 
     def test_chain_hop_colliding_with_existing_final_dst_refused(self):
         # Atomicity: the chain's FINAL destination exists as an
-        # unrelated file — the pre-flight refuses (dst_exists) and the
-        # disk is untouched, byte for byte.
+        # unrelated file — the shared pre-flight refuses
+        # (plan_dst_exists) and the disk is untouched, byte for byte.
         write(self.root / "a.md", "A\n")
         write(self.root / "b.md", "B\n")
         write(self.root / "c.md", "unrelated\n")
@@ -261,11 +261,41 @@ class TestPlanValidation(TempCase):
         expect_code(
             self,
             lambda: apply_plan(plan_path, self.root, execute=True, allow_partial=True),
-            "dst_exists",
+            "plan_dst_exists",
         )
         self.assertEqual(
             prune_slopkeeper(snapshot_tree(self.root)), prune_slopkeeper(before)
         )
+
+    def test_dst_colliding_with_existing_file_refused_at_validate(self):
+        # A8: the destination pre-flight is SHARED (preflight_destinations),
+        # so `plan validate` refuses what `apply` refuses — the human
+        # gate can no longer bless a plan whose destination is occupied.
+        (self.root / "archive" / "scraps").mkdir(parents=True)
+        (self.root / "archive" / "scraps" / "ledger_wb.html").write_text("x")
+        plan_path = write_plan(self.root)
+        expect_code(
+            self,
+            lambda: validate_plan(load_plan(plan_path), self.root),
+            "plan_dst_exists",
+        )
+
+    def test_chain_hop_onto_created_path_still_validates(self):
+        # The shared pre-flight keeps the chain exemption: a final
+        # destination that no move is a source of must not exist — but
+        # intermediate hops (created by the plan itself) are legal.
+        write(self.root / "a.md", "A\n")
+        write(self.root / "b.md", "B\n")
+        plan_path = write_plan(
+            self.root,
+            partial=True,
+            moves=[
+                {"from": "a.md", "to": "b.md", "reason": "chain hop"},
+                {"from": "b.md", "to": "c/final.md", "reason": "chain end"},
+            ],
+        )
+        out = validate_plan(load_plan(plan_path), self.root)
+        self.assertEqual(len(out["moves"]), 2)
 
 
 class TestEdits(TempCase):
@@ -589,7 +619,7 @@ class TestPhase6DeadGlobGate(TempCase):
 
 
 class TestValidatorErrorCodes(TempCase):
-    """TEST_PLAN plan.py matrix rows marked missing."""
+    """plan.py validator rows that were previously untested."""
 
     def test_wrong_root_rejected(self):
         plan = load_plan(write_plan(self.root, corpus_root=str(self.tmp / "elsewhere")))
@@ -666,7 +696,7 @@ class TestValidatorErrorCodes(TempCase):
 
 
 class TestDocsMagicSkip(TempCase):
-    """The docs/ magic string is dead (DESIGN.md §6.1, settled).
+    """The docs/ magic string is dead (settled).
 
     An uncovered top-level docs/ fails plan_incomplete like any other
     entry; what the plan deliberately ignored is a recorded "skip".
@@ -679,7 +709,7 @@ class TestDocsMagicSkip(TempCase):
 
 
 class TestSkipField(TempCase):
-    """The plan-level skip list (DESIGN.md §6.1): "we never looked at
+    """The plan-level skip list: "we never looked at
     it" is a recorded decision, not a silent default."""
 
     def test_skip_satisfies_coverage(self):
@@ -697,7 +727,7 @@ class TestSkipField(TempCase):
     def test_skip_nested_path_rejected(self):
         # Names only: a skip is a top-level decision, not a path list.
         plan = load_plan(write_plan(self.root))
-        plan["skip"] = ["docs/site"]
+        plan["skip"] = ["docs/out"]
         expect_code(self, lambda: validate_plan(plan, self.root), "plan_bad_skip")
 
     def test_skip_non_list_rejected(self):

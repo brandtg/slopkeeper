@@ -39,7 +39,7 @@ def scaffold_from_plan(
     execute: bool = False,
     strategy_id: str | None = None,
 ) -> dict:
-    """Write the folder-bot layer (§5.5: execute mode holds the tend lock).
+    """Write the folder-bot layer (execute mode holds the tend lock).
 
     Dry-run is a pure read: no lock. Execute wraps the file writes and
     the manifest snapshot in .slopkeeper/tend.lock so a concurrent tend
@@ -71,7 +71,18 @@ def _scaffold_from_plan(
         agents = corpus_path(root, rel / "AGENTS.md")
         content = f.get("agents_md") or _render_agents_md(f, template)
         writes.append({"path": agents, "content": content})
-        if f.get("state_md"):
+        # STATE.md gating: an explicit plan-entry value always wins; when
+        # the entry omits the key, fall back to the strategy pack's
+        # folder_template.state_md — but only for folders carrying the
+        # pack's own kind (a role-bots pack's STATE default should not
+        # stamp folders partitioned under some other kind). Before this,
+        # scaffold read the raw plan (validate_plan's bot-kind default
+        # never reaches it), so state_md:true in a pack did nothing.
+        want_state = f.get("state_md")
+        if want_state is None:
+            kind = f.get("kind") or template.get("kind", "project")
+            want_state = bool(template.get("state_md")) and kind == template.get("kind")
+        if want_state:
             st = corpus_path(root, rel / "STATE.md")
             writes.append({"path": st, "content": _render_state_md(f, template)})
 
@@ -117,13 +128,18 @@ def _scaffold_from_plan(
 
 def _render_agents_md(folder: dict, template: dict) -> str:
     body = template.get("agents_md_skeleton", "# <Name>\n")
-    kind_line = f"\n**Kind:** {folder.get('kind', 'project')}\n"
     role = folder.get("role") or "(describe this folder's role here)"
     name = Path(folder["path"]).name
     body = body.replace("<Role name>", name)
     body = body.replace("<Name>", name)
     body = body.replace("<Topic>", name)
     body = body.replace("<Project>", name)
+    # by-kind's skeleton opens "# <Kind>" — the category name is the
+    # folder's own name (docs/, data/, scripts/...), same fill as <Name>.
+    # The kind VALUE lives in the root roster table; no per-file Kind
+    # line here (the trailing **Kind:** append duplicated whatever the
+    # skeleton's own ## Kind section already said).
+    body = body.replace("<Kind>", name)
     body = body.replace(
         "<bot|topic|case|project|archive>", folder.get("kind", "project")
     )
@@ -151,7 +167,10 @@ def _render_agents_md(folder: dict, template: dict) -> str:
         body = re.sub(
             r"## Boundaries\n- <what belongs elsewhere, and where>\n?", "", body
         )
-    return body + kind_line + _footer()
+    # Join with an explicit blank line: a `---` hugging the last body
+    # line renders as a setext heading in GFM, not a rule. (Skeletons
+    # differ in trailing newlines — normalize here, once.)
+    return f"{body.rstrip()}\n\n{_footer().lstrip()}"
 
 
 def _render_state_md(folder: dict, template: dict) -> str:

@@ -4,8 +4,8 @@
 
 """External references: refs --scan-path, plan external_roots, code-file edits.
 
-The external-reference round's rows, per TEST_PLAN conventions (one
-concern per class, corpora built via helpers, expect_code for every
+The external-reference round's rows (one concern per class, corpora built
+via helpers, expect_code for every
 SlopKeeperError code):
 
 - refs <root> <basename> --scan-path <dir> finds citations OUTSIDE the
