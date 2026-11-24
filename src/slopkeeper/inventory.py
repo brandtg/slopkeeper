@@ -213,9 +213,33 @@ def collect(
     rel_paths: list[Path] = []
     truncated = False
     top_dir_counts: dict[str, int] = {}
+    # fp6/A2: top-level-of-any-depth symlinked directories, named. The
+    # walk never descends them (os.walk does not follow links) so they
+    # were invisible — yet coverage validation counts them (iterdir) and
+    # the fingerprint now binds name+target. Inventory must not disagree
+    # with what a plan is held to: they join `dirs` as zero-file
+    # ENTRIES and are named in stats.
+    symlinked_dirs: list[str] = []
 
     for dirpath, dirnames, filenames in corpus_walk(root):
         rel_dir = Path(dirpath).resolve().relative_to(root)
+        for d in dirnames:
+            try:
+                if not (Path(dirpath) / d).is_symlink():
+                    continue
+            except OSError:
+                continue
+            rel_name = (rel_dir / d).as_posix() if rel_dir.parts else d
+            symlinked_dirs.append(rel_name)
+            dirs.setdefault(
+                rel_name,
+                {
+                    "path": rel_name,
+                    "file_count": 0,
+                    "total_files": 0,
+                    "last_modified": None,
+                },
+            )
         d_depth = len(rel_dir.parts)
         if depth is not None and d_depth >= depth:
             dirnames[:] = []
@@ -308,6 +332,12 @@ def collect(
             # are separate corpora — invisible above, named here so no
             # one has to `find` for why the counts dropped.
             "nested_corpora": nested_corpora(root),
+            # fp6/A2: symlinked directories the walk does not descend —
+            # named, so inventory agrees with coverage validation (the
+            # audit's dirs: 0 surprise). Plans must cover these entries
+            # (keep/unresolved/skip); moves through or onto them are
+            # refused by default (symlink_escape; --allow-symlinks).
+            "symlinked_dirs": sorted(set(symlinked_dirs)),
         },
         "dirs": [dirs[k] for k in sorted(dirs) if k != "."],
         "files": files,

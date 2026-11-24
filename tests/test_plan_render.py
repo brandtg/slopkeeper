@@ -10,7 +10,6 @@ import contextlib
 import io
 import json
 import unittest
-from unittest import mock
 
 from helpers import TempCase, build_corpus, write, write_plan
 from slopkeeper import cli
@@ -296,47 +295,105 @@ class TestRenderRewriteSummary(TempCase):
         self.assertNotIn("Scan paths", md)
 
 
-class TestRenderBasedOnFallback(TempCase):
-    def test_fallback_writes_canonical_fingerprint_key(self):
-        # T6 (parent note): the render-time based_on fallback for plans
-        # without one must write the canonical `corpus_fingerprint` —
-        # `inventory_sha256` is the pre-T1 alias, read-only for plans in
-        # the wild; new output never uses that spelling (T1 wording).
+class TestRenderNoCorpusBinding(TempCase):
+    """A1 (0.2.6): plan render WARNS on a missing corpus binding and
+    never fabricates one. The pre-fix fallback computed a FRESH
+    fingerprint into any unbound plan — the human gate then approved a
+    binding that had never existed at authoring time (the audit's
+    self-certification finding)."""
+
+    def _unbound_plan(self):
         plan_path = write_plan(self.root)
         raw = json.loads(plan_path.read_text(encoding="utf-8"))
         del raw["based_on"]
         plan_path.write_text(json.dumps(raw), encoding="utf-8")
+        return plan_path
 
-        captured: dict = {}
-
-        def fake_render(
-            plan,
-            reference_report=None,
-            rewrite_summary=None,
-            stragglers=None,
-            code_anchor_risks=None,
-            emptied_dirs=None,
-        ):
-            captured["plan"] = plan
-            return "# gate\n"
-
+    def test_render_succeeds_with_loud_warning_and_no_backfill(self):
+        plan_path = self._unbound_plan()
         out_path = self.tmp / "gate.md"
-        with mock.patch("slopkeeper.cli.render_markdown", fake_render):
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
-                code = cli.main(
-                    [
-                        "plan",
-                        "render",
-                        str(plan_path),
-                        str(self.root),
-                        "--out",
-                        str(out_path),
-                    ]
-                )
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = cli.main(
+                [
+                    "plan",
+                    "render",
+                    str(plan_path),
+                    str(self.root),
+                    "--out",
+                    str(out_path),
+                ]
+            )
+        self.assertEqual(code, 0)  # the gate still renders — the human sees WHY
+        md = out_path.read_text(encoding="utf-8")
+        self.assertIn("WARNING — plan carries no corpus binding", md)
+        self.assertIn("plan_no_based_on", md)
+        # No fabrication: the plan on disk still has no binding.
+        raw = json.loads(plan_path.read_text(encoding="utf-8"))
+        self.assertNotIn("based_on", raw)
+
+    def test_sidecar_records_the_warning(self):
+        from slopkeeper.plan import load_render_sidecar
+
+        plan_path = self._unbound_plan()
+        out_path = self.tmp / "gate.md"
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = cli.main(
+                [
+                    "plan",
+                    "render",
+                    str(plan_path),
+                    str(self.root),
+                    "--out",
+                    str(out_path),
+                ]
+            )
         self.assertEqual(code, 0)
-        self.assertIn("corpus_fingerprint", captured["plan"]["based_on"])
-        self.assertNotIn("inventory_sha256", captured["plan"]["based_on"])
+        sidecar = load_render_sidecar(self.root)
+        self.assertEqual(sidecar["warnings"], ["no_fingerprint"])
+
+    def test_bound_plan_renders_without_the_warning(self):
+        plan_path = write_plan(self.root)
+        out_path = self.tmp / "gate.md"
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = cli.main(
+                [
+                    "plan",
+                    "render",
+                    str(plan_path),
+                    str(self.root),
+                    "--out",
+                    str(out_path),
+                ]
+            )
+        self.assertEqual(code, 0)
+        md = out_path.read_text(encoding="utf-8")
+        self.assertNotIn("no corpus binding", md)
+        self.assertIn("Based on inventory", md)
+        from slopkeeper.plan import load_render_sidecar
+
+        sidecar = load_render_sidecar(self.root)
+        self.assertNotIn("warnings", sidecar)
+
+    def test_validate_and_apply_refuse_the_unbound_plan(self):
+        # The audit's Test A, at the API surface: omit based_on and the
+        # old behavior applied silently. Both gates now refuse.
+        from slopkeeper.apply import apply_plan
+        from slopkeeper.models import SlopKeeperError
+
+        plan_path = self._unbound_plan()
+        with self.assertRaises(SlopKeeperError) as cm:
+            validate_plan(load_plan(plan_path), self.root)
+        self.assertEqual(cm.exception.code, "plan_no_based_on")
+        with self.assertRaises(SlopKeeperError) as cm:
+            apply_plan(plan_path, self.root, execute=True)
+        self.assertEqual(cm.exception.code, "plan_no_based_on")
+        # --force escapes corpus_changed, never the missing binding.
+        with self.assertRaises(SlopKeeperError) as cm:
+            apply_plan(plan_path, self.root, execute=True, force=True)
+        self.assertEqual(cm.exception.code, "plan_no_based_on")
 
 
 class TestRenderRulesAndStragglers(TempCase):

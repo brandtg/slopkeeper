@@ -16,10 +16,13 @@ from slopkeeper.references import citation_lines
 from slopkeeper.references import (
     CitationIndex,
     _resolve,
-    _text_files_under,
     _token_spans,
+    _urlish,
+    _text_files_under,
+    dangling_citations,
     is_text_file,
     reference_risk,
+    refs_lookup,
     scan_references,
     scan_references_stream,
 )
@@ -420,6 +423,162 @@ class TestStreamScan(unittest.TestCase):
         full = scan_references_stream(tmp)
         self.assertEqual(set(full), {"stats"})
         self.assertEqual(full["stats"], {"files_scanned": 0, "hits": 0})
+
+
+class TestHostHeuristicPrefersCorpus(unittest.TestCase):
+    """A3 (0.2.6): anything that resolves against the corpus is a PATH,
+    whatever its first segment looks like. The pre-fix heuristic dropped
+    ANY path token whose dotted first segment ended in an alpha tail — so
+    the identical corpus renamed `myfiles` → `my.files` returned
+    `would_rewrite: []` with no risk row either, and after --execute the
+    citation pointed at nothing (the audit's controlled comparison).
+    Dotted dirs (`my.files/`, `data.backup/`, `v1.0/`) are common corpus
+    layouts; the basename fallback kept `refs` mostly working, so the
+    breakage was invisible EXCEPT in the rewrite pass — the tool's own
+    selling point."""
+
+    def _idx(self, *paths):
+        return CitationIndex([Path(p) for p in paths])
+
+    def _toks(self, line, **kw):
+        return [t for t, _k, _s, _e in _token_spans(line, **kw)]
+
+    def test_dotted_corpus_dir_citation_survives(self):
+        idx = self._idx("my.files/report.md", "notes.md")
+        self.assertIn(
+            "my.files/report.md",
+            self._toks("see my.files/report.md now", index=idx),
+        )
+
+    def test_control_plain_dir_matches(self):
+        idx = self._idx("myfiles/report.md", "notes.md")
+        self.assertIn(
+            "myfiles/report.md",
+            self._toks("see myfiles/report.md now", index=idx),
+        )
+
+    def test_versioned_and_backup_dotted_dirs(self):
+        idx = self._idx("v1.0/notes.md", "data.backup/x.md")
+        self.assertIn("v1.0/notes.md", self._toks("read v1.0/notes.md ok", index=idx))
+        self.assertIn(
+            "data.backup/x.md", self._toks("read data.backup/x.md ok", index=idx)
+        )
+
+    def test_directory_citation_under_dotted_name(self):
+        idx = self._idx("my.files/report.md")
+        self.assertIn("my.files/", self._toks("browse my.files/ daily", index=idx))
+
+    def test_token_under_a_dotted_dir_names_nothing_yet(self):
+        # my.files/ IS a corpus dir: the token continues it, so it is a
+        # (dangling) corpus citation, not a hostname — dangling mode
+        # lists it rather than dropping it in silence.
+        idx = self._idx("my.files/report.md")
+        self.assertIn(
+            "my.files/gone.md", self._toks("see my.files/gone.md ok", index=idx)
+        )
+
+    def test_host_token_still_dropped_even_when_tail_matches_a_file(self):
+        # example.com/index.md with a root index.md in the corpus stays
+        # a host: containment is EXACT (token, its dir prefixes, the
+        # citing-dir read) — never a bare-tail match.
+        idx = self._idx("index.md")
+        self.assertEqual(
+            self._toks("mirror example.com/index.md please", index=idx), []
+        )
+
+    def test_scheme_prefixed_token_dropped_even_if_resolvable(self):
+        # The `://` rule outranks corpus resolution: a URL that happens
+        # to name a real layout is still a URL.
+        idx = self._idx("my.files/report.md")
+        self.assertEqual(
+            self._toks("https://my.files/report.md is not ours", index=idx), []
+        )
+
+    def test_email_marker_drops_the_token(self):
+        idx = self._idx("my.files/report.md")
+        self.assertTrue(_urlish("x", 0, "my.files/note@corp.md", index=idx))
+
+    def test_relative_sibling_read_needs_citing_dir(self):
+        idx = self._idx("a/dotted.dir/report.md", "a/x.md")
+        self.assertEqual(self._toks("see dotted.dir/report.md ok", index=idx), [])
+        self.assertIn(
+            "dotted.dir/report.md",
+            self._toks("see dotted.dir/report.md ok", index=idx, citing_dir="a"),
+        )
+
+    def test_no_index_keeps_the_legacy_conservatism(self):
+        # Callers without a corpus view keep the historical drop: safer
+        # to miss a rewrite than to mangle a URL.
+        self.assertEqual(self._toks("see my.files/report.md now"), [])
+
+
+class TestDanglingDottedDirs(unittest.TestCase):
+    """A3's dangling-mode face: dotted-dir tokens surface as dangling
+    instead of vanishing."""
+
+    def test_dangling_reports_dotted_dir_token_not_the_host(self):
+        tmp = Path(tempfile.mkdtemp(prefix="sk-dang-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        write(tmp / "my.files/report.md", "# r\n")
+        write(tmp / "notes.md", "see my.files/gone.md and example.com/x.md now\n")
+        rel = [Path("my.files/report.md"), Path("notes.md")]
+        toks = {s["token"] for s in dangling_citations(tmp, rel)}
+        self.assertIn("my.files/gone.md", toks)
+        self.assertNotIn("example.com/x.md", toks)
+
+
+class TestRefsLookupHonestState(unittest.TestCase):
+    """A5 (0.2.6): citation_count 0 was three facts wearing one coat —
+    "nobody cites it", "you typoed", "ambiguous, never guessed". The
+    CitationIndex already knew; refs_lookup now says so (still ok: true
+    — every one of them is a valid query result)."""
+
+    def _corpus(self):
+        tmp = Path(tempfile.mkdtemp(prefix="sk-refs-h-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        write(tmp / "reports/note.md", "# one\n")
+        write(tmp / "tasks/note.md", "# two\n")
+        write(tmp / "solo/report.md", "# solo\n")
+        write(tmp / "index.md", "see solo/report.md\n")
+        rel = [
+            Path("reports/note.md"),
+            Path("tasks/note.md"),
+            Path("solo/report.md"),
+            Path("index.md"),
+        ]
+        return tmp, rel
+
+    def test_typo_reports_not_exists(self):
+        root, rel = self._corpus()
+        out = refs_lookup(root, "file_that_does_not_exist.md", rel)
+        self.assertEqual(out["citations"], [])
+        self.assertFalse(out["exists"])
+        self.assertFalse(out["ambiguous"])
+        self.assertEqual(out["ambiguous_paths"], [])
+        self.assertFalse(out["nonexistent_path"])
+
+    def test_ambiguous_basename_reports_candidates(self):
+        root, rel = self._corpus()
+        out = refs_lookup(root, "note.md", rel)
+        self.assertEqual(out["citations"], [])  # still never attributed
+        self.assertTrue(out["exists"])
+        self.assertTrue(out["ambiguous"])
+        self.assertEqual(out["ambiguous_paths"], ["reports/note.md", "tasks/note.md"])
+
+    def test_resolvable_name_is_honest(self):
+        root, rel = self._corpus()
+        out = refs_lookup(root, "solo/report.md", rel)
+        self.assertTrue(out["exists"])
+        self.assertFalse(out["ambiguous"])
+        self.assertEqual([c["file"] for c in out["citations"]], ["index.md"])
+
+    def test_slashed_name_with_only_a_basename_match_not_exists(self):
+        # D7's branch, A5's word: it names no corpus PATH.
+        root, rel = self._corpus()
+        out = refs_lookup(root, "nope/report.md", rel)
+        self.assertTrue(out["nonexistent_path"])
+        self.assertFalse(out["exists"])
+        self.assertFalse(out["ambiguous"])
 
 
 if __name__ == "__main__":

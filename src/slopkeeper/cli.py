@@ -39,6 +39,7 @@ from .anchors import anchored_move_risks
 from .draft import draft as draft_plan
 from .plan import (
     PLAN_TEMPLATE,
+    based_on_binding,
     load_plan,
     render_markdown,
     straggler_report,
@@ -461,6 +462,11 @@ def cmd_refs(args) -> int:
                 {
                     "basename": args.basename,
                     "nonexistent_path": True,
+                    # A5: the honest query state — a slashed name that
+                    # only basename-matches names NO corpus path.
+                    "exists": False,
+                    "ambiguous": False,
+                    "ambiguous_paths": [],
                     "citation_count": len(hits),
                     "citations": hits,
                     "scan_paths": [str(d) for d in scan_dirs],
@@ -494,6 +500,13 @@ def cmd_refs(args) -> int:
             "refs",
             {
                 "basename": args.basename,
+                # A5: citation_count 0 is three different facts — "safe
+                # to move", "you typoed", "ambiguous, never guessed".
+                # The index knows which; the payload now says so (still
+                # ok: true — every one is a valid query result).
+                "exists": lookup["exists"],
+                "ambiguous": lookup["ambiguous"],
+                "ambiguous_paths": lookup["ambiguous_paths"],
                 "citation_count": len(hits),
                 "citations": hits,
                 "scan_paths": [str(d) for d in scan_dirs],
@@ -713,7 +726,12 @@ def cmd_strategies(args) -> int:
 def cmd_plan_validate(args) -> int:
     root = _resolve_dir(args.root)
     plan = load_plan(Path(args.plan))
-    plan = validate_plan(plan, root, allow_partial=args.allow_partial)
+    plan = validate_plan(
+        plan,
+        root,
+        allow_partial=args.allow_partial,
+        allow_symlinks=args.allow_symlinks,
+    )
     stragglers = straggler_report(root, plan)
     # Phase 9: informational cost rows for moves of code-anchored dirs.
     anchor_risks = anchored_move_risks(root, plan)
@@ -775,11 +793,24 @@ def cmd_plan_validate(args) -> int:
 
 def cmd_plan_render(args) -> int:
     from .apply import _run_artifacts, build_gate_report
-    from .models import corpus_fingerprint
 
     root = _resolve_dir(args.root)
     plan = load_plan(Path(args.plan))
-    plan = validate_plan(plan, root, allow_partial=args.allow_partial)
+    # A1 (0.2.6): render is the ONLY surface that may see an unbound
+    # plan. It never back-fills a fresh fingerprint — the pre-fix
+    # fallback self-certified plans that had no real binding to the
+    # corpus (the human approved a fingerprint computed at render time,
+    # not at authoring time). The gate renders a loud "no corpus
+    # binding" warning block instead, records warnings:
+    # ["no_fingerprint"] in the --out sidecar, and apply refuses the
+    # plan (plan_no_based_on).
+    plan = validate_plan(
+        plan,
+        root,
+        allow_partial=args.allow_partial,
+        require_based_on=False,
+        allow_symlinks=args.allow_symlinks,
+    )
 
     # Reference counts for the human gate: the same un-capped stream
     # scan apply will run (Phase 3 — no size gate anywhere). One pass
@@ -797,14 +828,6 @@ def cmd_plan_render(args) -> int:
     # B8: emptied-by-file dirs and their destination breakdowns ride on
     # the validated plan.
     emptied = plan.get("emptied_dir_suggestions") or []
-    if "based_on" not in plan or not plan["based_on"]:
-        # corpus_fingerprint is canonical (T1): the pre-T1
-        # `inventory_sha256` spelling is a read-only alias for plans in
-        # the wild — new fallbacks never write it.
-        plan["based_on"] = {
-            "corpus_fingerprint": corpus_fingerprint(root),
-            "inventory_at": "unrecorded",
-        }
     md = render_markdown(
         plan,
         ref_report,
@@ -826,6 +849,9 @@ def cmd_plan_render(args) -> int:
                 rel
                 for rel in _run_artifacts(root, args.plan, args.out, args.rewrites_out)
             ],
+            # A1: the sidecar records what the gate showed — an unbound
+            # plan carries the warning instead of a fabricated binding.
+            warnings=None if based_on_binding(plan) else ["no_fingerprint"],
         )
         payload = {"written_to": args.out, "bytes": len(md)}
     else:
@@ -874,6 +900,7 @@ def cmd_apply(args) -> int:
         force=args.force,
         allow_partial=args.allow_partial,
         strict_references=args.strict_references,
+        allow_symlinks=args.allow_symlinks,
     )
     if args.rewrites_out:
         # B1: the line-level rewrite detail as JSON, matching
@@ -1241,6 +1268,15 @@ def build_parser() -> argparse.ArgumentParser:
     v.add_argument("root")
     v.add_argument("--allow-partial", action="store_true")
     v.add_argument(
+        "--allow-symlinks",
+        action="store_true",
+        help="accept move paths that cross symlinked directories "
+        "(deliberate traversal to a FRESH path; default: refused — "
+        "symlink_escape; the corpus walk never looks behind a link. "
+        "Never a clobber license: an existing destination stays "
+        "plan_dst_exists-refused)",
+    )
+    v.add_argument(
         "--out",
         default=None,
         help="write the validated plan (expanded moves + stragglers) as JSON here",
@@ -1251,6 +1287,12 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("plan")
     r.add_argument("root")
     r.add_argument("--allow-partial", action="store_true")
+    r.add_argument(
+        "--allow-symlinks",
+        action="store_true",
+        help="render a plan whose moves cross symlinked paths (same "
+        "policy as validate/apply; default: symlink_escape)",
+    )
     r.add_argument("--out", default=None)
     r.add_argument(
         "--rewrites-out",
@@ -1271,13 +1313,26 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("root")
     sp.add_argument("--execute", action="store_true")
     sp.add_argument(
-        "--force", action="store_true", help="skip the corpus-changed fingerprint gate"
+        "--force",
+        action="store_true",
+        help="skip the corpus-changed fingerprint gate (the "
+        "based_on.corpus_fingerprint binding itself is required — "
+        "--force does not bypass plan_no_based_on)",
     )
     sp.add_argument("--allow-partial", action="store_true")
     sp.add_argument(
         "--strict-references",
         action="store_true",
         help="abort instead of warning on referenced moves",
+    )
+    sp.add_argument(
+        "--allow-symlinks",
+        action="store_true",
+        help="execute moves that cross symlinked directories "
+        "(deliberate traversal to a FRESH path; default: refused — "
+        "symlink_escape; the corpus walk never looks behind a link. "
+        "Never a clobber license: an existing destination stays "
+        "plan_dst_exists-refused)",
     )
     sp.add_argument(
         "--rewrites-out",

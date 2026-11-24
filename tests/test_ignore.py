@@ -34,11 +34,14 @@ from slopkeeper.status import write_manifest
 
 
 def plan_dict(root, moves, **extra):
-    """A minimal plan payload for validate_plan (no fingerprint gate here)."""
+    """A minimal plan payload for validate_plan. Carries the mandatory
+    corpus binding (A1) so the required based_on check is not the thing
+    under test; staleness tests override `based_on`."""
     plan = {
         "schema": "slopkeeper/plan@1",
         "corpus_root": str(root),
         "strategy": "hybrid",
+        "based_on": {"corpus_fingerprint": corpus_fingerprint(root)},
         "moves": moves,
     }
     plan.update(extra)
@@ -256,8 +259,8 @@ class TestNestedCorpora(TempCase):
 
 
 class TestFingerprint(TempCase):
-    def test_prefix_is_fp5(self):
-        self.assertTrue(corpus_fingerprint(self.root).startswith("fp5:"))
+    def test_prefix_is_fp6(self):
+        self.assertTrue(corpus_fingerprint(self.root).startswith("fp6:"))
 
     def test_non_regular_files_are_not_content(self):
         # fp5 (0.1.6 field test B6): sandbox deny-list mounts show up as
@@ -324,7 +327,7 @@ class TestInventoryIgnores(TempCase):
         self.assertFalse(any(f["path"].startswith("archive/") for f in inv["files"]))
         self.assertEqual(inv["stats"]["ignore_rules"], 1)
         # The fingerprint must agree with the file list.
-        self.assertTrue(inv["fingerprint"].startswith("fp5:"))
+        self.assertTrue(inv["fingerprint"].startswith("fp6:"))
 
 
 class TestValidateIgnores(TempCase):

@@ -113,11 +113,15 @@ The commands:
   point for the agent to reclassify, not a decision.
 - **plan** — the only write path. A JSON document of `moves` (from → to +
   reason), `keep`, `unresolved`, `folders` (to scaffold), and the corpus
-  fingerprint it was authored against. Validated hard: path escapes,
+  fingerprint it was authored against — required: validate and apply
+  refuse an unbound plan (`plan_no_based_on`; `plan render` warns, never
+  fabricates). Validated hard: path escapes,
   stale sources, collisions, nested moves, cycles, incomplete coverage.
   `plan validate` / `plan render` / `plan schema` are the subcommands.
 - **apply** — all-or-nothing execution. Dry-run by default; refuses a
-  corpus whose fingerprint changed since planning; pre-flights every
+  corpus whose fingerprint changed since planning; refuses moves that
+  cross symlinked paths (`symlink_escape`; `--allow-symlinks` for a
+  deliberate traversal); pre-flights every
   destination before touching anything; journals every move with a
   content hash; flags every move cited from stay-put files.
 - **move** — one bulk move (src dst root): builds the one-move plan,
