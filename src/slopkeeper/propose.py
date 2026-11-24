@@ -50,8 +50,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .anchors import CODE_EXTS, scan_code_anchors
-from .ignore import corpus_walk
+from . import kinds
+from .anchors import scan_code_anchors
 from .references import (
     CitationIndex,
     _PER_FILE_CAP,
@@ -63,55 +63,17 @@ from .references import (
     reference_risk,
     scan_references_stream,
 )
+from .scan import corpus_rel_paths
 from .strategies import get_strategy
 
 # Kind buckets: the extension -> dest-dir mapping every candidate shares.
 # Deliberately coarse — this is a fork-cost estimate, not a classifier.
-KIND_EXTS: dict[str, set[str]] = {
-    "docs": {
-        ".md",
-        ".markdown",
-        ".txt",
-        ".rst",
-        ".org",
-        ".pdf",
-        ".docx",
-        ".pptx",
-        ".tex",
-        ".html",
-        ".htm",
-    },
-    "data": {
-        ".json",
-        ".yaml",
-        ".yml",
-        ".toml",
-        ".ini",
-        ".cfg",
-        ".csv",
-        ".tsv",
-        ".jsonl",
-        ".xml",
-        ".sql",
-        ".log",
-    },
-    "code": CODE_EXTS,
-    "media": {
-        ".png",
-        ".jpg",
-        ".jpeg",
-        ".gif",
-        ".svg",
-        ".webp",
-        ".ico",
-        ".mp3",
-        ".mp4",
-        ".wav",
-        ".zip",
-        ".gz",
-        ".tar",
-    },
-}
+# The sets are kinds.py's now (P3/R7): one owner per extension, and the
+# buckets are disjoint, so an extension cannot be "data" here and "code"
+# in inventory in the same run. That was real: `.sql` sat in both, and
+# the dict order silently decided this module's answer. It is code
+# (CODE_EXTS says so) and lands in scripts/ now.
+KIND_EXTS: dict[str, frozenset[str]] = kinds.KIND_EXTS
 KIND_DIR = {"docs": "docs", "data": "data", "code": "scripts", "media": "media"}
 
 # projects.json's detection signals, as direct dir contents. A marker
@@ -135,12 +97,8 @@ CANDIDATES = [
 
 
 def _corpus_rel_paths(root: Path) -> list[Path]:
-    out: list[Path] = []
-    for dirpath, _dirnames, filenames in corpus_walk(root):
-        d = Path(dirpath)
-        for fn in filenames:
-            out.append((d / fn).relative_to(root))
-    return out
+    """The corpus file list, from the one traversal (scan.py)."""
+    return corpus_rel_paths(root)
 
 
 def _kind_of(rel: Path) -> str | None:

@@ -6,12 +6,13 @@
 
 from __future__ import annotations
 
+import os
 import unittest
-
-from helpers import TempCase
-from slopkeeper.doctor import doctor
-from helpers import write
 from pathlib import Path
+
+from helpers import TempCase, write
+from slopkeeper.doctor import doctor
+from slopkeeper.inventory import collect
 
 
 class TestDoctor(TempCase):
@@ -198,6 +199,43 @@ class TestDoctorPhase11(TempCase):
         self.assertIn(".cache", dirs)
         self.assertNotIn(".small", dirs)
         self.assertTrue(any(".cache/" in a for a in d["advice"]))
+
+    def test_stranding_counts_exclude_tool_layer_entries(self):
+        # The visibility survey is the corpus walk now, so it excludes
+        # what every other surface excludes: the ignore file itself
+        # (counting it had doctor reporting "dangling citations" inside
+        # .slopkeeperignore) and a symlink to nothing (no walk can read
+        # it, so it is not a visible file). Both used to be counted by
+        # the survey's private os.walk.
+        write(self.root / ".slopkeeperignore", "*.log\n# node_modules/\n")
+        write(self.root / "misc/keep.md", "visible\n")
+        write(self.root / "misc/drop.log", "ignored\n")
+        os.symlink("nowhere.md", self.root / "misc" / "dangling.md")
+        d = doctor(self.root)
+        by_dir = {s["dir"]: s for s in d["ignore_stranding"]}
+        self.assertEqual(by_dir["misc"], {"dir": "misc", "ignored": 1, "visible": 1})
+        tokens = [
+            row["token"]
+            for row in d["dangling_citations"]["sample"]
+            if row["file"] == ".slopkeeperignore"
+        ]
+        self.assertEqual(tokens, [])
+
+    def test_surveys_agree_with_the_inventory_stats(self):
+        # One walk, one truth: what doctor's surveys name is what
+        # inventory named, from the same records (they used to be two
+        # walks that could disagree).
+        write(self.root / "sub/.slopkeeper/manifest.json", "{}")
+        write(self.root / "sub/inner.md", "# inner\n")
+        os.mkfifo(self.root / "pipe")
+        d = doctor(self.root)
+        self.assertEqual(d["nested_corpora"], ["sub"])
+        self.assertEqual([x["path"] for x in d["non_regular_files"]], ["pipe"])
+        self.assertEqual(d["stats"]["nested_corpora"], ["sub"])
+        self.assertNotIn(
+            "sub/inner.md",
+            [f["path"] for f in collect(self.root, fast=True)["files"]],
+        )
 
     def test_dangling_citations_flagged(self):
         write(self.root / "guide.md", "see docs/gone.md and [[missing/link]]\n")

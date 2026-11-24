@@ -247,7 +247,16 @@ def safe_move_path(
 # --- integrity --------------------------------------------------------------
 
 
-def sha256_file(path: Path, cap_bytes: int = 64 * 1024 * 1024) -> str | None:
+# The corpus-scan hash cap, ONE number for every surface: `sha256_file`
+# returns None past it, the single-pass scanner (scan.py) leaves
+# `hashed` False, and the fingerprint, the manifest and the journal all
+# agree that an over-cap file's identity is its mtime. Canonical here
+# because models is the module every one of those consumers already
+# imports; scan.py folds it, inventory and status reuse it.
+SHA256_CAP_BYTES = 64 * 1024 * 1024
+
+
+def sha256_file(path: Path, cap_bytes: int = SHA256_CAP_BYTES) -> str | None:
     try:
         st = path.stat()
         if st.st_size > cap_bytes:
@@ -296,66 +305,18 @@ def corpus_fingerprint_detail(
     that into a fact the surfaces can act on: inventory and doctor
     name it, apply refuses the tend (corpus_unstable) while the corpus
     is actively being churned under the walk.
+
+    Since 0.2.8 this is a fold over the single-pass scanner rather than
+    a walk of its own: the entry set, the digest framing and the health
+    semantics are the same ones (fp6), but the traversal exists once,
+    and `inventory.collect` folds the SAME visits it listed instead of
+    walking a second time and hoping the corpus held still (the audit's
+    B5 two-instants skew). The lazy import is the standing circular-
+    import dance — ignore.py and scan.py both import this module.
     """
-    # Lazy import: ignore.py imports HIDDEN_SKIP_DIRS from this module,
-    # so a top-level import here would be a circular-import trap.
-    from .ignore import corpus_walk
+    from .scan import fingerprint_scan
 
-    h = hashlib.sha256()
-    count = 0
-    unstatable: list[str] = []
-
-    def _name_unstatable(fp: Path) -> None:
-        if len(unstatable) < UNSTATABLE_NAMED:
-            unstatable.append(str(fp.relative_to(root)))
-
-    for dirpath, dirnames, filenames in corpus_walk(root):
-        dirpath = Path(dirpath)
-        for dn in dirnames:
-            # fp6 (A2): a symlinked directory is an ENTRY. The walk
-            # never descends it (os.walk does not follow links), but
-            # coverage validation counts it — so its NAME and TARGET
-            # belong to the fingerprint, or the gate would bless plans
-            # whose sibling symlink quietly appeared, vanished, or
-            # re-targeted after authoring.
-            dp = dirpath / dn
-            try:
-                if not dp.is_symlink():
-                    continue
-                target = os.readlink(dp)
-            except OSError:
-                # B6: an entry the walk listed that cannot be read is
-                # churn (or a dying mount), not noise to swallow.
-                _name_unstatable(dp)
-                continue
-            h.update(str(dp.relative_to(root)).encode("utf-8", "replace"))
-            h.update(b"\0symlink:")
-            h.update(target.encode("utf-8", "replace"))
-            h.update(b"\0")
-            count += 1
-        for fn in filenames:
-            fp = dirpath / fn
-            try:
-                st = fp.stat()
-            except OSError:
-                # B6: counted and named, never a silent skip.
-                _name_unstatable(fp)
-                continue
-            digest = sha256_file(fp)
-            h.update(str(fp.relative_to(root)).encode("utf-8", "replace"))
-            h.update(b"\0")
-            h.update(str(st.st_size).encode())
-            h.update(b":")
-            if digest is not None:
-                h.update(digest.encode())
-            else:
-                h.update(str(st.st_mtime_ns).encode())
-            h.update(b"\0")
-            count += 1
-    health: dict = {"skipped_unstatable": len(unstatable)}
-    if unstatable:
-        health["skipped_unstatable_paths"] = unstatable
-    return f"{CURRENT_FP_PREFIX}:{h.hexdigest()[:32]}:{count}", health
+    return fingerprint_scan(root)
 
 
 def corpus_fingerprint(root: Path) -> str:

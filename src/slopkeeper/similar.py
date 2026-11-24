@@ -28,6 +28,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import kinds
 from .models import SlopKeeperError, sha256_file, state_dir
 
 # Minimum similarity for a file to join a cluster (max-link over members)...
@@ -207,14 +208,30 @@ def build_vectors_cached(
         return vectors_from_tf(docs), fresh
 
 
-def _cosine(a: Counter, b: Counter) -> float:
+def _norm(c: Counter) -> float:
+    """‖c‖₂, for callers that compare one vector against many."""
+    return math.sqrt(sum(w * w for w in c.values()))
+
+
+def _cosine(a: Counter, b: Counter, na: float | None = None, nb: float | None = None):
+    """cos(a, b) over the sparse TF-IDF vectors.
+
+    `na`/`nb` are the callers' precomputed norms: the matcher compares
+    one candidate against every cluster member, and re-deriving ‖b‖ for
+    a vector that has not changed since the last comparison was the
+    inner loop's warmest spot (P3). Left None, they are computed here —
+    same answer either way.
+    """
     if not a or not b:
         return 0.0
     if len(b) < len(a):
         a, b = b, a
+        na, nb = nb, na
     dot = sum(w * b.get(t, 0.0) for t, w in a.items())
-    na = math.sqrt(sum(w * w for w in a.values()))
-    nb = math.sqrt(sum(w * w for w in b.values()))
+    if na is None:
+        na = math.sqrt(sum(w * w for w in a.values()))
+    if nb is None:
+        nb = math.sqrt(sum(w * w for w in b.values()))
     return dot / (na * nb) if na and nb else 0.0
 
 
@@ -225,11 +242,18 @@ def similarity_clusters(
 ) -> list[list[str]]:
     """Greedy single-link with a mean-similarity floor (anti-chaining)."""
     clusters: list[list[str]] = []
+    # Every norm, once: the greedy pass re-uses each vector as both side
+    # of a comparison many times over, and a norm is a full pass over the
+    # vector's terms.
+    norms = {rel: _norm(v) for rel, v in vecs.items()}
     for rel in sorted(vecs):
         v = vecs[rel]
+        nv = norms[rel]
         best_i, best_s = -1, 0.0
         for i, members in enumerate(clusters):
-            sims = sorted((_cosine(v, vecs[m]) for m in members), reverse=True)
+            sims = sorted(
+                (_cosine(v, vecs[m], nv, norms[m]) for m in members), reverse=True
+            )
             if sims[0] >= t1 and sims[0] > best_s:
                 if sum(sims) / len(sims) >= t1 * ratio:
                     best_s, best_i = sims[0], i
@@ -282,21 +306,18 @@ def same_stem_groups(paths: list[str]) -> list[list[str]]:
 
 
 def identical_groups(root: Path, paths: list[str]) -> list[list[str]]:
-    """Byte-identical non-binary files (sha256 of first 1 MiB)."""
+    """Byte-identical non-binary files (sha256 of first 1 MiB).
+
+    "Non-binary" is the ONE table's answer (kinds.is_binary, P3/R7).
+    This used to carry its own inline list of nine extensions, which
+    meant the duplicate detector hashed `.webp`, `.tar`, `.mp3` and
+    `.db` copies that every other surface already knew were binary —
+    noise rows, and a second definition of a word the tool has one of.
+    """
     by_hash: dict[str, list[str]] = {}
     for p in paths:
         fp = root / p
-        if fp.suffix.lower() in (
-            ".png",
-            ".jpg",
-            ".jpeg",
-            ".gif",
-            ".pdf",
-            ".zip",
-            ".gz",
-            ".mp4",
-            ".mov",
-        ):
+        if kinds.is_binary(fp):
             continue
         try:
             with fp.open("rb") as f:
@@ -437,12 +458,25 @@ def hubs(refs: dict[str, list[str]], min_referrers: int = 3) -> list[dict]:
     ]
 
 
-def collect_similarity(root: Path, files: list[dict], with_dupes: bool = True) -> dict:
+def collect_similarity(
+    root: Path,
+    files: list[dict],
+    with_dupes: bool = True,
+    sha_of=None,
+) -> dict:
     """Full hint document for the clusters command.
 
     Vectors reuse .slopkeeper/vectors.json keyed by content hash
     and write the refreshed cache back; output is identical with or
     without a warm cache.
+
+    `sha_of(rel)` replaces the per-file `sha256_file` the cache keys on.
+    The clusters command passes the single-pass scan's hashes
+    (`scan.CorpusScan.sha_of`): the inventory walk has already read and
+    digested every one of those bytes, and re-hashing the corpus to look
+    up a cache the same walk could have hit was the third full read of
+    the tree in one command. None (the default) hashes on demand, for
+    callers that arrive with a bare file list.
     """
     if len(files) > MAX_FILES:
         raise SlopKeeperError(
@@ -453,6 +487,13 @@ def collect_similarity(root: Path, files: list[dict], with_dupes: bool = True) -
             "or organize smaller scopes; the O(n^2) matcher needs this cap.",
         )
     paths = [f["path"] for f in files]
+    # One parent index for every "which files live in this dir" question
+    # below. Both the collapse set and the appended subtree rows asked it
+    # by scanning the whole path list per directory — O(dirs × files)
+    # with the same answer every time.
+    by_parent: dict[str, list[str]] = {}
+    for p in paths:
+        by_parent.setdefault(str(Path(p).parent), []).append(p)
     # Identical subtrees (Phase 11) collapse to ONE cluster entry: their
     # files leave the vector input entirely and reappear as a single
     # labeled row naming every copy — four copies of a vendored design
@@ -462,8 +503,7 @@ def collect_similarity(root: Path, files: list[dict], with_dupes: bool = True) -
         p
         for g in subtrees
         for d in [g["dir"], *g["copies"]]
-        for p in paths
-        if str(Path(p).parent) == d
+        for p in by_parent.get(d, ())
     }
     cluster_files = [f for f in files if f["path"] not in collapsed]
     # The cached payload is per-doc tf — pure function of file CONTENT.
@@ -474,9 +514,12 @@ def collect_similarity(root: Path, files: list[dict], with_dupes: bool = True) -
     # parameter that DOES change tf invalidates mechanically.
     params: dict = {}
     cache_docs = load_vector_cache(root, params)
-    vecs, fresh = build_vectors_cached(
-        cluster_files, cache_docs, lambda rel: sha256_file(root / rel)
-    )
+    if sha_of is None:
+
+        def sha_of(rel):  # noqa: E306 - the on-demand fallback
+            return sha256_file(root / rel)
+
+    vecs, fresh = build_vectors_cached(cluster_files, cache_docs, sha_of)
     write_vector_cache(root, params, cache_docs, fresh)
     clusters = similarity_clusters(vecs)
     labeled = [
@@ -497,7 +540,7 @@ def collect_similarity(root: Path, files: list[dict], with_dupes: bool = True) -
                     f"(+{len(g['copies'])} identical copies)"
                 ),
                 "size": g["files"],
-                "files": sorted(p for p in paths if str(Path(p).parent) == g["dir"]),
+                "files": sorted(by_parent.get(g["dir"], ())),
                 "copies": g["copies"],
             }
         )

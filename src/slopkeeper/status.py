@@ -20,19 +20,18 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .ignore import corpus_walk, load_ignore, nested_corpora
+from .ignore import load_ignore
 from .models import (
     CURRENT_FP_PREFIX,
     MANIFEST_NAME,
     MANIFEST_SCHEMA,
     SlopKeeperError,
     add_warning,
-    corpus_fingerprint,
-    sha256_file,
     state_dir,
     tend_lock,
 )
 from .inventory import HEAD_BYTES, HEAD_CHARS, _kind  # noqa: F401 (kind reuse)
+from .scan import scan_corpus
 
 CHARS_PER_TOKEN = 4
 # Phase 7 rebaseline threshold: drift past max(20% of the manifest's
@@ -87,6 +86,8 @@ def write_manifest(
     unresolved: list | None = None,
     plan_path: str | None = None,
     plan_sha256: str | None = None,
+    *,
+    scan=None,
 ) -> dict:
     """Snapshot the corpus. Called by `apply --execute`, `status --record`,
     scaffold --execute, and undo.
@@ -131,21 +132,20 @@ def write_manifest(
     else:
         skipped_bad_unresolved = sum(1 for u in unresolved if _bad_unresolved(u))
         unresolved = [u for u in unresolved if not _bad_unresolved(u)]
-    files: dict[str, list] = {}
-    for dirpath, _dirnames, filenames in corpus_walk(root):
-        dirpath = Path(dirpath)
-        for fn in filenames:
-            fp = dirpath / fn
-            try:
-                st = fp.stat()
-            except OSError:
-                continue
-            rel = fp.relative_to(root).as_posix()
-            files[rel] = [st.st_size, st.st_mtime_ns, sha256_file(fp)]
+    # One pass, and the manifest's two halves finally describe the SAME
+    # instant (P3/R6): the per-file records and the fingerprint used to
+    # come from two walks a moment apart, so a corpus being written
+    # during a tend could be recorded as a file set from one walk and a
+    # digest from another. `scan` lets a caller that already walked
+    # (`status --record`) hand its records over instead of paying twice.
+    scan = scan_corpus(root, want_sha=True) if scan is None else scan
+    files: dict[str, list] = {
+        e.rel: [e.size, e.mtime_ns, e.sha256 if e.hashed else None] for e in scan.files
+    }
     manifest = {
         "schema": MANIFEST_SCHEMA,
         "recorded_at": datetime.now(tz=timezone.utc).isoformat(timespec="seconds"),
-        "fingerprint": corpus_fingerprint(root),
+        "fingerprint": scan.fingerprint(),
         "file_count": len(files),
         "files": files,
         "unresolved": unresolved,
@@ -159,27 +159,20 @@ def write_manifest(
     return manifest
 
 
-def _walk_now(root: Path) -> dict[str, tuple[int, int, str | None]]:
+def _walk_now(root: Path, scan=None) -> dict[str, tuple[int, int, str | None]]:
     """Current disk state per file: [size, mtime_ns, sha256_or_null].
 
     The hash slot mirrors the manifest: null for files past
     sha256_file's 64 MiB cap, which then compare on size+mtime only.
+    `scan` is a prepared hash pass (see scan_corpus) — `status` holds one
+    for the whole command, so the diff, the nested-corpus list and the
+    reported fingerprint all come off the same walk (R6).
     """
-    out: dict[str, tuple[int, int, str | None]] = {}
-    for dirpath, _dirnames, filenames in corpus_walk(root):
-        dirpath = Path(dirpath)
-        for fn in filenames:
-            fp = dirpath / fn
-            try:
-                st = fp.stat()
-            except OSError:
-                continue
-            out[fp.relative_to(root).as_posix()] = (
-                st.st_size,
-                st.st_mtime_ns,
-                sha256_file(fp),
-            )
-    return out
+    if scan is None:
+        scan = scan_corpus(root, want_sha=True)
+    return {
+        e.rel: (e.size, e.mtime_ns, e.sha256 if e.hashed else None) for e in scan.files
+    }
 
 
 def _entry_changed(old: list, now: tuple) -> bool:
@@ -306,6 +299,11 @@ def status_all(roots: list[str], record: bool = False) -> list[dict]:
 
 def _status(root: Path, record: bool = False) -> dict:
     root = root.resolve()
+    # R6: one pass answers the whole command. The diff, the nested-corpus
+    # list, `fingerprint_now` and (on --record) the manifest itself all
+    # come off this walk, so the status surface cannot report three
+    # snapshots of a corpus that moved underneath it.
+    scan = scan_corpus(root, want_sha=True)
     if record:
         # --record is the documented recovery for a corrupt manifest
         # (manifest_unreadable's own hint says "delete it and run
@@ -319,16 +317,16 @@ def _status(root: Path, record: bool = False) -> dict:
         except SlopKeeperError as e:
             if e.code != "manifest_unreadable":
                 raise
-        manifest = write_manifest(root)
+        manifest = write_manifest(root, scan=scan)
     else:
         manifest = load_manifest(root)
 
-    now = _walk_now(root)
+    now = _walk_now(root, scan)
     if manifest is None:
         return {
             "never_tended": True,
             "file_count": len(now),
-            "nested_corpora": nested_corpora(root),
+            "nested_corpora": sorted(set(scan.report.nested)),
             "advice": [
                 "No manifest: either this corpus was never organized, or "
                 "tending happened without SlopKeeper.",
@@ -360,7 +358,7 @@ def _status(root: Path, record: bool = False) -> dict:
     # files are neither vanished nor broken, they are another corpus's
     # business now. Reported under removed_now_nested and named in
     # nested_corpora, never a fake removal storm.
-    nested = nested_corpora(root)
+    nested = sorted(set(scan.report.nested))
 
     def _under_nested(rel: str) -> bool:
         return any(rel == n or rel.startswith(n + "/") for n in nested)
@@ -446,7 +444,7 @@ def _status(root: Path, record: bool = False) -> dict:
         "removed_now_nested": removed_now_nested,
         "nested_corpora": nested,
         "estimated_triage_tokens": est_chars // CHARS_PER_TOKEN,
-        "fingerprint_now": corpus_fingerprint(root),
+        "fingerprint_now": scan.fingerprint(),
         "fingerprint_then": manifest.get("fingerprint"),
         "folders_missing_agents_md": agents_missing,
         "stale_folders": stale_folders,

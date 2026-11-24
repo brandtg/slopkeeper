@@ -73,8 +73,12 @@ the JSON subcommands documented here; they are scriptable and stable.)
    citation (path context is required); a bare basename mention
    matches only names of 3+ characters containing a dot, and an
    ambiguous basename (several corpus files share it) is never
-   attributed; extensionless files and non-text extensions are never
-   read.
+   attributed; a file the shared type table calls binary is never read.
+   "Text" is one answer for the whole tool (0.2.8): the extension table
+   where it speaks, a NUL sniff where it does not, so a file
+   `inventory` reports as `kind: text` is scannable for citations even
+   when its extension appears in no list — and an extensionless file
+   can hold a citation, it just cannot be named by a bare basename.
 5. **Unresolved is honest.** Files you can't classify go in
    `unresolved` with a reason — never guess. `keep` is for top-level
    entries that stay (a watchlist, a folder that is already right);
@@ -89,8 +93,11 @@ the JSON subcommands documented here; they are scriptable and stable.)
    The plan MUST carry the binding that gate checks:
    `based_on.corpus_fingerprint`, the `fingerprint` value from
    `slopkeeper inventory <root> --fast --summary` (the `inventory_sha256`
-   spelling is the read-only pre-T1 alias). A plan without it is refused
-   by validate and apply (`plan_no_based_on`) — `--force` escapes a
+   spelling is the read-only pre-T1 alias). It is the digest of the walk
+   that produced the file list you are planning against, not of a second
+   look taken after it (0.2.8: every corpus-side command walks exactly
+   once). A plan without it is refused by validate and apply
+   (`plan_no_based_on`) — `--force` escapes a
    MISMATCH, never a missing binding. `plan render` shows an unbound
    plan with a loud "no corpus binding" warning block and records
    `warnings: ["no_fingerprint"]` in the sidecar; render never
@@ -695,8 +702,10 @@ find/replace pairs for it:
           --scan-path inside the tool-layer skip list (.git,
           .slopkeeper, .venv, node_modules, ...) is never read and
           reported per-dir as scan_path_skip_list — never silently
-          empty. Non-text files are skipped; the per-file read cap is
-          512 KiB; scan dirs have no size ceiling.
+          empty. Files the shared type table calls binary are skipped
+          (an unlisted extension is decided by the NUL sniff, the same
+          answer `inventory` reports as `kind`); the per-file read cap
+          is 512 KiB; scan dirs have no size ceiling.
 
       slopkeeper refs <root> --dangling [--limit N] [--prefix <dir>]
         → path-ish citations that resolve to NOTHING (already-broken

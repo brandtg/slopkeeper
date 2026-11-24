@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "slopkeeper"
-version = "0.2.7"
+version = "0.2.8"
 description = "Someone has to clean up after your agents. Inventory, plan, human gate, all-or-nothing apply with undo: the agent classifies, the human approves, and nothing is ever deleted."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -58,6 +58,7 @@ slopkeeper = ["strategies/*.json", "AGENT_GUIDE.md", "SKILL.md"]
 testpaths = ["tests"]
 markers = [
   "bench: slow benchmark, excluded from the default suite (run tests/bench_reference_scan.py directly)",
+  "slow: scale smoke (5k+ files) — opt in with SLOPKEEPER_RUN_SLOW=1; weekly CI, not per-commit",
 ]
 
 [tool.ruff]

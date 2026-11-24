@@ -48,6 +48,7 @@ from .plan import (
 )
 from .propose import build_candidates
 from .roots import add_root, load_roots, remove_root
+from .scan import prepare
 from .scaffold import scaffold_from_plan
 from .similar import collect_similarity, hubs
 from .skill import install as install_skills
@@ -167,9 +168,14 @@ def cmd_inventory(args) -> int:
 
 def cmd_clusters(args) -> int:
     root = _resolve_dir(args.root)
-    inv = collect(root, depth=args.depth)
+    # One traversal for the whole command (P3/R6): the scan walks, stats
+    # and hashes every file once, the inventory document folds off it,
+    # and the vector cache keys on the SAME digests instead of hashing
+    # the corpus a second time to look itself up.
+    scan = prepare(root)
+    inv = collect(root, depth=args.depth, scan=scan)
     files = inv["files"]
-    data = collect_similarity(root, files)
+    data = collect_similarity(root, files, sha_of=scan.sha_of)
     if args.min_size > 1:
         data["clusters"] = [c for c in data["clusters"] if c["size"] >= args.min_size]
     if inv.get("references"):

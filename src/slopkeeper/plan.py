@@ -147,7 +147,10 @@ def _reject_dead_glob_prefix_rewrites(
     index = CitationIndex(_walk_rel_paths(root))
     checked: set[str] = set()
     for tp in _walk_rel_paths(root):
-        if not is_text_file(tp):
+        # Resolved against the corpus: is_text_file sniffs bytes for the
+        # extensions the table is silent about (0.2.8), and a bare
+        # relative name would be sniffed against the process CWD.
+        if not is_text_file(root / tp):
             continue
         try:
             raw = (root / tp).read_bytes()[:_PER_FILE_CAP]
