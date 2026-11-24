@@ -309,6 +309,25 @@ def doctor(root: Path) -> dict:
             "(fp5), so sandboxed and unsandboxed runs agree. If one is "
             "real content, fix the mount — the tool cannot read it."
         )
+    # B6: files the fingerprint walk could not stat. Inventory stats
+    # carry the count (`skipped_unstatable`) on every run; the advice
+    # fires only when it is non-zero, because a file that appears in
+    # the walk and then denies stat is a corpus being churned under the
+    # scan — and apply REFUSES such a tend (corpus_unstable) rather
+    # than bind a plan to a digest of a corpus that no longer exists.
+    if s.get("skipped_unstatable"):
+        named = ", ".join(f"`{p}`" for p in (s.get("skipped_unstatable_paths") or []))
+        more = s["skipped_unstatable"] - len(s.get("skipped_unstatable_paths") or [])
+        if more > 0:
+            named += f" …and {more} more"
+        advice.append(
+            f"{s['skipped_unstatable']} file(s) vanished or denied stat during "
+            "the walk (" + named + "): something is writing to this corpus "
+            "while it is scanned — a sync client, a build, an editor. "
+            "`apply` refuses to tend against such a fingerprint; stop the "
+            "churner and re-run. The paths ride along in "
+            "`stats.skipped_unstatable_paths`."
+        )
     dangling = dangling_citations(root, walk_files)
     if dangling:
         advice.append(

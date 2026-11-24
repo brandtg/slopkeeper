@@ -8,31 +8,45 @@ Safety invariants, in order:
 1. Nothing happens without --execute (dry-run is the default).
 2. A plan must carry a corpus binding (based_on.corpus_fingerprint, A1)
    and the corpus must match it; --force escapes the mismatch, never the
-   missing binding (plan_no_based_on).
+   missing binding (plan_no_based_on) and never a corpus that churned
+   under the walk (corpus_unstable, B6).
 3. Every move is pre-flighted (collisions, chains, nesting, symlink
    containment — A2) before ANY move, and destinations are re-checked
-   immediately before each write.
-4. Every executed move is journaled with a content hash; undo reverses exactly.
+   immediately before each write. A destination that appears in that
+   last window is refused (dst_exists), never clobbered — the move is
+   an atomic no-replace link/unlink (B4).
+4. Every executed move is journaled with a content hash, fsync'd line
+   by line under a per-tend filename (A4), and undo VERIFIES that hash
+   before restoring: a file edited after the move comes back with
+   `content_changed` on its row rather than a silent lie (B1).
 5. Nothing is ever deleted; a failed mid-run is recoverable via the journal.
 6. A mid-run IO failure is journaled-partial, never silent: recorded in
    `errors`, the envelope carries `partial: true`, the process exits
-   non-zero, and `next` points at the exact undo command.
+   non-zero, and `next` points at the exact undo command. An edit whose
+   find-text no longer occurs exactly once at write time is a recorded
+   `edit_stale`, never a guessed replacement (B3).
+7. Soft conditions that no check can refuse are LOUD on the envelope:
+   `warnings` names a platform without locking (B7) and a corpus that
+   moved between the gate and the first write (B5). The journal header
+   carries the plan's fingerprint and the at-execute fingerprint
+   alongside the tend id, so any later audit can tell which disk ran.
 """
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import shutil
 import time
-from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .ignore import corpus_walk
 from .models import (
     SlopKeeperError,
-    corpus_fingerprint,
+    add_warning,
+    corpus_fingerprint_detail,
     corpus_path,
     resolve_chains,
     safe_move_path,
@@ -73,8 +87,76 @@ RENDER_WARNING = (
 
 
 def _default_journal(root: Path) -> Path:
+    """A journal path per TEND — never a shared file (A4).
+
+    The pre-0.2.7 name was second-granularity UTC plus append mode, so
+    two `apply --execute` runs inside one second wrote into ONE journal
+    and `undo` reverted both tends at once — the documented "undo one
+    tend" model was wrong at second granularity (the 2026-11-23 audit's
+    A4). Same-second tends now land in `-2`, `-3`… siblings; the tend id
+    (the filename stem) rides in each journal's provenance header, so a
+    journal always names the tend it records.
+
+    Called only under the tend lock (execute mode), so the exists()
+    probe cannot race another slopkeeper process; an explicitly passed
+    `journal_path` (tests, scripted batch runs) keeps its append
+    semantics — naming a file is an instruction to share it.
+    """
     ts = datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    return state_dir(root) / f"journal-{ts}.jsonl"
+    base = state_dir(root)
+    path = base / f"journal-{ts}.jsonl"
+    n = 2
+    while path.exists():
+        path = base / f"journal-{ts}-{n}.jsonl"
+        n += 1
+    return path
+
+
+def _journal_write(jf, doc: dict) -> None:
+    """One whole journal line, durable before the next mutation (A4/B2).
+
+    write + flush + os.fsync: the journal is the LAST-RESORT recovery
+    mechanism, and a crash between two ops must never find it holding a
+    half-written JSON object — the line either reached the disk whole or
+    did not exist. Small N per tend, so the fsync tax is negligible
+    against the moves it protects. OSError propagates to the caller's
+    existing per-op handler (a line that cannot be journaled is recorded
+    as `moved but journal write failed`, never swallowed).
+    """
+    jf.write(json.dumps(doc) + "\n")
+    jf.flush()
+    os.fsync(jf.fileno())
+
+
+def _refuse_corpus_churn(health: dict, force: bool) -> int:
+    """B6: a corpus that churned under the fingerprint walk is not tended.
+
+    Returns the count of files the walk could not stat (0 = a clean
+    walk); raises `corpus_unstable` when it is non-zero unless --force.
+    Before 0.2.7 each such file hit a bare `continue`, so the digest
+    quietly described LESS than the corpus and the drift gate compared
+    two digests of two different disks — a plan authored against a
+    stable corpus applied clean while something rewrote it under the
+    scan. A churny corpus is not a plan problem, so the refusal names
+    the suspect paths and the fix (stop the writer, re-run); --force is
+    the operator's explicit "I know, proceed", and even then the count
+    rides the envelope as `skipped_unstatable` — never swallowed.
+    """
+    n = int(health.get("skipped_unstatable") or 0)
+    if not n or force:
+        return n
+    named = list(health.get("skipped_unstatable_paths") or [])
+    detail = ""
+    if named:
+        detail = ": " + ", ".join(named) + (" …" if n > len(named) else "")
+    raise SlopKeeperError(
+        "corpus_unstable",
+        f"{n} file(s) vanished or denied stat while the corpus was walked{detail}",
+        "Something is writing to this corpus right now (an editor, a sync "
+        "client, a build) — a fingerprint cannot bind a moving target, so "
+        "nothing was moved. Stop the writer and re-run; --force proceeds "
+        "anyway and records the count on the envelope.",
+    )
 
 
 def _all_rel_paths(root: Path) -> list[Path]:
@@ -652,17 +734,15 @@ def _merge_dir_move(
             errors.append({"src": child_src, "error": f"OSError: {err}"})
             continue
         try:
-            jf.write(
-                json.dumps(
-                    {
-                        "ts": time.time(),
-                        "src": child_src,
-                        "dst": child_dst,
-                        "sha256": digest,
-                        "op": "move",
-                    }
-                )
-                + "\n"
+            _journal_write(
+                jf,
+                {
+                    "ts": time.time(),
+                    "src": child_src,
+                    "dst": child_dst,
+                    "sha256": digest,
+                    "op": "move",
+                },
             )
         except OSError as err:
             errors.append(
@@ -678,6 +758,64 @@ def _merge_dir_move(
         src_abs.rmdir()
     except OSError:
         pass
+
+
+# errno values that mean "hardlinks are not a thing here" rather than
+# "something is wrong with these files": EXDEV (cross-device) plus the
+# EPERM/EMLINK/ENOTSUP/ENOSYS/EINVAL family filesystems and platforms
+# report for an unsupported link(). Anything else is a real failure and
+# propagates as an OSError for the caller to record.
+_HARDLINK_UNSUPPORTED = frozenset(
+    e
+    for e in (
+        errno.EXDEV,
+        errno.EPERM,
+        errno.EMLINK,
+        getattr(errno, "ENOTSUP", None),
+        errno.ENOSYS,
+        errno.EINVAL,
+        errno.EOPNOTSUPP,
+    )
+    if e is not None
+)
+
+
+def _move_no_clobber(src_abs: Path, dst_abs: Path) -> None:
+    """Atomic no-replace FILE move (B4): the clobber window, closed.
+
+    apply pre-flights every destination, then the move loop runs — and
+    a file created by anyone else in that window was silently destroyed,
+    because `shutil.move` is a bare rename and POSIX rename REPLACES.
+    `os.link` is the stdlib's only atomic no-replace primitive: it fails
+    EEXIST when the destination exists, so the race resolves in the
+    owner's favor instead of the tool's. Then `os.unlink` removes the
+    source, which completes the move (same inode, so content, mode and
+    times ride along exactly as a rename would).
+
+    Raises FileExistsError when the destination appeared mid-run — the
+    caller records `dst_exists` and refuses THAT move (a partial run,
+    never a clobber). Filesystems without hardlinks (and the rare
+    cross-device link) fall back to a re-check + shutil.move: no
+    stdlib primitive renames across devices, so that path keeps its
+    last-moment `lexists` guard and is a last resort, not the default.
+
+    follow_symlinks=False so a symlink SOURCE moves the LINK (its own
+    bytes), never a copy of whatever it points at.
+    """
+    try:
+        os.link(src_abs, dst_abs, follow_symlinks=False)
+    except FileExistsError:
+        raise
+    except OSError as err:
+        if err.errno not in _HARDLINK_UNSUPPORTED:
+            raise
+        if os.path.lexists(dst_abs):
+            raise FileExistsError(
+                errno.EEXIST, "Destination exists", str(dst_abs)
+            ) from None
+        shutil.move(str(src_abs), str(dst_abs))
+        return
+    os.unlink(src_abs)
 
 
 def _execution_order(chains: dict[str, str]) -> list[tuple[str, str]]:
@@ -732,10 +870,28 @@ def apply_plan(
     allow_symlinks (CLI --allow-symlinks) is the deliberate traversal
     flag for the A2 move-path containment policy; default False refuses
     moves through or onto symlinks (symlink_escape).
+
+    A tend that ran WITHOUT the lock (a platform with no fcntl) says so
+    on its own envelope — `warnings: ["no_locking_available"]` (B7).
+    Failing soft was the old behavior; failing soft IN SILENCE was the
+    bug: the agent read the same payload a serialized run produces.
     """
     root = corpus_root.resolve()
-    with tend_lock(root) if execute else nullcontext():
+    if not execute:
+        # Dry-runs take no lock, and no-lock means no locking warning to
+        # report: nothing here needed serializing.
         return _apply_plan(
+            plan_path,
+            root,
+            execute=False,
+            force=force,
+            allow_partial=allow_partial,
+            strict_references=strict_references,
+            journal_path=journal_path,
+            allow_symlinks=allow_symlinks,
+        )
+    with tend_lock(root) as lock:
+        data = _apply_plan(
             plan_path,
             root,
             execute=execute,
@@ -745,6 +901,9 @@ def apply_plan(
             journal_path=journal_path,
             allow_symlinks=allow_symlinks,
         )
+    if lock.unavailable:
+        add_warning(data, "no_locking_available")
+    return data
 
 
 def _render_mismatch_warning(root: Path, plan_sha256: str) -> str | None:
@@ -798,7 +957,14 @@ def _apply_plan(
     # refused a missing binding; this raise is the gate's own refusal —
     # in-process callers that opted out of validation never apply an
     # unbound plan either. --force escapes the MISMATCH only.
-    current = corpus_fingerprint(root)
+    #
+    # B6 first: the digest is only evidence if the walk saw everything.
+    # Files that vanished or denied stat mid-walk used to `continue`
+    # silently, so the two digests being compared could describe two
+    # different corpora and still "pass". The count refuses the tend
+    # before the comparison is even meaningful.
+    current, fp_health = corpus_fingerprint_detail(root)
+    unstatable = _refuse_corpus_churn(fp_health, force)
     recorded = based_on_binding(plan)
     if not recorded:
         raise SlopKeeperError(
@@ -1013,6 +1179,11 @@ def _apply_plan(
             "reference_risks": ref_report,
             "fingerprint": current,
         }
+        if unstatable:
+            # B6: the dry run says it too — a churny corpus is worth
+            # knowing about before the human approves the render.
+            dry["skipped_unstatable"] = unstatable
+            add_warning(dry, "skipped_unstatable")
         if rewrite_mode != "off":
             summary = _rewrite_summary()
             # Per-file would-be counts; zero writes happen in a dry run.
@@ -1033,12 +1204,39 @@ def _apply_plan(
     # First line is the provenance header binding the journal to
     # the plan's exact bytes; undo skips non-move ops, so it tolerates
     # the header wherever it sits.
+    #
+    # B5 (minimal forensics): a SECOND fingerprint, taken here under the
+    # tend lock after every pre-flight and immediately before the first
+    # write. The gate's digest and this one bound the window the run
+    # actually wrote into: if they differ, something outside this process
+    # moved the disk between the gate and the moves, and the envelope
+    # says so (`warnings: ["fingerprint_moved_during_apply"]`). The
+    # plan's own binding rides the header beside them, so an audit after
+    # the fact can tell which corpus the plan believed, which the gate
+    # saw, and which got moved (a --force apply is exactly the case where
+    # plan ≠ gate in the header). P3's single-pass scanner makes the
+    # extra walk free; until then the audit trail costs one more hashing
+    # pass over the corpus.
+    at_execute, exec_health = corpus_fingerprint_detail(root)
+    unstatable = max(unstatable, _refuse_corpus_churn(exec_health, force))
     journal = journal_path or _default_journal(root)
     journal.parent.mkdir(parents=True, exist_ok=True)
     moved, edits_applied, errors, rewrote = [], [], [], []
     with journal.open("a", encoding="utf-8") as jf:
-        jf.write(
-            json.dumps({"op": "plan", "sha256": plan_sha256, "ts": time.time()}) + "\n"
+        _journal_write(
+            jf,
+            {
+                "op": "plan",
+                "tend_id": journal.stem,
+                "sha256": plan_sha256,
+                "ts": time.time(),
+                # B5: plan binding / gate digest / at-execute digest —
+                # the three instants one tend spans (a torn or edited
+                # journal still says which corpus it belongs to).
+                "plan_fingerprint": recorded,
+                "gate_fingerprint": current,
+                "execute_fingerprint": at_execute,
+            },
         )
         for src, dst in _execution_order(chains):
             src_abs = corpus_path(root, Path(src))
@@ -1066,25 +1264,53 @@ def _apply_plan(
             # record and continue. Earlier hops stay journaled and
             # undoable; the envelope reports partial and points at the
             # journal (T5).
+            #
+            # B4: the destination gets one last look INSIDE the write.
+            # The pre-flight ran before the reference scan and the whole
+            # rewrite pass — minutes of wall clock on a big corpus — and
+            # a file created in the window used to be silently renamed
+            # over. A FileExistsError here is that owner still holding
+            # their file: record `dst_exists`, skip this hop, keep the
+            # run undoable.
             try:
                 digest = sha256_file(src_abs)
                 dst_abs.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(src_abs), str(dst_abs))
+                if src_abs.is_dir():
+                    # A directory rename cannot be a no-replace link
+                    # (no hardlinks to dirs): re-check and refuse if the
+                    # path appeared since the pre-flight — shutil.move
+                    # would replace an empty dir or bury the tree in a
+                    # non-empty one.
+                    if os.path.lexists(dst_abs):
+                        raise FileExistsError(
+                            errno.EEXIST, "Destination exists", str(dst_abs)
+                        )
+                    shutil.move(str(src_abs), str(dst_abs))
+                else:
+                    _move_no_clobber(src_abs, dst_abs)
+            except FileExistsError as err:
+                errors.append(
+                    {
+                        "src": src,
+                        "dst": dst,
+                        "error": f"dst_exists: {err.filename or dst} appeared "
+                        "mid-apply — not overwritten",
+                    }
+                )
+                continue
             except OSError as err:
                 errors.append({"src": src, "error": f"OSError: {err}"})
                 continue
             try:
-                jf.write(
-                    json.dumps(
-                        {
-                            "ts": time.time(),
-                            "src": src,
-                            "dst": dst,
-                            "sha256": digest,
-                            "op": "move",
-                        }
-                    )
-                    + "\n"
+                _journal_write(
+                    jf,
+                    {
+                        "ts": time.time(),
+                        "src": src,
+                        "dst": dst,
+                        "sha256": digest,
+                        "op": "move",
+                    },
                 )
             except OSError as err:
                 # The move happened; record it, and say it is
@@ -1138,17 +1364,15 @@ def _apply_plan(
                 errors.append({"file": report_rel, "error": f"OSError: {err}"})
                 continue
             try:
-                jf.write(
-                    json.dumps(
-                        {
-                            "ts": time.time(),
-                            "op": "rewrite",
-                            "file": report_rel,
-                            "replacements": reps,
-                            "count": len(reps),
-                        }
-                    )
-                    + "\n"
+                _journal_write(
+                    jf,
+                    {
+                        "ts": time.time(),
+                        "op": "rewrite",
+                        "file": report_rel,
+                        "replacements": reps,
+                        "count": len(reps),
+                    },
                 )
             except OSError as err:
                 errors.append(
@@ -1165,9 +1389,6 @@ def _apply_plan(
             try:
                 before = sha256_file(fp)
                 text = _read_edit_text(fp, final)
-                fp.write_text(
-                    text.replace(e["find"], e["replace"], 1), encoding="utf-8"
-                )
             except OSError as err:
                 errors.append({"file": final, "error": f"OSError: {err}"})
                 continue
@@ -1177,19 +1398,47 @@ def _apply_plan(
                 # recorded and continued, never a crash mid-apply.
                 errors.append({"file": final, "error": f"{err.code}: {err.message}"})
                 continue
+            # B3: re-verify the find text AT WRITE TIME, with the same
+            # discipline the rewrite pass uses one loop above (it checks
+            # its `old` is still on the line before touching it). The
+            # exactly-once rule was validated against the POST-REWRITE
+            # view of PRE-MOVE content; between then and now the moves
+            # ran, the pass wrote, and anything outside this process may
+            # have written too. A `replace(find, x, 1)` on drifted text
+            # edits the wrong occurrence — or none at all, silently —
+            # and journals the edit as applied either way. Absent or
+            # ambiguous now records `edit_stale` and writes nothing:
+            # loud, partial, undoable — never a guess.
+            find = str(e["find"])
+            hits = text.count(find)
+            if hits != 1:
+                errors.append(
+                    {
+                        "file": final,
+                        "error": f"edit_stale: find text occurred {hits} time(s) "
+                        "at write time, expected exactly 1 — the file changed "
+                        "after validation; nothing was edited",
+                    }
+                )
+                continue
             try:
-                jf.write(
-                    json.dumps(
-                        {
-                            "ts": time.time(),
-                            "op": "edit",
-                            "file": final,
-                            "find": e["find"],
-                            "replace": e["replace"],
-                            "sha256_before": before,
-                        }
-                    )
-                    + "\n"
+                fp.write_text(
+                    text.replace(find, str(e["replace"]), 1), encoding="utf-8"
+                )
+            except OSError as err:
+                errors.append({"file": final, "error": f"OSError: {err}"})
+                continue
+            try:
+                _journal_write(
+                    jf,
+                    {
+                        "ts": time.time(),
+                        "op": "edit",
+                        "file": final,
+                        "find": e["find"],
+                        "replace": e["replace"],
+                        "sha256_before": before,
+                    },
                 )
             except OSError as err:
                 errors.append(
@@ -1224,16 +1473,14 @@ def _apply_plan(
                     errors.append({"dir": d, "error": f"OSError: {err}"})
                     continue
                 try:
-                    jf.write(
-                        json.dumps(
-                            {
-                                "ts": time.time(),
-                                "op": "rmdir",
-                                "dir": d,
-                                "empty_dirs": empty_shape,
-                            }
-                        )
-                        + "\n"
+                    _journal_write(
+                        jf,
+                        {
+                            "ts": time.time(),
+                            "op": "rmdir",
+                            "dir": d,
+                            "empty_dirs": empty_shape,
+                        },
                     )
                 except OSError as err:
                     errors.append(
@@ -1274,7 +1521,21 @@ def _apply_plan(
         "reference_risks": ref_report,
         "journal": str(journal),
         "fingerprint": current,
+        # B5: the digest taken immediately before the first write. Equal
+        # to `fingerprint` in a clean run; different means the corpus
+        # moved between the gate and the moves (--force always looks
+        # like this). Both are in the journal header too.
+        "fingerprint_execute": at_execute,
     }
+    if at_execute != current:
+        # B5: drift the gate waved through (or --force waved through)
+        # gets a machine-greppable flag on the envelope, not just a
+        # number in the journal.
+        add_warning(executed, "fingerprint_moved_during_apply")
+    if unstatable:
+        # B6 under --force: the count survives; silence was the bug.
+        executed["skipped_unstatable"] = unstatable
+        add_warning(executed, "skipped_unstatable")
     if removal_ran:
         executed["removed_dirs"] = removed_dirs
     if rewrite_mode != "off":
@@ -1293,29 +1554,92 @@ def _apply_plan(
     return executed
 
 
-def undo_journal(journal_path: Path, corpus_root: Path, execute: bool = False) -> dict:
+def undo_journal(
+    journal_path: Path,
+    corpus_root: Path,
+    execute: bool = False,
+    force: bool = False,
+) -> dict:
     """Reverse a journal (execute mode runs under the tend lock).
 
     Dry-run undo is a pure read: no lock, safe beside a running tend.
+
+    force (CLI undo --force) is the escape hatch for a journal that is
+    malformed in the MIDDLE (B2): the default refuses to replay a
+    recovery record someone has edited, because the ops around the torn
+    line may be missing. A torn TAIL — the crash-mid-write case — is
+    always tolerated. See _undo_journal.
     """
     root = corpus_root.resolve()
-    with tend_lock(root) if execute else nullcontext():
-        return _undo_journal(journal_path, root, execute=execute)
+    if not execute:
+        return _undo_journal(journal_path, root, execute=False, force=force)
+    with tend_lock(root) as lock:
+        data = _undo_journal(journal_path, root, execute=execute, force=force)
+    if lock.unavailable:
+        add_warning(data, "no_locking_available")
+    return data
 
 
-def _undo_journal(journal_path: Path, corpus_root: Path, execute: bool = False) -> dict:
+def _undo_journal(
+    journal_path: Path,
+    corpus_root: Path,
+    execute: bool = False,
+    force: bool = False,
+) -> dict:
     root = corpus_root.resolve()
-    entries = []
+    entries: list[dict] = []
+    corrupt = 0
+    mid_corrupt = 0
+    tend_id = ""
     try:
-        for line in journal_path.read_text(encoding="utf-8").splitlines():
-            if line.strip():
-                entries.append(json.loads(line))
+        # B2: read the recovery record forgivingly. errors="replace" so
+        # even an undecodable byte becomes a malformed LINE (counted and
+        # reported below) instead of killing the whole undo with a
+        # UnicodeDecodeError — the journal is the last resort, and the
+        # old `read_text(...)` + a single try/OSError meant one torn line
+        # (crash mid-write) or one hand edit made the tend
+        # un-undoable outright.
+        raw = journal_path.read_bytes().decode("utf-8", errors="replace")
     except OSError as e:
         raise SlopKeeperError("journal_unreadable", str(e))
+    lines = raw.splitlines()
+    content = [i for i, ln in enumerate(lines) if ln.strip()]
+    last_content = content[-1] if content else -1
+    for i in content:
+        try:
+            entry = json.loads(lines[i])
+        except json.JSONDecodeError:
+            corrupt += 1
+            if i != last_content:
+                mid_corrupt += 1
+            continue
+        if not isinstance(entry, dict):
+            # A bare list/string/number is not an op record; same
+            # tolerance as a malformed line (B2), never a crash on
+            # `.get` three lines down.
+            corrupt += 1
+            if i != last_content:
+                mid_corrupt += 1
+            continue
+        if entry.get("op") == "plan" and isinstance(entry.get("tend_id"), str):
+            tend_id = entry["tend_id"]
+        entries.append(entry)
     if not entries:
         raise SlopKeeperError("journal_empty", "nothing to undo")
+    if mid_corrupt and execute and not force:
+        raise SlopKeeperError(
+            "journal_corrupt",
+            f"{mid_corrupt} malformed line(s) before the end of {journal_path.name} "
+            f"({corrupt} total) — undo refuses to replay a partial record",
+            "A torn LAST line is a crash artifact and is tolerated; a "
+            "malformed line in the MIDDLE means the journal was edited or "
+            "truncated. Inspect the file, fix or drop the bad line, then "
+            "undo again — or pass --force to undo the ops that did parse "
+            "(the rest stay applied). Nothing was restored.",
+        )
 
     ops = []
+    content_changed_rows = 0
     for e in reversed(entries):
         if e.get("op") == "rewrite":
             # Reverse replay: per journaled line, `new` must be present
@@ -1427,14 +1751,81 @@ def _undo_journal(journal_path: Path, corpus_root: Path, execute: bool = False) 
         if src_abs.exists():
             ops.append({"src": e["src"], "status": "blocked_dst_occupied"})
             continue
+        # B1: the journaled content hash is a CHECKPOINT, not decoration
+        # (the module docstring always said the move is "journaled with a
+        # content hash"; nothing ever compared it). The file at `dst` may
+        # have been edited after the tend — by an agent, an editor, a
+        # sync client — and undo would restore that mutated content to
+        # the original path and report a clean "restored". Hash it first:
+        # a mismatch still restores (the human's file comes back, and
+        # deleting it would be the worse lie) but says `content_changed`
+        # on the row, with both digests for the diff. Moves reach parity
+        # with the edit/rewrite reversal above, which already refuses on
+        # drift (`already_changed`) instead of guessing.
+        content_changed = False
+        expected = e.get("sha256")
+        actual: str | None = None
+        if expected and os.path.isfile(dst_abs):
+            actual = sha256_file(dst_abs)
+            # None = too big / unreadable to hash: unverifiable, which is
+            # not evidence of change — never flag on a missing hash.
+            if actual is not None and actual != expected:
+                content_changed = True
+                content_changed_rows += 1
         if execute:
             src_abs.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(dst_abs), str(src_abs))
+            try:
+                if os.path.isfile(dst_abs):
+                    # B4's discipline on the way back too: never rename
+                    # over a file someone put at the source path.
+                    _move_no_clobber(dst_abs, src_abs)
+                else:
+                    if os.path.lexists(src_abs):
+                        raise FileExistsError(
+                            errno.EEXIST, "Destination exists", str(src_abs)
+                        )
+                    shutil.move(str(dst_abs), str(src_abs))
+            except FileExistsError:
+                ops.append({"src": e["src"], "status": "blocked_dst_occupied"})
+                continue
+            except OSError as err:
+                # The restore itself failed (EACCES, disk gone). Recorded,
+                # never raised: the remaining ops still reverse, and the
+                # row says which one did not and why.
+                ops.append(
+                    {"src": e["src"], "status": "restore_failed", "error": str(err)}
+                )
+                continue
             _prune_empty_dirs(dst_abs.parent, root)
-        ops.append(
-            {"src": e["src"], "status": "restored" if execute else "would_restore"}
-        )
+        row: dict = {
+            "src": e["src"],
+            "status": "restored" if execute else "would_restore",
+        }
+        if content_changed:
+            row["content_changed"] = True
+            row["sha256_journaled"] = expected
+            row["sha256_now"] = actual
+        ops.append(row)
     result = {"mode": "executed" if execute else "dry-run", "operations": ops}
+    if tend_id:
+        # A4: one journal per tend, and the tend names itself — the
+        # "undo exactly one tend" model the guide promises.
+        result["tend_id"] = tend_id
+    if corrupt:
+        # B2: malformed lines are counted, never a crash. A torn TAIL is
+        # tolerated outright; a middle-line corruption refused --execute
+        # above (dry-run still reports so the human sees what execute
+        # would do, and why it needs --force).
+        result["journal_corrupt_lines"] = corrupt
+        if mid_corrupt:
+            result["journal_corrupt_mid_lines"] = mid_corrupt
+            if not execute:
+                add_warning(result, "journal_corrupt_needs_force")
+    if content_changed_rows:
+        # B1: the per-row flags are the detail; this is the count an
+        # agent keys off without walking `operations`.
+        result["content_changed_count"] = content_changed_rows
+        add_warning(result, "content_changed")
     if execute:
         # the manifest describes the CURRENT tended state, and the
         # plan this journal came from did not happen — refresh the

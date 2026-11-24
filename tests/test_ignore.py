@@ -48,6 +48,140 @@ def plan_dict(root, moves, **extra):
     return plan
 
 
+# --- gitignore conformance fixture (A6, 0.2.7) -----------------------------
+#
+# Every (rule, path, is_dir) outcome below is GIT'S OWN verdict, produced
+# by `git check-ignore --no-index` against a scratch repo holding exactly
+# these paths with exactly this one rule in .gitignore. Humans and agents
+# write `.slopkeeperignore` lines believing gitignore semantics — the
+# 2026-11-23 audit's A6 was precisely that trust broken: `a/**/b` compiled
+# to require an intervening directory, so `a/b` was silently NOT ignored
+# and SlopKeeper planned to organize files the owner meant excluded.
+#
+# Two probes are listed as documented deviations, asserted to OUR answer
+# with the reason named. Everything else must agree with git exactly.
+GIT_CONFORMANCE = [
+    # a `**` SEGMENT spans ZERO or more directories (the A6 fix)
+    ("a/**/b", "a/b", False, True),
+    ("a/**/b", "a/x/b", False, True),
+    ("a/**/b", "a/x/y/b", False, True),
+    ("a/**/b", "b", False, False),
+    ("a/**/b", "z/a/b", False, False),
+    ("deep/**/d.txt", "deep/a/b/c/d.txt", False, True),
+    ("deep/**/d.txt", "deep/d.txt", False, True),
+    ("assets/**/*.png", "assets/y.png", False, True),
+    ("assets/**/*.png", "assets/x/y.png", False, True),
+    ("assets/**/*.png", "assets/x/y.jpg", False, False),
+    ("**/b", "b", False, True),
+    ("**/b", "a/b", False, True),
+    ("**/b", "z/a/b", False, True),
+    ("**/*.png", "assets/x/y.png", False, True),
+    ("**/secrets/**", "secrets/key.pem", False, True),
+    ("**/secrets/**", "a/secrets/key.pem", False, True),
+    ("**", "anything/at/all.md", False, True),
+    # trailing `**` = everything BELOW the directory
+    ("logs/**", "logs/x.txt", False, True),
+    ("logs/**", "logs/a/b.txt", False, True),
+    ("a/**", "a/b", False, True),
+    ("a/**", "a/x/b", False, True),
+    # directory-only rules
+    ("logs/", "logs", True, True),
+    ("logs/", "logs/x.txt", False, True),
+    ("logs/", "sub/logs/x.txt", False, True),
+    ("build/", "build", True, True),
+    ("build/", "build/x.md", False, True),
+    ("build/", "builds/x.md", False, False),
+    ("my.files/", "my.files/report.md", False, True),
+    ("data.backup", "data.backup/old.csv", False, True),
+    ("node_modules/", "src/node_modules/pkg/index.js", False, True),
+    # anchored rules (leading or interior slash)
+    ("/build", "build", True, True),
+    ("/docs/*.md", "docs/a.md", False, True),
+    ("/docs/*.md", "docs/sub/a.md", False, False),
+    ("docs/*.md", "docs/sub/a.md", False, False),
+    ("src/node_modules/", "src/node_modules/pkg/index.js", False, True),
+    ("src/node_modules/", "node_modules/pkg/index.js", False, False),
+    ("/a/b", "a/b", False, True),
+    ("/a/b", "z/a/b", False, False),
+    ("/README.md", "docs/README.md", False, False),
+    ("tmp/cache.o", "tmp/cache.o", False, True),
+    ("v1.0/spec.md", "v1.0/spec.md", False, True),
+    # basename rules match at any depth
+    ("*.log", "deep/x/y/c.log", False, True),
+    ("cache.o", "tmp/cache.o", False, True),
+    ("README.md", "docs/README.md", False, True),
+    (".DS_Store", ".DS_Store", False, True),
+    ("notes?.md", "notes1.md", False, True),
+    ("notes?.md", "notes.md", False, False),
+    ("LICENSE", "LICENSE", False, True),
+    # `*` never crosses a `/`
+    ("*.md", "a/b.md", False, True),
+    ("a/*.md", "a/b/c.md", False, False),
+    # documented gaps (v1 has no negation: '!' is a literal, so nothing
+    # is ignored — which is also git's answer for this one-rule file)
+    ("!keep.log", "keep.log", False, False),
+]
+
+# Probes where git and SlopKeeper answer differently ON PURPOSE: a rule
+# whose contents are all ignored makes git treat the directory itself as
+# ignored too (nothing is left to track). SlopKeeper judges the path the
+# rule names: `a/**` hides everything BELOW a, not a — the empty directory
+# stays visible so `inventory` and coverage still account for it. Asserted
+# to our answer so a future "fix" cannot flip it by accident.
+GIT_CONFORMANCE_DEVIATIONS = {
+    ("a/**", "a", True): False,
+    ("logs/**", "logs", True): False,
+}
+
+
+class TestGitignoreConformance(unittest.TestCase):
+    """The rules people actually write, checked against git's own answers."""
+
+    def test_matches_git_declared_outcomes(self):
+        disagreements = []
+        for rule, path, is_dir, git_says in GIT_CONFORMANCE:
+            ours = CorpusIgnore([rule]).is_ignored(path, is_dir=is_dir)
+            if ours != git_says:
+                disagreements.append(
+                    f"rule {rule!r} path {path!r} (dir={is_dir}): git={git_says} "
+                    f"ours={ours}"
+                )
+        self.assertEqual(
+            disagreements,
+            [],
+            ".slopkeeperignore drifted from gitignore semantics:\n  "
+            + "\n  ".join(disagreements),
+        )
+
+    def test_documented_deviations_are_the_only_ones(self):
+        # The deviation table is exhaustive: anything it names must be
+        # asserted to our documented answer, and nothing in the main table
+        # may duplicate it (a silent git-conformance regression would
+        # otherwise hide behind the exception).
+        for (rule, path, is_dir), ours in GIT_CONFORMANCE_DEVIATIONS.items():
+            self.assertEqual(
+                CorpusIgnore([rule]).is_ignored(path, is_dir=is_dir),
+                ours,
+                f"documented deviation ({rule!r}, {path!r}) changed meaning — "
+                "either conform to git or document the new deviation",
+            )
+            self.assertNotIn(
+                (rule, path, is_dir),
+                [(r, p, d) for r, p, d, _ in GIT_CONFORMANCE],
+                f"{rule!r}/{path!r} is in both the conformance table and the "
+                "deviation table",
+            )
+
+    def test_doublestar_zero_directory_case_is_the_regression(self):
+        # The audit's A6 repro, named: an ignore line written believing
+        # gitignore must not leave the flat file visible.
+        ig = CorpusIgnore(["inbox/**/draft.md", "reports/**"])
+        self.assertTrue(ig.is_ignored("inbox/draft.md"))
+        self.assertTrue(ig.is_ignored("inbox/2026/draft.md"))
+        self.assertTrue(ig.is_ignored("reports/anything.md"))
+        self.assertFalse(ig.is_ignored("notebook/draft.md"))
+
+
 class TestMatcher(unittest.TestCase):
     """The pattern language: gitignore's core rules, nothing more."""
 

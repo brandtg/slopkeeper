@@ -96,11 +96,36 @@ the JSON subcommands documented here; they are scriptable and stable.)
    `warnings: ["no_fingerprint"]` in the sidecar; render never
    fabricates a fingerprint. (0.2.6: the field was optional and the
    drift gate silently skipped itself without it — the audit's A1.)
+   A digest is only evidence if the walk saw everything: files that
+   vanish or deny `stat` mid-scan are counted, not skipped — inventory
+   and doctor report `stats.skipped_unstatable` (and
+   `skipped_unstatable_paths`), and apply refuses the tend
+   (`corpus_unstable`, 0.2.7 B6): a corpus being churned under the scan
+   cannot be bound at all. Stop the writer (sync client, editor, build)
+   and re-run; `--force` proceeds and the count rides the envelope as
+   `skipped_unstatable`.
+   Every executed apply also records WHICH disk ran. The journal header
+   carries `plan_fingerprint`, `gate_fingerprint` and
+   `execute_fingerprint` (the digest taken immediately before the first
+   write, under the lock); the envelope repeats the last two as
+   `fingerprint` / `fingerprint_execute`. They differ → the corpus moved
+   between the gate and the moves → `warnings:
+   ["fingerprint_moved_during_apply"]` (B5). A tend that ran where
+   `flock` does not exist says so too — `warnings:
+   ["no_locking_available"]` (B7) — because the payload is otherwise
+   identical to a serialized run and nothing could tell them apart.
 7. **Respect `.slopkeeperignore`.** A corpus may carry a
    `.slopkeeperignore` at its root (gitignore-style: `dir/` for a
    whole subtree at any depth, `*.ext` for basenames everywhere,
-   `/path` anchored to the root). Ignored paths are invisible to
-   inventory, draft, plans, reference scans and the fingerprint — the
+   `/path` anchored to the root, and a `**` SEGMENT spanning ZERO OR
+   MORE directories — `a/**/b` matches `a/b` as well as `a/x/b`, the
+   gitignore reading humans and agents actually write; 0.2.7 compiled
+   it as requiring an intervening directory, so `a/b` silently stayed
+   visible and got planned into a move the owner had excluded. `*` and
+   `?` never cross `/`). Plan `rules[].match` shares this one grammar,
+   so a pattern means the same thing in either file. Ignored paths are
+   invisible to inventory, draft, plans, reference scans and the
+   fingerprint — the
    tool will refuse any move source or edit target inside them
    (`move_source_ignored` / `edit_target_ignored`) even if your plan
    predates the ignore file. Ignored directories remain legal move
@@ -162,7 +187,11 @@ intentional name. When you add a fixture or an example, invent an
        nested corpora, code-anchored directories (file:line evidence),
        non-regular files (devices/FIFOs — sandbox deny-list mounts;
        pruned from every walk and the fingerprint so sandboxed and
-       unsandboxed runs agree), and a dangling-citation count
+       unsandboxed runs agree), a churn warning when files vanished or
+       denied `stat` under the walk (`stats.skipped_unstatable` +
+       `skipped_unstatable_paths`: something is writing here while it is
+       scanned, and `apply` refuses such a tend), and a
+       dangling-citation count
        (`refs --dangling` lists them).
 
 2. slopkeeper inventory <root> [--fast --summary | --out inv.json]
@@ -245,6 +274,18 @@ intentional name. When you add a fixture or an example, invent an
        (e.g. hand-edited JSON) gets a `render_warning` in the result —
        informational only: re-render or get explicit sign-off if the
        human approved the earlier render.
+       Execute results carry `fingerprint_execute` (the corpus digest
+       taken immediately before the first write) beside `fingerprint`
+       (the gate's), and a `warnings` array for the soft conditions no
+       check can refuse: `fingerprint_moved_during_apply` (B5),
+       `skipped_unstatable` (B6, under --force),
+       `no_locking_available` (B7, a platform without flock). Absent
+       means none fired. Mid-run refusals land in `errors` (and make
+       the run `partial`): a destination that appeared since the
+       pre-flight is recorded `dst_exists` and NOT overwritten (B4 —
+       the move is an atomic no-replace link/unlink), and an edit whose
+       `find` no longer occurs exactly once at write time is recorded
+       `edit_stale` rather than guessed at (B3).
 
 8. slopkeeper scaffold <plan.json> <root> --execute
      → writes AGENTS.md roster + per-folder AGENTS.md/STATE.md.
@@ -254,6 +295,29 @@ intentional name. When you add a fixture or an example, invent an
 9. Report: moved counts, risk resolutions, suggested-file merges needed,
    journal path (for undo). Offer: slopkeeper undo <journal> <root>
    (dry-run is the default; add --execute to actually restore)
+
+   ONE TEND, ONE JOURNAL (0.2.7 A4): every execute writes its own
+   `.slopkeeper/journal-<UTC-stamp>.jsonl`, and same-second tends get
+   `-2`, `-3`… siblings instead of appending into one file — so `undo`
+   reverses exactly the tend it names, never a neighbor that happened
+   to share a second. The journal's first line carries `tend_id` (its
+   own filename stem) plus the plan/gate/execute fingerprints; the dry
+   run and the restore both echo `tend_id`.
+   Undo VERIFIES each journaled content hash before restoring (B1): a
+   file edited after the tend still comes back (whatever it holds now —
+   undo never deletes), but its row carries `content_changed: true`
+   with `sha256_journaled`/`sha256_now`, and the result counts them as
+   `content_changed_count` + `warnings: ["content_changed"]`. Read that
+   list: a clean "restored" beside `content_changed` means someone's
+   post-tend work came back with the file.
+   A journal whose LAST line is torn (crash mid-write, B2) still undoes
+   — malformed lines are counted in `journal_corrupt_lines` and skipped,
+   and every line is fsync'd whole so a crash cannot leave a partial
+   object in the middle. Malformed lines BEFORE the last one mean the
+   recovery record itself was edited: `undo --execute` refuses with
+   `journal_corrupt` unless `--force`, which reverses the ops that did
+   parse. The dry run says so up front (`journal_corrupt_mid_lines`,
+   `warnings: ["journal_corrupt_needs_force"]`).
 
    PARTIAL APPLY: `apply --execute` can fail MID-RUN (an OSError on one
    hop — permissions, disk full). The envelope then carries
@@ -719,6 +783,7 @@ unexplained silence.
 | `plan_no_moves` | `moves` is not a list, or is empty on a non-partial plan | a plan needs at least one move — unless it carries `"partial": true` (a zero-move partial plan is valid: the draft filed everything as unresolved; validate it and `apply --execute` records the backlog) |
 | `plan_stale_src` | a source vanished | re-inventory, regenerate |
 | `corpus_changed` | fingerprint mismatch | re-inventory; `--force` only if yours |
+| `corpus_unstable` | the fingerprint walk could not stat N files (they vanished or denied stat mid-scan) — something is writing to the corpus while it is read (B6); inventory/doctor report the same count as `stats.skipped_unstatable` | stop the writer (sync client, editor, build) and re-run; `--force` proceeds and carries the count as `skipped_unstatable` on the envelope |
 | `plan_no_based_on` | the plan carries no corpus binding — `based_on.corpus_fingerprint` is missing, blank, or not a string (0.2.6: validate and apply always required it; the gate silently skipped itself without it) | author the plan from inventory output: run `slopkeeper inventory <root> --fast --summary` and record its `fingerprint` as `based_on.corpus_fingerprint`; `--force` does not bypass this |
 | `plan_dst_exists` | destination occupied (validate and apply share this pre-flight) | resolve collision in plan |
 | `referenced_moves` | strict mode: refs would break | rewrite refs first |
@@ -772,6 +837,7 @@ unexplained silence.
 | `edit_unreadable` | an edit target cannot be read | check the file exists and is readable |
 | `journal_unreadable` | the journal file cannot be read | check the journal path |
 | `journal_empty` | the journal contains no entries | nothing to undo |
+| `journal_corrupt` | a journal line is malformed in the MIDDLE (not the torn last line a crash leaves), so the recovery record itself was edited or truncated (B2) — undo refuses instead of replaying a partial tend; dry-run reports the count as `journal_corrupt_lines` | inspect the journal, fix or drop the bad line, undo again — or `--force` to reverse the ops that did parse |
 | `corpus_too_big` | draft's filed-file count exceeds its 3000 cap (clusters refuses with `similarity_cap`) | partition per-directory, or narrow the draft |
 | `plan_bad_rewrites` | plan.rewrites is not `{"mode": "auto"}` or `{"mode": "off"}` | set `"mode"` to `auto` (default) or `off`; it is the only key |
 | `rewrite_expect_mismatch` | an external root's `expect` count differs from the computed rewrite count | verify with `refs --scan-path`, fix `"expect"`, or drop the assertion |

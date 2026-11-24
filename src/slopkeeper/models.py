@@ -276,32 +276,26 @@ def sha256_file_exact(path: Path, chunk_bytes: int = 1 << 20) -> str:
     return h.hexdigest()
 
 
-def corpus_fingerprint(root: Path) -> str:
-    """Stable digest of content per non-skipped file — staleness is
-    content-based.
+# How many unstatable paths corpus_fingerprint_detail names (B6). The
+# COUNT is the contract — refuse/warn on it; the names are diagnostic
+# sugar, capped so a churning corpus cannot bloat the envelope.
+UNSTATABLE_NAMED = 10
 
-    Each entry hashes (relpath, size, sha256) with the content hash
-    from sha256_file, streamed in chunks — files are never slurped
-    whole. Files past sha256_file's 64 MiB cap (or unreadable ones)
-    yield None and contribute size+mtime only — one limit, reused, so
-    the fingerprint, manifest and journal agree on what "hashable"
-    means; mtime stays their identity because there is no hash.
 
-    The walk is corpus_walk (HIDDEN_SKIP_DIRS + the `.slopkeeperignore`
-    set — dot-directories are CONTENT as of fp4, only skip-list members
-    and ignored paths are invisible): ignored paths are invisible to the
-    gate. The ignore file itself is never walked either — it is tool
-    layer, not content — and is not hashed: only the effective path set
-    counts, so a comment-only ignore edit never moves the fingerprint.
+def corpus_fingerprint_detail(
+    root: Path,
+) -> tuple[str, dict]:
+    """(fingerprint, health) — the B6-loud form of corpus_fingerprint.
 
-    Used as a staleness gate: a plan computed against one fingerprint is
-    refused against a changed corpus unless --force. The `fp6:` prefix
-    version-separates the format (fp4 = the walk without the blanket
-    dot-dir prune — dot-dirs are content; fp6 = symlinked directories
-    counted as ENTRIES, audit A2): plans authored against fp1–fp5 fail
-    cleanly with `corpus_changed` instead of colliding. A bare `touch`
-    (new mtime, same content) does NOT change a fingerprint; a real
-    content edit does.
+    health carries `skipped_unstatable` (an int) and, when non-zero,
+    `skipped_unstatable_paths` (the first UNSTATABLE_NAMED). Before
+    0.2.7 an OSError on `stat()` hit a bare `continue`: a file that
+    appeared and vanished mid-walk, or a mount hiccup, shifted the
+    fingerprint SILENTLY — the drift gate then compared two digests of
+    two different corpora and blessed the plan anyway. The count turns
+    that into a fact the surfaces can act on: inventory and doctor
+    name it, apply refuses the tend (corpus_unstable) while the corpus
+    is actively being churned under the walk.
     """
     # Lazy import: ignore.py imports HIDDEN_SKIP_DIRS from this module,
     # so a top-level import here would be a circular-import trap.
@@ -309,6 +303,12 @@ def corpus_fingerprint(root: Path) -> str:
 
     h = hashlib.sha256()
     count = 0
+    unstatable: list[str] = []
+
+    def _name_unstatable(fp: Path) -> None:
+        if len(unstatable) < UNSTATABLE_NAMED:
+            unstatable.append(str(fp.relative_to(root)))
+
     for dirpath, dirnames, filenames in corpus_walk(root):
         dirpath = Path(dirpath)
         for dn in dirnames:
@@ -324,6 +324,9 @@ def corpus_fingerprint(root: Path) -> str:
                     continue
                 target = os.readlink(dp)
             except OSError:
+                # B6: an entry the walk listed that cannot be read is
+                # churn (or a dying mount), not noise to swallow.
+                _name_unstatable(dp)
                 continue
             h.update(str(dp.relative_to(root)).encode("utf-8", "replace"))
             h.update(b"\0symlink:")
@@ -335,6 +338,8 @@ def corpus_fingerprint(root: Path) -> str:
             try:
                 st = fp.stat()
             except OSError:
+                # B6: counted and named, never a silent skip.
+                _name_unstatable(fp)
                 continue
             digest = sha256_file(fp)
             h.update(str(fp.relative_to(root)).encode("utf-8", "replace"))
@@ -347,7 +352,49 @@ def corpus_fingerprint(root: Path) -> str:
                 h.update(str(st.st_mtime_ns).encode())
             h.update(b"\0")
             count += 1
-    return f"{CURRENT_FP_PREFIX}:{h.hexdigest()[:32]}:{count}"
+    health: dict = {"skipped_unstatable": len(unstatable)}
+    if unstatable:
+        health["skipped_unstatable_paths"] = unstatable
+    return f"{CURRENT_FP_PREFIX}:{h.hexdigest()[:32]}:{count}", health
+
+
+def corpus_fingerprint(root: Path) -> str:
+    """Stable digest of content per non-skipped file — staleness is
+    content-based.
+
+    Each entry hashes (relpath, size, sha256) with the content hash
+    from sha256_file, streamed in chunks — files are never slurped
+    whole. Files past sha256_file's 64 MiB cap (or unreadable ones)
+    yield None and contribute size+mtime only — one limit, reused, so
+    the fingerprint, manifest and journal agree on what "hashable"
+    means; mtime stays their identity because there is no hash. (The
+    "a bare touch does not move it" guarantee holds for hashable files
+    only: an over-cap or unreadable file IS its mtime, so touching one
+    does shift the digest. corpus_fingerprint_detail is the loud form;
+    this is its quiet wrapper for callers that only want the string.)
+
+    The walk is corpus_walk (HIDDEN_SKIP_DIRS + the `.slopkeeperignore`
+    set — dot-directories are CONTENT as of fp4, only skip-list members
+    and ignored paths are invisible): ignored paths are invisible to the
+    gate. The ignore file itself is never walked either — it is tool
+    layer, not content — and is not hashed: only the effective path set
+    counts, so a comment-only ignore edit never moves the fingerprint.
+
+    Used as a staleness gate: a plan computed against one fingerprint is
+    refused against a changed corpus unless --force. The `fp6:` prefix
+    version-separates the format (fp4 = the walk without the blanket
+    dot-dir prune — dot-dirs are content; fp6 = symlinked directories
+    counted as ENTRIES, audit A2): plans authored against fp1–fp5 fail
+    cleanly with `corpus_changed` instead of colliding. A bare `touch`
+    (new mtime, same content) does NOT change a fingerprint; a real
+    content edit does — unless the file is over the hash cap, where its
+    identity IS the mtime (see above).
+
+    Callers that must ACT on what the walk could not see (inventory,
+    doctor, apply's churn refusal) call corpus_fingerprint_detail; this
+    is the string-only convenience wrapper over it.
+    """
+    return corpus_fingerprint_detail(root)[0]
 
 
 # --- state dir ---------------------------------------------------------------
@@ -361,6 +408,29 @@ def state_dir(root: Path) -> Path:
 # --- tending lock ------------------------------------------
 
 TEND_LOCK_NAME = "tend.lock"
+
+
+class LockState:
+    """What a tend_lock acquisition actually achieved (B7).
+
+    tend_lock YIELDS one of these, and the mutating surfaces read it
+    after the span: `unavailable` is True when the platform has no
+    fcntl at all, so the "exclusive" tend ran with zero serialization.
+    A Windows operator used to get that in total silence — the same
+    envelopes as a locked POSIX run. Now apply/scaffold/undo/status
+    carry `warnings: ["no_locking_available"]` instead of pretending
+    the guarantee held.
+
+    `locked` distinguishes a real acquisition from a no-op span
+    (dry-runs take no lock and pass _NO_LOCK, so they never warn about
+    a lock they never needed).
+    """
+
+    __slots__ = ("locked", "unavailable")
+
+    def __init__(self, locked: bool = False, unavailable: bool = False):
+        self.locked = locked
+        self.unavailable = unavailable
 
 
 @contextmanager
@@ -378,7 +448,10 @@ def tend_lock(root: Path):
     it (Windows) the attempt fails SOFT — we proceed WITHOUT the lock
     rather than refuse the tend (zero-dep: no msvcrt pip fallbacks; the
     corpus tool is Unix-first, and the single-writer case is the common
-    one).
+    one). The yielded LockState says so (B7): a silent no-op lock is
+    worse than none, because the caller believes a guarantee the
+    platform never gave. Check state.unavailable after the span and
+    surface `no_locking_available` in the envelope.
 
     The OS releases the lock on process death, so there is no stale-
     lock logic and no cleanup ritual: the lock file may remain, an
@@ -392,12 +465,15 @@ def tend_lock(root: Path):
     write_manifest when apply already holds it) would conflict with
     itself.
     """
+    state = LockState()
     try:
         import fcntl  # POSIX-only; imported here so Windows never sees it
     except ImportError:
-        # No fcntl (Windows): fail soft — proceed unlocked.
-        # Covered on POSIX via the None-in-sys.modules import blocker.
-        yield
+        # No fcntl (Windows): fail soft — proceed unlocked, and SAY SO
+        # on the yielded state (B7). The CLI surfaces it as a warning;
+        # the tend itself is the operator's call.
+        state.unavailable = True
+        yield state
         return
     lock_path = state_dir(root) / TEND_LOCK_NAME
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -412,13 +488,31 @@ def tend_lock(root: Path):
                 "another tend is running — wait for it or check for a "
                 "dead agent's session",
             ) from None
-        yield
+        state.locked = True
+        yield state
     finally:
         try:
             fcntl.flock(fd, fcntl.LOCK_UN)
         except OSError:
             pass  # already released (process death does it too)
         os.close(fd)
+
+
+def add_warning(data: dict, warning: str) -> dict:
+    """Append one soft-condition warning to an envelope payload (P2).
+
+    The `warnings[]` convention: loud, machine-greppable, and NEVER a
+    refusal — the conditions it names (a platform with no locking, a
+    corpus that moved between the gate and the first write) are facts
+    the agent must see, not reasons to stop. Absent-vs-present is the
+    whole signal: no warnings means no key, so existing payloads are
+    unchanged. (P5 promotes warnings[] to every envelope; this is the
+    one helper every producer goes through.)
+    """
+    warnings = data.setdefault("warnings", [])
+    if warning not in warnings:
+        warnings.append(warning)
+    return data
 
 
 # --- plan chain resolution --------------------------------------------------

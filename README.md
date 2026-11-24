@@ -119,19 +119,30 @@ The commands:
   stale sources, collisions, nested moves, cycles, incomplete coverage.
   `plan validate` / `plan render` / `plan schema` are the subcommands.
 - **apply** — all-or-nothing execution. Dry-run by default; refuses a
-  corpus whose fingerprint changed since planning; refuses moves that
+  corpus whose fingerprint changed since planning, and one that churned
+  under the walk (`corpus_unstable` — files that vanished or denied
+  `stat` mid-scan are counted in `stats.skipped_unstatable`, never
+  skipped silently); refuses moves that
   cross symlinked paths (`symlink_escape`; `--allow-symlinks` for a
   deliberate traversal); pre-flights every
-  destination before touching anything; journals every move with a
-  content hash; flags every move cited from stay-put files.
+  destination before touching anything and re-checks it inside the
+  write itself (an atomic no-replace link/unlink — a destination created
+  mid-run is refused, not clobbered); journals every move with a
+  content hash, one journal per tend, and undo VERIFIES those hashes
+  (a file edited after the tend comes back flagged `content_changed`);
+  flags every move cited from stay-put files.
 - **move** — one bulk move (src dst root): builds the one-move plan,
   runs it through the same validate → gate → journal machinery, and
   renders the human gate. Dry-run by default; `--execute` runs it.
 - **scaffold** — writes the folder-bot layer: root `AGENTS.md` roster,
   per-folder `AGENTS.md` and `STATE.md`. Never overwrites — existing
   files get a `*.slopkeeper-suggested` sibling instead.
-- **undo** — reverses a journal exactly (restores, prunes empty dirs).
-  Takes one journal; name it (see `.slopkeeper/journal-*.jsonl`).
+- **undo** — reverses one journal exactly (restores, prunes empty dirs).
+  One journal per tend — same-second tends get `-2`, `-3` siblings, so
+  undo never reverts a neighbor tend. The journaled sha256s are verified
+  on restore: a file edited after the tend still comes back, flagged
+  `content_changed`. Takes one journal; name it (see
+  `.slopkeeper/journal-*.jsonl`).
 - **strategies** — partitioning rubric packs the agent reads: `role-bots`
   (folder-as-bot), `topics`, `projects`, `by-kind` (mechanical baseline),
   `hybrid` (default).
@@ -179,8 +190,10 @@ work — point your agent at AGENT_GUIDE.md.
   risks). The tool makes the gate cheap; it does not try to remove it.
 - Fingerprint gating means a plan can never act on a corpus it wasn't
   written against — the "silent drift" failure mode is closed.
-- Journals are JSONL with sha256s; undo is exact and reversible, and
-  prunes empty dirs it created. Nothing is ever deleted.
+- Journals are JSONL — one file per tend, each line fsync'd whole, every
+  move carrying its sha256 — and undo VERIFIES those hashes on the way
+  back: exact, reversible, `content_changed` when a file was edited after
+  the tend, empty dirs it created pruned. Nothing is ever deleted.
 - Strategies are JSON rubric packs, not code: the agent reads them like
   documentation, and new strategies are new files, not releases.
 

@@ -13,11 +13,10 @@ run repeatedly on a living corpus without clobbering the owner's edits.
 from __future__ import annotations
 
 import re
-from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .models import corpus_path, safe_relpath, tend_lock
+from .models import add_warning, corpus_path, safe_relpath, tend_lock
 from .plan import load_plan
 from .status import write_manifest
 from .strategies import get_strategy
@@ -43,13 +42,24 @@ def scaffold_from_plan(
 
     Dry-run is a pure read: no lock. Execute wraps the file writes and
     the manifest snapshot in .slopkeeper/tend.lock so a concurrent tend
-    cannot interleave.
+    cannot interleave. A platform with no flock writes anyway and says
+    so on the envelope — `warnings: ["no_locking_available"]` (B7):
+    scaffold's idempotence promise ("run it twice, never clobber") is
+    weaker without serialization, and a silent no-op lock made the
+    payload identical to a protected run.
     """
     root = corpus_root.resolve()
-    with tend_lock(root) if execute else nullcontext():
+    if not execute:
         return _scaffold_from_plan(
-            plan_path, root, execute=execute, strategy_id=strategy_id
+            plan_path, root, execute=False, strategy_id=strategy_id
         )
+    with tend_lock(root) as lock:
+        data = _scaffold_from_plan(
+            plan_path, root, execute=True, strategy_id=strategy_id
+        )
+    if lock.unavailable:
+        add_warning(data, "no_locking_available")
+    return data
 
 
 def _scaffold_from_plan(

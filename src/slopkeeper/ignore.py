@@ -21,7 +21,10 @@ Syntax: a small gitignore subset. `#` comments, blank lines skipped.
 A trailing `/` means directory-only (the whole subtree, at any depth).
 A pattern with an interior or leading slash is anchored to the corpus
 root; otherwise it matches basenames at any depth (`*.log` works
-everywhere). `*`/`?` do not cross `/`; a `**` SEGMENT does. Not in v1:
+everywhere). `*`/`?` do not cross `/`; a `**` SEGMENT spans ZERO OR MORE
+directories (gitignore's reading: `a/**/b` matches `a/b` as well as
+`a/x/b` — 0.2.7 fixed the compile that required an intervening
+directory, which silently left `a/b` visible to a plan). Not in v1:
 negation, nested ignore files, a global ignore — hit a wall first.
 """
 
@@ -45,22 +48,37 @@ def glob_to_regex(pattern: str) -> re.Pattern:
     rules and plan `rules[].match` (Phase 8) share it, so a pattern means
     the same thing in an ignore file and in a plan rule. (stdlib
     fnmatch.translate is NOT `-`-aware: its `*` crosses `/`.)
+
+    A `**` SEGMENT matches ZERO or more directories, as gitignore says
+    (audit A6): `a/**/b` matches `a/b` as well as `a/x/b`. The pre-0.2.7
+    compile emitted `a/.*/b`, which required an intervening directory —
+    so a rule written believing gitignore semantics silently failed to
+    ignore `a/b`, and SlopKeeper planned to organize files the owner
+    meant excluded. A trailing `**` (`a/**`) still means everything
+    BELOW a, never `a` itself.
     """
-    parts = []
-    for seg in pattern.split("/"):
-        if seg == "**":
-            parts.append(".*")
+    rx = ""
+    # True when the last emitted piece carries its own trailing
+    # separator, so the next segment must NOT add another `/`.
+    joined = False
+    segs = pattern.split("/")
+    for i, seg in enumerate(segs):
+        last = i == len(segs) - 1
+        if seg == "**" and not last:
+            rx += ("/" if rx and not joined else "") + "(?:[^/]*/)*"
+            joined = True
             continue
-        buf = []
-        for ch in seg:
-            if ch == "*":
-                buf.append("[^/]*")
-            elif ch == "?":
-                buf.append("[^/]")
-            else:
-                buf.append(re.escape(ch))
-        parts.append("".join(buf))
-    return re.compile("^" + "/".join(parts) + "$")
+        if rx and not joined:
+            rx += "/"
+        if seg == "**":  # trailing: everything below, never the dir itself
+            rx += ".*"
+        else:
+            rx += "".join(
+                "[^/]*" if ch == "*" else "[^/]" if ch == "?" else re.escape(ch)
+                for ch in seg
+            )
+        joined = False
+    return re.compile("^" + rx + "$")
 
 
 class CorpusIgnore:

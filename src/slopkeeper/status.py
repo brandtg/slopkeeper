@@ -17,7 +17,6 @@ is skipped by every walk. Zero dependencies; no LLM, no network.
 from __future__ import annotations
 
 import json
-from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -27,6 +26,7 @@ from .models import (
     MANIFEST_NAME,
     MANIFEST_SCHEMA,
     SlopKeeperError,
+    add_warning,
     corpus_fingerprint,
     sha256_file,
     state_dir,
@@ -228,11 +228,18 @@ def status(root: Path, record: bool = False) -> dict:
     """Diff the corpus against the last tend (tending lock).
 
     Plain reads take NO lock — status must stay safe beside a running
-    tend. Only --record (a manifest write) acquires .slopkeeper/tend.lock.
+    tend. Only --record (a manifest write) acquires .slopkeeper/tend.lock,
+    and only a --record run can carry `warnings: ["no_locking_available"]`
+    (B7): a read needed no lock, so it has nothing to confess.
     """
     root = root.resolve()
-    with tend_lock(root) if record else nullcontext():
-        return _status(root, record)
+    if not record:
+        return _status(root, False)
+    with tend_lock(root) as lock:
+        data = _status(root, True)
+    if lock.unavailable:
+        add_warning(data, "no_locking_available")
+    return data
 
 
 def status_all(roots: list[str], record: bool = False) -> list[dict]:
@@ -289,6 +296,10 @@ def status_all(roots: list[str], record: bool = False) -> list[dict]:
                 "unresolved_count": len(s.get("still_unresolved", [])),
             }
         )
+        if s.get("warnings"):
+            # B7: a --all --record run without locking says so per root,
+            # exactly like the per-root status envelope.
+            entry["warnings"] = s["warnings"]
         out.append(entry)
     return out
 

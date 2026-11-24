@@ -619,7 +619,23 @@ def _cmd_scaffold(s, arg, lines, out) -> None:
 
 
 def _journals(root: Path) -> list[Path]:
-    return sorted((root / ".slopkeeper").glob("journal-*.jsonl"))
+    """Journals oldest-first, so the last one IS the latest tend.
+
+    Name order alone lied once same-second tends got counter suffixes
+    (A4): "journal-<ts>-2.jsonl" sorts BEFORE "journal-<ts>.jsonl", so
+    the second tend — the newer one — would not be the default /undo
+    target. mtime decides; the name breaks ties upward, which is the
+    suffix order (plain, then -2, then -3).
+    """
+    journals = list((root / ".slopkeeper").glob("journal-*.jsonl"))
+
+    def key(p: Path) -> tuple[float, str]:
+        try:
+            return (p.stat().st_mtime_ns / 1e9, p.name)
+        except OSError:
+            return (0.0, p.name)
+
+    return sorted(journals, key=key)
 
 
 def _cmd_undo(s, arg, lines, out) -> None:
@@ -652,7 +668,22 @@ def _cmd_undo(s, arg, lines, out) -> None:
     journal = journals[idx - 1]
     data = undo_journal(journal, root, execute=False)
     for op in data["operations"]:
-        _p(out, f"  {op.get('status')}: {op.get('src', op.get('file', ''))}")
+        line = f"  {op.get('status')}: {op.get('src', op.get('file', ''))}"
+        # B1: a restore that comes back different than it left. The human
+        # must see this BEFORE approving the restore.
+        if op.get("content_changed"):
+            line += "  (content changed since the tend)"
+        _p(out, line)
+    if data.get("journal_corrupt_lines"):
+        _p(
+            out,
+            f"  {data['journal_corrupt_lines']} malformed line(s) skipped"
+            + (
+                " — mid-file corruption; use the CLI with --force to undo what parsed"
+                if "journal_corrupt_needs_force" in (data.get("warnings") or [])
+                else ""
+            ),
+        )
     if not execute:
         _p(out, "  (dry run — add ! to execute: /undo %d !)" % idx)
         return
