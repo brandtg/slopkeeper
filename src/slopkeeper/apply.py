@@ -6,8 +6,12 @@
 
 Safety invariants, in order:
 1. Nothing happens without --execute (dry-run is the default).
-2. The corpus must match the fingerprint the plan was authored against.
-3. Every move is pre-flighted (collisions, chains, nesting) before ANY move.
+2. A plan must carry a corpus binding (based_on.corpus_fingerprint, A1)
+   and the corpus must match it; --force escapes the mismatch, never the
+   missing binding (plan_no_based_on).
+3. Every move is pre-flighted (collisions, chains, nesting, symlink
+   containment — A2) before ANY move, and destinations are re-checked
+   immediately before each write.
 4. Every executed move is journaled with a content hash; undo reverses exactly.
 5. Nothing is ever deleted; a failed mid-run is recoverable via the journal.
 6. A mid-run IO failure is journaled-partial, never silent: recorded in
@@ -31,12 +35,14 @@ from .models import (
     corpus_fingerprint,
     corpus_path,
     resolve_chains,
+    safe_move_path,
     sha256_file,
     sha256_file_exact,
     state_dir,
     tend_lock,
 )
 from .plan import (
+    based_on_binding,
     load_plan,
     load_render_sidecar,
     preflight_destinations,
@@ -712,6 +718,7 @@ def apply_plan(
     allow_partial: bool = False,
     strict_references: bool = False,
     journal_path: Path | None = None,
+    allow_symlinks: bool = False,
 ) -> dict:
     """Dry-run or execute a plan (tending lock).
 
@@ -721,6 +728,10 @@ def apply_plan(
     apply never wedges the corpus. Dry-runs take no lock: two agents may
     plan simultaneously; only journal append + moves/edits + manifest
     write serialize.
+
+    allow_symlinks (CLI --allow-symlinks) is the deliberate traversal
+    flag for the A2 move-path containment policy; default False refuses
+    moves through or onto symlinks (symlink_escape).
     """
     root = corpus_root.resolve()
     with tend_lock(root) if execute else nullcontext():
@@ -732,6 +743,7 @@ def apply_plan(
             allow_partial=allow_partial,
             strict_references=strict_references,
             journal_path=journal_path,
+            allow_symlinks=allow_symlinks,
         )
 
 
@@ -758,26 +770,47 @@ def _apply_plan(
     allow_partial: bool = False,
     strict_references: bool = False,
     journal_path: Path | None = None,
+    allow_symlinks: bool = False,
 ) -> dict:
     root = corpus_root.resolve()
     plan = load_plan(plan_path)
-    plan = validate_plan(plan, root, allow_partial=allow_partial)
+    plan = validate_plan(
+        plan,
+        root,
+        allow_partial=allow_partial,
+        require_based_on=True,
+        allow_symlinks=allow_symlinks,
+    )
     # provenance: the hash of the exact plan bytes being applied —
     # recorded in the manifest, the journal header, and checked against
     # the last render. load_plan just read this file, so it is hashable.
     plan_sha256 = sha256_file_exact(plan_path)
     render_warning = _render_mismatch_warning(root, plan_sha256)
 
-    # 1. Staleness gate. `corpus_fingerprint` is the canonical key;
-    # `inventory_sha256` is a read-only alias — plans authored from the
-    # pre-T1 template carry it, and both name the same inventory
-    # fingerprint (inventory.py writes corpus_fingerprint(root) under
-    # either name). Reading only one spelling let template-authored
-    # plans apply silently against a drifted corpus.
+    # 1. Staleness gate — FIRES UNCONDITIONALLY (A1, 0.2.6). The pre-fix
+    # form was `if recorded and ...`: a plan with no based_on skipped
+    # the gate entirely (no --force needed) and a corpus mutated after
+    # authoring applied clean (the 2026-11-23 audit's A1).
+    # `corpus_fingerprint` is the canonical key; `inventory_sha256` is a
+    # read-only alias — plans authored from the pre-T1 template carry it,
+    # and both name the same inventory fingerprint (based_on_binding is
+    # the one place that rule lives). validate_plan above already
+    # refused a missing binding; this raise is the gate's own refusal —
+    # in-process callers that opted out of validation never apply an
+    # unbound plan either. --force escapes the MISMATCH only.
     current = corpus_fingerprint(root)
-    based_on = plan.get("based_on", {}) or {}
-    recorded = based_on.get("corpus_fingerprint") or based_on.get("inventory_sha256")
-    if recorded and recorded != current and not force:
+    recorded = based_on_binding(plan)
+    if not recorded:
+        raise SlopKeeperError(
+            "plan_no_based_on",
+            "plan has no corpus binding: based_on.corpus_fingerprint is "
+            "required (a non-empty string)",
+            "author the plan from inventory output; the fingerprint is "
+            "what makes the plan safe to apply. Run `slopkeeper inventory "
+            "<root> --fast --summary` and record its fingerprint as "
+            "based_on.corpus_fingerprint (see `slopkeeper plan schema`).",
+        )
+    if recorded != current and not force:
         raise SlopKeeperError(
             "corpus_changed",
             f"corpus changed since the plan was authored "
@@ -800,6 +833,18 @@ def _apply_plan(
     # call re-observes the disk under the tend lock, after the
     # fingerprint gate — the last look before any write.
     preflight_destinations(root, chains)
+
+    # 2a. Containment pre-flight (A2): validate_plan checked the plan's
+    # DECLARED paths; this re-observes every chain-resolved FINAL
+    # destination against the live disk under the tend lock — a symlink
+    # created between authoring and this run is refused (symlink_escape)
+    # before a single write, in dry-run and execute alike. The move loop
+    # re-checks each hop immediately before its write as the TOCTOU belt.
+    if not allow_symlinks:
+        for src, dst in chains.items():
+            if src == dst:
+                continue
+            safe_move_path(dst, root, destination=True)
 
     # 3. Reference risk scan + 3b. the citation rewrite pass — ONE
     # engine now (B2): the pass runs first and its per-site records
@@ -1001,6 +1046,13 @@ def _apply_plan(
             if not src_abs.exists():
                 errors.append({"src": src, "error": "vanished mid-apply"})
                 continue
+            # A2 TOCTOU belt: resolve-and-contain the destination
+            # IMMEDIATELY before the write (the audit's fix) — a symlink
+            # created after the 2a pre-flight would otherwise be followed
+            # by shutil.move, which does not refuse. Raises
+            # symlink_escape: a containment failure stops the run rather
+            # than writing where no walk has ever looked.
+            safe_move_path(dst, root, destination=True, allow_symlinks=allow_symlinks)
             # E1: the destination exists by the time this move runs —
             # an earlier move of this same plan created it. Merging
             # keeps the flat final paths the whole tool models;

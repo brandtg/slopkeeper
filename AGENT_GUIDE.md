@@ -38,7 +38,12 @@ the JSON subcommands documented here; they are scriptable and stable.)
    moved path gets the full new path; a stale path that merely
    basename-matches is skipped and reported as `unresolved_path`),
    relative links stay relative, and tokens with a URL scheme or host
-   (`https://docs.acme.example/...`) are never touched. Opt out only
+   (`https://docs.acme.example/...`) are never touched. A token whose
+   first segment merely *looks* like a host is a PATH when it resolves
+   against the corpus (0.2.6, audit A3): citations under dotted
+   directories (`my.files/report.md`, `data.backup/x.md`, `v1.0/notes.md`)
+   are real citations and get rewritten; `example.com/index.md` stays a
+   host unless the corpus actually has `example.com/`. Opt out only
    deliberately with
    `"rewrites": {"mode": "off"}` (globally) or `"rewrite": false` on a
    single move (a vendored subtree whose references travel with it —
@@ -81,6 +86,16 @@ the JSON subcommands documented here; they are scriptable and stable.)
    regenerate the plan. `--force` only if the changes were yours and
    expected. Staleness is content-based: a bare `touch` won't force a
    re-plan, but a real edit — even one that keeps the byte size — will.
+   The plan MUST carry the binding that gate checks:
+   `based_on.corpus_fingerprint`, the `fingerprint` value from
+   `slopkeeper inventory <root> --fast --summary` (the `inventory_sha256`
+   spelling is the read-only pre-T1 alias). A plan without it is refused
+   by validate and apply (`plan_no_based_on`) — `--force` escapes a
+   MISMATCH, never a missing binding. `plan render` shows an unbound
+   plan with a loud "no corpus binding" warning block and records
+   `warnings: ["no_fingerprint"]` in the sidecar; render never
+   fabricates a fingerprint. (0.2.6: the field was optional and the
+   drift gate silently skipped itself without it — the audit's A1.)
 7. **Respect `.slopkeeperignore`.** A corpus may carry a
    `.slopkeeperignore` at its root (gitignore-style: `dir/` for a
    whole subtree at any depth, `*.ext` for basenames everywhere,
@@ -105,6 +120,21 @@ the JSON subcommands documented here; they are scriptable and stable.)
    `node_modules`, ...) is ever invisible — per-corpus noise
    (`.cache`, transcript dumps) is this file's job, and doctor
    suggests the lines.
+
+8. **Never move through a symlink** (0.2.6, audit A2). Move sources and
+   destinations are checked against the live disk component by
+   component, and again immediately before each write: a move that
+   passes THROUGH a symlinked directory or LANDS on a symlink is refused
+   with `symlink_escape`, even when the link lands inside the corpus —
+   the walk never looks behind a link, so such a write escapes every
+   guarantee (coverage, fingerprint, reference scans). Symlinked
+   top-level DIRECTORIES are still corpus entries: inventory names them
+   in `stats.symlinked_dirs`, the fingerprint (fp6) binds their names
+   and targets, and coverage validation requires them in `keep` /
+   `unresolved` / `skip`. A deliberate traversal to a FRESH path:
+   `--allow-symlinks` on `plan validate` / `plan render` / `apply` —
+   never a clobber license (an existing destination stays
+   `plan_dst_exists`-refused even with the flag).
 
 ## Fixture hygiene (repo tests)
 
@@ -147,6 +177,10 @@ intentional name. When you add a fixture or an example, invent an
        --out inv.json: the SHAPED payload (--summary/--fields are
        honored in the file, not ignored) lands there; stdout carries
        only counts (stats + out_path) — read the file, not the terminal.
+       stats.symlinked_dirs names symlinked directories the walk does
+       not descend — entries the plan must cover (keep/unresolved/
+       skip), never content; moves crossing them are refused
+       (symlink_escape — Hard rule 8).
 
 3. slopkeeper clusters <root> [--out clusters.json]
      → similarity HINTS: content clusters, scrape pairs, dupes, hubs,
@@ -173,7 +207,9 @@ intentional name. When you add a fixture or an example, invent an
 
 5. Write the plan JSON. Get the template:
      slopkeeper plan schema
-   Record the inventory's fingerprint as based_on.corpus_fingerprint.
+   Record the inventory's fingerprint as based_on.corpus_fingerprint —
+   MANDATORY (0.2.6): validate and apply refuse a plan without the
+   binding (`plan_no_based_on`); it is what makes apply safe.
    Cover every top-level entry: moves | keep | unresolved | skip.
    (keep accepts "name" or {"path": "name", "reason": "..."}; skip is
    a plain list of names.)
@@ -184,9 +220,15 @@ intentional name. When you add a fixture or an example, invent an
    not examine, and say so to the owner.
 
 6. slopkeeper plan validate <plan.json> <root>
-     → fix every error code it gives you. Then:
+     → fix every error code it gives you (a plan without
+       based_on.corpus_fingerprint is one of them: plan_no_based_on).
+       Moves crossing symlinked paths refuse here too (symlink_escape;
+       --allow-symlinks for a deliberate traversal). Then:
    slopkeeper plan render <plan.json> <root> --out plan.md
-     → HUMAN GATE: show plan.md. Wait for approval.
+     → HUMAN GATE: show plan.md. Wait for approval. An unbound plan
+       renders a loud "WARNING — plan carries no corpus binding" block
+       (and warnings: ["no_fingerprint"] in the sidecar) — render never
+       fabricates a fingerprint; show the owner, then fix the binding.
 
 7. slopkeeper apply <plan.json> <root>            (dry-run)
    slopkeeper apply <plan.json> <root> --execute  (for real)
@@ -566,14 +608,21 @@ find/replace pairs for it:
 
       slopkeeper refs <root> <path-or-basename>
         → citation sites {file, line, text, kind} for a corpus path,
-          directory, path suffix, or unambiguous basename (an
-          ambiguous basename returns nothing — never attributed).
+          directory, path suffix, or unambiguous basename. The payload
+          carries the honest query state (A5): "exists" (the name
+          resolves to a corpus path, dir, or unambiguous basename) and
+          "ambiguous" plus "ambiguous_paths" (several corpus files
+          share the basename — citations are never attributed, and the
+          candidates are named), so citation_count: 0 now distinguishes
+          "safe to move" from "you typoed" (exists: false) from
+          "ambiguous, tool refused to guess". Still ok: true — each is
+          a valid query result, not an error.
           A directory name includes citations of paths under it.
           Citations flagged "external": true sit outside the corpus
           (absolute file path). A slashed name that exists nowhere in
-          the corpus comes back with "nonexistent_path": true and
-          only EXACT citations of the string — never a different
-          same-basename file's citations (D7).
+          the corpus comes back with "nonexistent_path": true
+          (exists: false) and only EXACT citations of the string —
+          never a different same-basename file's citations (D7).
 
       slopkeeper refs <root> <name> --scan-path ~/skills --scan-path ~/cron
         → also sweep directories OUTSIDE the corpus — or ignored ones
@@ -590,7 +639,10 @@ find/replace pairs for it:
           links, half-updated references): {file, line, token, text}.
           Informational — fix by hand with edits; the rewrite pass
           never touches them. Bare words are never counted (they are
-          prose), and URL-scheme tokens are skipped. The default is
+          prose), and URL-scheme tokens are skipped. A token that
+          continues a real corpus directory (`my.files/gone.md` with
+          `my.files/` in the corpus) is reported here rather than
+          silently dropped as a hostname (A3). The default is
           UNBOUNDED (D10 — the old 200-row cap made a clean-move
           verification impossible); --limit caps explicitly, --prefix
           lists every citation still naming a removed directory, and
@@ -667,6 +719,7 @@ unexplained silence.
 | `plan_no_moves` | `moves` is not a list, or is empty on a non-partial plan | a plan needs at least one move — unless it carries `"partial": true` (a zero-move partial plan is valid: the draft filed everything as unresolved; validate it and `apply --execute` records the backlog) |
 | `plan_stale_src` | a source vanished | re-inventory, regenerate |
 | `corpus_changed` | fingerprint mismatch | re-inventory; `--force` only if yours |
+| `plan_no_based_on` | the plan carries no corpus binding — `based_on.corpus_fingerprint` is missing, blank, or not a string (0.2.6: validate and apply always required it; the gate silently skipped itself without it) | author the plan from inventory output: run `slopkeeper inventory <root> --fast --summary` and record its `fingerprint` as `based_on.corpus_fingerprint`; `--force` does not bypass this |
 | `plan_dst_exists` | destination occupied (validate and apply share this pre-flight) | resolve collision in plan |
 | `referenced_moves` | strict mode: refs would break | rewrite refs first |
 | `plan_nested_moves` | dir + its contents both moved | move dir whole OR its files |
@@ -707,7 +760,7 @@ unexplained silence.
 | `plan_bad_folder` | a folder entry has no `path` | every folder entry names a path |
 | `plan_bad_kind` | folder `kind` is unknown | kind is one of bot, case, topic, project, archive, scratch |
 | `move_cycle` | the moves form a cycle (a→b→a) | remove the circular moves from the plan |
-| `symlink_escape` | a path resolves outside the root via a symlink | remove the symlink or move its target explicitly |
+| `symlink_escape` | a move path crosses a symlink — through a symlinked directory, onto a symlink destination, resolving outside the root, or its parent cannot be resolved (the corpus walk never looks behind a link) | remove the symlink or move its target explicitly; `--allow-symlinks` (validate/render/apply) for a deliberate traversal |
 | `no_corpus` | the argument to `doctor` is not a directory | pass the directory you want to organize |
 | `no_plan` | REPL: no compiled plan to act on (`/apply`/`/render`/`/scaffold` before `/plan`, or decisions changed since) | `/plan` first — it compiles decisions, validates and saves; `/load` + `/plan` for an agent-authored plan |
 | `no_such_move` | REPL: not a move number | `/moves` lists the working plan's moves |

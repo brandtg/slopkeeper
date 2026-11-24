@@ -172,6 +172,15 @@ def corpus_walk(root: Path, nested_out: list[str] | None = None):
     `not_utf8` row for a `loop.md` device). They are pruned here so
     every consumer — inventory, fingerprint, reference scans, rewrites
     — sees the same regular-file set; doctor names what was pruned.
+
+    Symlinked directories (fp6, audit A2): reported in `dirnames` but
+    NEVER descended (os.walk does not follow links) — their contents
+    stay invisible to every consumer. They are still ENTRIES: the
+    fingerprint digests name+target and inventory names them in
+    `stats.symlinked_dirs`, because plan coverage validation counts
+    top-level entries via iterdir and always has. Moves through or onto
+    them are refused by default (models.safe_move_path); --allow-symlinks
+    is the deliberate bypass.
     """
     root = Path(root)
     ignore = load_ignore(root)

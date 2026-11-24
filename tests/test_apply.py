@@ -1006,9 +1006,7 @@ class TestPhase8BackticksAndNotRecorded(TempCase):
     risk rows carry the line (and token) instead of line: null."""
 
     def test_spaced_filename_shape_rewrites(self):
-        write(
-            self.root / "misc/notes/Sample Transcript - Owner's Phone .md", "# t\n"
-        )
+        write(self.root / "misc/notes/Sample Transcript - Owner's Phone .md", "# t\n")
         write(
             self.root / "reports/1-1/peer/2026-09-29-agenda.md",
             "# agenda\ntranscript: `notes/Sample Transcript - Owner's Phone .md`\n",
@@ -1034,12 +1032,9 @@ class TestPhase8BackticksAndNotRecorded(TempCase):
         per_file = {p["file"]: p for p in dry["would_rewrite"]}
         self.assertIn("reports/1-1/peer/2026-09-29-agenda.md", per_file)
         new_texts = [
-            r["new"]
-            for r in per_file["reports/1-1/peer/2026-09-29-agenda.md"]["lines"]
+            r["new"] for r in per_file["reports/1-1/peer/2026-09-29-agenda.md"]["lines"]
         ]
-        self.assertIn(
-            "projects/notes/Sample Transcript - Owner's Phone .md", new_texts
-        )
+        self.assertIn("projects/notes/Sample Transcript - Owner's Phone .md", new_texts)
         # Not a skip: the citation is recorded and fixed.
         self.assertEqual(dry.get("skip_rewrites"), [])
 
@@ -3205,3 +3200,148 @@ class TestFieldReport018(TempCase):
         self.assertEqual(row["line"], 1)
         self.assertEqual(row["token"], "misc/pic.png")
         self.assertEqual(row["text"], "see misc/pic.png from the prototype")
+
+
+class TestDottedDirRewriteParity(TempCase):
+    """A3 (0.2.6), the audit's A/B controlled comparison end-to-end:
+    the identical corpus with the directory renamed myfiles → my.files
+    used to come back `would_rewrite: []` — no rewrite, no risk row —
+    and after --execute the citation pointed at a path that no longer
+    existed. Dotted dirs must now rewrite exactly like their plain
+    twins."""
+
+    def _dry(self, dirname: str, root_name: str | None = None) -> dict:
+        root = self.tmp / (root_name or f"c-{dirname}")
+        write(root / dirname / "report.md", "# report\n")
+        write(root / "notes.md", f"see {dirname}/report.md today\n")
+        plan = {
+            "schema": "slopkeeper/plan@1",
+            "corpus_root": str(root),
+            "strategy": "hybrid",
+            "based_on": {"corpus_fingerprint": corpus_fingerprint(root)},
+            "moves": [
+                {
+                    "from": f"{dirname}/report.md",
+                    "to": "archive/report.md",
+                    "reason": "archive the report",
+                }
+            ],
+            "edits": [],
+            "keep": ["notes.md"],
+            "unresolved": [],
+            "folders": [],
+        }
+        p = self.tmp / f"plan-{dirname}.json"
+        p.write_text(json.dumps(plan), encoding="utf-8")
+        return apply_plan(p, root)
+
+    def test_dotted_rewrites_exactly_like_the_control(self):
+        dotted = self._dry("my.files")
+        control = self._dry("myfiles")
+
+        def shape(rows, dirname):
+            # Parity = same sites, same new text; the OLD text names the
+            # directory the corpus actually has (my.files vs myfiles).
+            return [
+                {
+                    "file": r["file"],
+                    "count": r["count"],
+                    "lines": [
+                        {
+                            **ln,
+                            "old": ln["old"].replace(dirname + "/", "", 1),
+                        }
+                        for ln in r["lines"]
+                    ],
+                }
+                for r in rows
+            ]
+
+        self.assertEqual(
+            shape(dotted["would_rewrite"], "my.files"),
+            shape(control["would_rewrite"], "myfiles"),
+        )
+        self.assertEqual(
+            dotted["would_rewrite"],
+            [
+                {
+                    "file": "notes.md",
+                    "count": 1,
+                    "lines": [
+                        {
+                            "line": 1,
+                            "old": "my.files/report.md",
+                            "new": "archive/report.md",
+                        }
+                    ],
+                }
+            ],
+        )
+
+    def test_version_and_backup_dotted_dirs(self):
+        for dirname in ("v1.0", "data.backup"):
+            dry = self._dry(dirname)
+            self.assertEqual(
+                [(r["file"], r["count"]) for r in dry["would_rewrite"]],
+                [("notes.md", 1)],
+                f"{dirname}/ must rewrite like any dir",
+            )
+
+    def test_execute_rewrites_the_dotted_citation(self):
+        # The audit's worst case was POST-execute: the citation pointing
+        # at a path that no longer exists. Prove the fix on disk.
+        root = self.tmp / "c-execute"
+        write(root / "my.files" / "report.md", "# report\n")
+        write(root / "notes.md", "see my.files/report.md today\n")
+        plan = {
+            "schema": "slopkeeper/plan@1",
+            "corpus_root": str(root),
+            "strategy": "hybrid",
+            "based_on": {"corpus_fingerprint": corpus_fingerprint(root)},
+            "moves": [
+                {
+                    "from": "my.files/report.md",
+                    "to": "archive/report.md",
+                    "reason": "archive the report",
+                }
+            ],
+            "edits": [],
+            "keep": ["notes.md"],
+            "unresolved": [],
+            "folders": [],
+        }
+        p = self.tmp / "plan-execute.json"
+        p.write_text(json.dumps(plan), encoding="utf-8")
+        out = apply_plan(p, root, execute=True)
+        self.assertEqual(out["moved_count"], 1)
+        self.assertEqual(
+            (root / "notes.md").read_text(), "see archive/report.md today\n"
+        )
+
+    def test_external_site_text_still_skipped(self):
+        # The other side of A3: real hosts stay non-citations even when
+        # a same-named file sits in the corpus (the tail alone never
+        # rescues a host token — exact containment or nothing).
+        root = self.tmp / "c-external"
+        write(root / "index.md", "# ours\n")
+        write(
+            root / "notes.md",
+            "visit example.com/index.md or https://example.com/index.md now\n",
+        )
+        plan = {
+            "schema": "slopkeeper/plan@1",
+            "corpus_root": str(root),
+            "strategy": "hybrid",
+            "based_on": {"corpus_fingerprint": corpus_fingerprint(root)},
+            "moves": [
+                {"from": "index.md", "to": "archive/index.md", "reason": "archive"}
+            ],
+            "edits": [],
+            "keep": ["notes.md"],
+            "unresolved": [],
+            "folders": [],
+        }
+        p = self.tmp / "plan-external.json"
+        p.write_text(json.dumps(plan), encoding="utf-8")
+        dry = apply_plan(p, root)
+        self.assertEqual(dry["would_rewrite"], [])

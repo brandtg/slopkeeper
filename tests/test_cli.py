@@ -595,6 +595,139 @@ class TestStalenessGate(TempCase):
         self._assert_corpus_changed(r)
 
 
+class TestMandatoryCorpusBinding(TempCase):
+    """A1 (0.2.6), the audit's Test A at the CLI surface: a plan that
+    omits based_on applied SILENTLY against a mutated corpus (the gate
+    read `if recorded:`). The binding is now required — validate and
+    apply exit 2 (plan_* → EXIT_VALIDATION) with `plan_no_based_on`,
+    and --force (the corpus_changed escape) does not bypass it."""
+
+    def _template_plan(self, *, with_binding: bool, mutate_after: bool = False):
+        template = json.loads(run_cli("plan", "schema").stdout)
+        template["corpus_root"] = str(self.root)
+        if with_binding:
+            template["based_on"] = {
+                "corpus_fingerprint": json.loads(
+                    run_cli("inventory", str(self.root), "--summary").stdout
+                )["data"]["fingerprint"]
+            }
+        else:
+            template.pop("based_on", None)
+        template["moves"] = [
+            {
+                "from": "acme_dossier.md",
+                "to": "research/dossiers/acme_dossier.md",
+                "reason": "dossier research",
+            }
+        ]
+        template["edits"] = []
+        template["folders"] = []
+        template["unresolved"] = []
+        template["keep"] = [
+            "WATCHLIST.md",
+            "globex_dossier.md",
+            "handoff-tp2.md",
+            "ledger_wb.html",
+            "spark-1.2.3",
+            "lead-gen",
+            "docs",
+        ]
+        plan = self.tmp / "plan.json"
+        plan.write_text(json.dumps(template), encoding="utf-8")
+        if mutate_after:
+            # The audit's mutation: a file changes after the plan was
+            # authored. With a binding this is corpus_changed; without
+            # one it used to apply clean.
+            (self.root / "globex_dossier.md").write_text("mutated\n")
+        return plan
+
+    def _assert_no_binding(self, r):
+        self.assertEqual(r.returncode, 2, r.stdout)
+        env = json.loads(r.stdout)
+        self.assertFalse(env["ok"])
+        self.assertEqual(env["error"]["code"], "plan_no_based_on")
+        self.assertIn("inventory", env["error"]["recovery"])
+
+    def test_apply_without_binding_exits_2(self):
+        plan = self._template_plan(with_binding=False)
+        self._assert_no_binding(run_cli("apply", str(plan), str(self.root)))
+
+    def test_apply_executed_mutated_corpus_without_binding_exits_2(self):
+        # The audit's exact repro: mutate after authoring, omit
+        # based_on, apply. Pre-fix: ok: true, moved: 2.
+        plan = self._template_plan(with_binding=False, mutate_after=True)
+        r = run_cli("apply", str(plan), str(self.root), "--execute")
+        self._assert_no_binding(r)
+        self.assertTrue((self.root / "acme_dossier.md").exists())
+
+    def test_force_is_not_an_escape_from_the_binding(self):
+        plan = self._template_plan(with_binding=False)
+        self._assert_no_binding(
+            run_cli("apply", str(plan), str(self.root), "--execute", "--force")
+        )
+
+    def test_validate_without_binding_exits_2(self):
+        plan = self._template_plan(with_binding=False)
+        self._assert_no_binding(run_cli("plan", "validate", str(plan), str(self.root)))
+
+    def test_blank_and_placeholder_bindings_refused(self):
+        for bad in ({"corpus_fingerprint": ""}, {"corpus_fingerprint": "   "}):
+            plan = self._template_plan(with_binding=True)
+            raw = json.loads(plan.read_text(encoding="utf-8"))
+            raw["based_on"] = bad
+            plan.write_text(json.dumps(raw), encoding="utf-8")
+            self._assert_no_binding(run_cli("apply", str(plan), str(self.root)))
+
+    def test_bound_mutated_corpus_still_corpus_changed(self):
+        # The gate's ORIGINAL job survives the new requirement: with a
+        # binding, post-authoring mutation raises corpus_changed (exit
+        # 1 — not a plan_* code) and --force still applies.
+        plan = self._template_plan(with_binding=True, mutate_after=True)
+        r = run_cli("apply", str(plan), str(self.root), "--execute")
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertEqual(json.loads(r.stdout)["error"]["code"], "corpus_changed")
+        r = run_cli("apply", str(plan), str(self.root), "--execute", "--force")
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertFalse((self.root / "acme_dossier.md").exists())
+
+
+class TestRefsHonestQuery(TempCase):
+    """A5 (0.2.6): refs on a name that exists nowhere said
+    ok: true, citation_count: 0 — the same payload as "exists, nobody
+    cites it". The envelope now carries exists/ambiguous/ambiguous_paths
+    (still ok: true — these are valid query results)."""
+
+    def test_nonexistent_basename_says_exists_false(self):
+        r = run_cli("refs", str(self.root), "file_that_does_not_exist.md")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        env = json.loads(r.stdout)
+        self.assertTrue(env["ok"])
+        d = env["data"]
+        self.assertEqual(d["citation_count"], 0)
+        self.assertFalse(d["exists"])
+        self.assertFalse(d["ambiguous"])
+        self.assertEqual(d["ambiguous_paths"], [])
+
+    def test_ambiguous_basename_names_the_candidates(self):
+        write(self.root / "reports/note.md", "# one\n")
+        write(self.root / "tasks/note.md", "# two\n")
+        r = run_cli("refs", str(self.root), "note.md")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        d = json.loads(r.stdout)["data"]
+        self.assertEqual(d["citation_count"], 0)  # still never attributed
+        self.assertTrue(d["exists"])
+        self.assertTrue(d["ambiguous"])
+        self.assertEqual(d["ambiguous_paths"], ["reports/note.md", "tasks/note.md"])
+
+    def test_cited_file_is_unambiguous(self):
+        r = run_cli("refs", str(self.root), "acme_dossier.md")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        d = json.loads(r.stdout)["data"]
+        self.assertTrue(d["exists"])
+        self.assertFalse(d["ambiguous"])
+        self.assertGreaterEqual(d["citation_count"], 1)
+
+
 class TestNextCommandsAreRunnable(TempCase):
     """T6: every next.command must be paste-runnable.
 

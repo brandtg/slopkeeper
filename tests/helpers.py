@@ -48,6 +48,16 @@ def touch(path: Path) -> Path:
     return path
 
 
+def make_symlink(target: Path, link: Path) -> Path:
+    """os.symlink(link -> target), creating link.parent (A2 fixtures —
+    the repo's symlink helper). Replaces an existing link idempotently."""
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if link.is_symlink() or link.exists():
+        link.unlink()
+    link.symlink_to(target)
+    return link
+
+
 def build_corpus(root: Path, spec: dict | None = None) -> Path:
     """Materialize the default corpus at root; spec overrides/adds files."""
     files = dict(DEFAULT_CORPUS)
@@ -108,11 +118,17 @@ def expect_code(self, cm_body, code: str):
     )
 
 
-def write_plan(root: Path, **overrides) -> Path:
+_UNSET = object()
+
+
+def write_plan(root: Path, *, based_on=_UNSET, **overrides) -> Path:
     plan = {
         "schema": "slopkeeper/plan@1",
         "corpus_root": str(root),
         "strategy": "hybrid",
+        # A1: plans carry a REAL corpus binding by default — the
+        # fingerprint computed from the temp corpus as it stands when
+        # the plan is written (same source apply's gate uses).
         "based_on": {"corpus_fingerprint": corpus_fingerprint(root)},
         "moves": [
             {
@@ -148,12 +164,19 @@ def write_plan(root: Path, **overrides) -> Path:
         ],
     }
     plan.update(overrides)
+    # based_on=None opts the binding OUT (the A1 staleness tests: an
+    # unbound plan must now refuse with plan_no_based_on); an explicit
+    # dict replaces it (stale-fingerprint tests).
+    if based_on is None:
+        plan.pop("based_on", None)
+    elif based_on is not _UNSET:
+        plan["based_on"] = based_on
     p = root.parent / "plan.json"
     p.write_text(json.dumps(plan), encoding="utf-8")
     return p
 
 
-def write_edit_plan(root: Path, **overrides) -> Path:
+def write_edit_plan(root: Path, *, based_on=_UNSET, **overrides) -> Path:
     # WATCHLIST.md stays and cites acme_dossier.md; the plan moves
     # the dossier and rewrites the citation.
     plan = {
@@ -188,6 +211,10 @@ def write_edit_plan(root: Path, **overrides) -> Path:
         "folders": [],
     }
     plan.update(overrides)
+    if based_on is None:
+        plan.pop("based_on", None)
+    elif based_on is not _UNSET:
+        plan["based_on"] = based_on
     p = root.parent / "plan-edit.json"
     p.write_text(json.dumps(plan))
     return p

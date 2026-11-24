@@ -194,17 +194,66 @@ _PATH_TOKEN_RE = re.compile(
 )
 
 
-def _urlish(line: str, start: int, token: str) -> bool:
-    """A token with a URL scheme or a host (C2): never a corpus citation
-    and never rewritten. `https://docs.acme.example/.../index.html` scans
-    as the path token `docs.acme.example/...` (the regex cannot carry the
-    scheme) and its tail used to resolve via the moved file's basename —
-    mangling a web address into a bare filename. A `://` immediately
-    before the token is a scheme; a dotted first segment (after any
-    ./ ../ prefixes) whose final dot-component looks like a TLD is a
-    host. Version-y directory names (`spark-1.2.3`) are corpus paths,
-    not hosts — the TLD test keeps them."""
+_HOST_FIRST_SEG_RE = re.compile(r"^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}$")
+
+
+def _resolves_in_corpus(
+    rest: str, index: CitationIndex, citing_dir: str | None
+) -> bool:
+    """True when a host-CANDIDATE token actually names corpus content (A3).
+
+    The pre-fix heuristic dropped any token whose first segment looked
+    like a hostname, so `my.files/report.md` — a plain citation under a
+    dotted directory (`data.backup/`, `v1.0/`, `my.files/` are common
+    corpus layouts) — was silently never rewritten, and after --execute
+    the citation pointed at nothing. If the corpus has the path, it IS
+    a path, full stop. Containment is deliberately EXACT (the token, its
+    directory prefixes, and the citing-dir read): a token whose tail
+    alone matches some unrelated corpus file (`example.com/index.md`
+    when the corpus has a root index.md) stays a host — the
+    suffix/basename fallbacks belong to _resolve, not to this question.
+    """
+    if rest in index.paths:
+        return True
+    stripped = rest.rstrip("/")
+    if stripped and stripped in index.dirs:
+        return True
+    cur = ""
+    for seg in rest.split("/")[:-1]:
+        cur = f"{cur}/{seg}" if cur else seg
+        if cur in index.dirs:
+            return True
+    if citing_dir is not None and _citing_dir_hit(
+        _resolve_from(citing_dir, rest), index
+    ):
+        return True
+    return False
+
+
+def _urlish(
+    line: str,
+    start: int,
+    token: str,
+    index: CitationIndex | None = None,
+    citing_dir: str | None = None,
+) -> bool:
+    """A token with a URL scheme, an email, or a bare host: never a
+    corpus citation and never rewritten. `https://docs.acme.example/.../index.html`
+    scans as the path token `docs.acme.example/...` (the regex cannot
+    carry the scheme) and its tail used to resolve via the moved file's
+    basename — mangling a web address into a bare filename. A `://`
+    immediately before the token is a scheme; an `@` anywhere in the
+    token is an email; a dotted first segment (after any ./ ../
+    prefixes) matching a host pattern is a host — UNLESS the token
+    resolves against the corpus (A3): with an `index` given, anything
+    that names a corpus path, a corpus directory, a path under one, or
+    a sibling of the citing file is a path, not a host. Version-y
+    directory names (`spark-1.2.3`) are corpus paths, not hosts — the
+    TLD test keeps them. Without an index (no corpus view), the
+    historical conservative heuristic applies."""
     if line[:start].endswith("://"):
+        return True
+    if "@" in token:
         return True
     rest = token
     while rest.startswith("./") or rest.startswith("../"):
@@ -212,37 +261,51 @@ def _urlish(line: str, start: int, token: str) -> bool:
     first = rest.split("/", 1)[0]
     if "." not in first:
         return False
+    if index is not None:
+        if _resolves_in_corpus(rest, index, citing_dir):
+            return False
+        return bool(_HOST_FIRST_SEG_RE.match(first))
     tail = first.rsplit(".", 1)[-1]
     return len(tail) >= 2 and tail.isalpha()
 
 
-def _path_tokens(line: str) -> list[tuple[str, str]]:
+def _path_tokens(
+    line: str,
+    index: CitationIndex | None = None,
+    citing_dir: str | None = None,
+) -> list[tuple[str, str]]:
     """Path-ish tokens on one line: (token, kind) with kind in
     wikilink|link|path. Bare basenames are not tokens — they are matched
     separately against the index's candidate basenames (a bare word is
     never a citation). URL-scheme and host tokens are not citations
     (C2) and are dropped here, for the scans and the rewrite pass
-    alike."""
+    alike; pass the CitationIndex (and the citing file's dir) so dotted
+    corpus paths are never mistaken for hosts (A3)."""
     tokens: list[tuple[str, str]] = []
     for m in _WIKILINK_RE.finditer(line):
         tokens.append((m.group(1).strip(), "wikilink"))
     for m in _MD_LINK_RE.finditer(line):
         tokens.append((m.group(1).strip(), "link"))
     for m in _PATH_TOKEN_RE.finditer(line):
-        if _urlish(line, m.start(), m.group(0)):
+        if _urlish(line, m.start(), m.group(0), index=index, citing_dir=citing_dir):
             continue
         tokens.append((m.group(0), "path"))
     return tokens
 
 
-def _token_spans(line: str) -> list[tuple[str, str, int, int]]:
+def _token_spans(
+    line: str,
+    index: CitationIndex | None = None,
+    citing_dir: str | None = None,
+) -> list[tuple[str, str, int, int]]:
     """_path_tokens with replacement spans: (stripped_text, kind, start, end).
 
     The span is what a rewrite may substitute: the target inside the
     brackets for wikilinks and Markdown links (fragments, aliases and
     titles are never touched), the whole match for path tokens. A path
     token identical to a link span is dropped — the link site owns that
-    span (one replacement, not two).
+    span (one replacement, not two). index/citing_dir thread the A3
+    corpus-resolution override to the host heuristic.
     """
     spans: list[tuple[str, str, int, int]] = []
     link_ranges: list[tuple[int, int]] = []
@@ -269,7 +332,7 @@ def _token_spans(line: str) -> list[tuple[str, str, int, int]]:
         # it (D6).
         if any(s <= m.start() and m.end() <= e for s, e in backtick_ranges):
             continue
-        if _urlish(line, m.start(), m.group(0)):
+        if _urlish(line, m.start(), m.group(0), index=index, citing_dir=citing_dir):
             continue
         spans.append((m.group(0), "path", m.start(), m.end()))
     return spans
@@ -377,7 +440,7 @@ def _line_targets(
     "see api.md." prose form). citing_dir enables the D4 citing-dir
     read — the scan and the rewrite pass resolve identically."""
     out: dict[str, str] = {}
-    for token, token_form in _path_tokens(line):
+    for token, token_form in _path_tokens(line, index=index, citing_dir=citing_dir):
         resolved = _resolve(
             token,
             index,
@@ -902,7 +965,7 @@ def _line_rewrite(
     location is left alone. External files and root-path tokens take
     the literal swap.
     """
-    token_spans = _token_spans(line)
+    token_spans = _token_spans(line, index=index, citing_dir=citing_pre)
     resolved: list[tuple[int, int, str, str, str]] = []
     skips: list[tuple[str, str, int, int]] = []
     cites: list[tuple[int, int, str, str, str]] = []
@@ -922,8 +985,10 @@ def _line_rewrite(
                 continue
             resolved.append(repl)
             continue
-        if _urlish(line, start, text):
-            continue  # a scheme/host token is not a corpus citation (C2)
+        if _urlish(line, start, text, index=index, citing_dir=citing_pre):
+            continue  # a scheme/host token is not a corpus citation (C2);
+            # corpus-resolvable dotted paths are (A3) — _urlish checked
+            # the index for exactly that.
         # Glob/brace/placeholder tokens get corpus-checked expansion
         # FIRST (D2/D11/E2): a swap is written only when every corpus
         # match moves into ONE destination directory; a split or
@@ -1445,7 +1510,7 @@ def citation_lines(
 def refs_lookup(
     root: Path, name: str, rel_paths: list[Path], per_file_cap: int = 5
 ) -> dict:
-    """refs' resolution layer (D7).
+    """refs' resolution layer (D7), with the honest query state (A5).
 
     A name containing `/` that resolves only through the basename
     fallback names no corpus path — the fallback would return a
@@ -1457,10 +1522,29 @@ def refs_lookup(
     string appears as a token. Suffix forms (`_org/x.md`) still
     resolve through the suffix loop and are unaffected, as are bare
     basenames (`refs <api.md>`).
+
+    A5: "nobody cites it", "you typoed" and "ambiguous, never guessed"
+    all used to return the same citation_count: 0 with ok: true — an
+    agent could not tell "safe to move" from "the query named nothing".
+    The CitationIndex already knows; the payload now says:
+    `exists` (the name resolves to a corpus path/dir/unambiguous
+    basename), `ambiguous` (several files share it — never attributed),
+    and `ambiguous_paths` (the candidates). Still ok: true — these are
+    valid query results, not errors.
     """
     index = CitationIndex(rel_paths)
     resolved = _resolve(name, index)
-    if "/" in name and resolved is not None and resolved[0] == "basename":
+    nonexistent = "/" in name and resolved is not None and resolved[0] == "basename"
+    exists = resolved is not None and not nonexistent
+    ambiguous = resolved is not None and resolved[0] == "ambiguous"
+    ambiguous_paths: list[str] = []
+    if ambiguous:
+        # by_basename candidates first; the stem form comes from the
+        # wikilink-only resolution but is worth naming if present.
+        ambiguous_paths = sorted(
+            index.by_basename.get(resolved[1]) or index.by_stem.get(resolved[1]) or []
+        )
+    if nonexistent:
         exact: list[dict] = []
         for tp in rel_paths:
             if not is_text_file(tp) or tp.as_posix() == name:
@@ -1472,7 +1556,12 @@ def refs_lookup(
                 continue
             hits = 0
             for i, line in enumerate(text.splitlines(), 1):
-                if any(t == name for t, _k, _s, _e in _token_spans(line)):
+                if any(
+                    t == name
+                    for t, _k, _s, _e in _token_spans(
+                        line, index=index, citing_dir=_parent(tp.as_posix())
+                    )
+                ):
                     exact.append(
                         {
                             "file": tp.as_posix(),
@@ -1484,10 +1573,19 @@ def refs_lookup(
                     hits += 1
                     if hits >= per_file_cap:
                         break
-        return {"citations": exact, "nonexistent_path": True}
+        return {
+            "citations": exact,
+            "nonexistent_path": True,
+            "exists": False,
+            "ambiguous": False,
+            "ambiguous_paths": [],
+        }
     return {
         "citations": citation_lines(root, name, rel_paths, per_file_cap),
         "nonexistent_path": False,
+        "exists": exists,
+        "ambiguous": ambiguous,
+        "ambiguous_paths": ambiguous_paths,
     }
 
 
@@ -1544,7 +1642,9 @@ def dangling_citations(
             continue
         hits = 0
         for lineno, line in enumerate(text.splitlines(), 1):
-            for token, kind, _s, _e in _token_spans(line):
+            for token, kind, _s, _e in _token_spans(
+                line, index=index, citing_dir=_parent(rel_str)
+            ):
                 if re.match(r"^[A-Za-z][A-Za-z0-9+.\-]*://", token):
                     continue
                 if kind == "path" and _is_slash_word(token):
@@ -1732,7 +1832,9 @@ def _not_recorded_detail(
         token = next(
             (
                 t
-                for t, _k, _s, _e in _token_spans(line)
+                for t, _k, _s, _e in _token_spans(
+                    line, index=index, citing_dir=citer_dir
+                )
                 if (r := _resolve(t, index, citing_dir=citer_dir)) is not None
                 and (r[1] == target or r[1].startswith(prefix))
             ),

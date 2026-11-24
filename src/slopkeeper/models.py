@@ -28,7 +28,14 @@ PLAN_SCHEMA = "slopkeeper/plan@1"
 # fp5: non-regular files (devices, FIFOs, sockets — sandbox deny-list
 # mounts) are pruned from the walk, so a sandboxed and an unsandboxed
 # run of the same corpus now fingerprint identically.
-CURRENT_FP_PREFIX = "fp5"
+# fp6 (audit A2): symlinked DIRECTORIES join the walk as ENTRIES — the
+# entry digests the root-relative name and the link target; contents
+# are still never followed. Coverage validation counts top-level
+# symlinked dirs (iterdir sees them), so binding them here closes the
+# gap where a plan covered an entry the fingerprint had never seen:
+# a symlink appearing, vanishing or re-targeting after authoring is now
+# drift the gate can catch.
+CURRENT_FP_PREFIX = "fp6"
 
 # The tool/infra layer — directories that are never content. Dot-dirs are
 # CONTENT as of fp4: `.claude/skills`, `.hermes` memories and cron prompts
@@ -157,6 +164,86 @@ def corpus_path(root: Path, rel: Path) -> Path:
     return root / rel
 
 
+def safe_move_path(
+    raw: str | Path,
+    root: Path,
+    *,
+    destination: bool = False,
+    allow_symlinks: bool = False,
+) -> Path:
+    """safe_relpath plus the filesystem symlink policy for MOVE paths (A2).
+
+    safe_relpath's symlink check sees only the FINAL component, so a
+    destination whose INTERMEDIATE directory is a symlink passed
+    validation and was followed at execute — the 2026-11-23 audit's A2
+    (with `corpus/notes -> /tmp/opencode/outside`, apply moved files out
+    of the corpus and validate called the plan valid). This re-checks
+    the whole chain against the live disk:
+
+    - every INTERMEDIATE component must not be a symlink: moving THROUGH
+      a symlinked directory is refused by default — the corpus walk
+      never looks behind a link, so the plan would write where no
+      coverage, fingerprint or reference scan has ever checked;
+    - a DESTINATION leaf must not be a symlink either (never move ONTO
+      a symlink — the write goes through the link); a SOURCE leaf may
+      be one: moving a symlink moves the link itself, and a link
+      resolving outside the root already died in safe_relpath;
+    - as a belt beyond the component walk, the RESOLVED parent must stay
+      inside the root (Path.is_relative_to), the containment form the
+      audit prescribes.
+
+    allow_symlinks (CLI --allow-symlinks) is the deliberate bypass: the
+    whole filesystem policy is skipped, containment included — traversal
+    through symlinked directories, in or out of the corpus, becomes the
+    operator's explicit decision.
+
+    Returns the same relative Path safe_relpath returns (not resolved);
+    re-observes the disk on every call, so apply runs it immediately
+    before each move as the TOCTOU belt.
+    """
+    p = safe_relpath(raw, root)
+    if allow_symlinks:
+        return p
+    root_res = root.resolve()
+    upto = root_res
+    for i, part in enumerate(p.parts):
+        upto = upto / part
+        if not upto.is_symlink():
+            continue
+        leaf = i == len(p.parts) - 1
+        if leaf and not destination:
+            continue  # a source's own symlink is what moves (see docstring)
+        role = "destination" if destination else "source"
+        form = "lands on a symlink" if leaf else "passes through a symlinked directory"
+        raise SlopKeeperError(
+            "symlink_escape",
+            f"move {role} {raw} {form}: {'/'.join(p.parts[: i + 1])}",
+            "Moves refuse symlinked path components by default — the "
+            "corpus walk never looks behind a link, so moving through or "
+            "onto one writes outside every guarantee (coverage, "
+            "fingerprint, reference scans). Remove the symlink, choose a "
+            "path that does not cross one, or pass --allow-symlinks for "
+            "a deliberate traversal.",
+        )
+    try:
+        real_parent = (root_res / p).parent.resolve()
+    except OSError as e:
+        raise SlopKeeperError(
+            "symlink_escape",
+            f"move path {raw} cannot be resolved on disk: {e}",
+            "Fix the filesystem state (unreadable directory behind a "
+            "link?), or pass --allow-symlinks for a deliberate traversal.",
+        ) from None
+    if not real_parent.is_relative_to(root_res):
+        raise SlopKeeperError(
+            "symlink_escape",
+            f"move path {raw} resolves outside the corpus root ({real_parent})",
+            "Remove the symlink or move its target explicitly; pass "
+            "--allow-symlinks only for a deliberate traversal.",
+        )
+    return p
+
+
 # --- integrity --------------------------------------------------------------
 
 
@@ -208,12 +295,13 @@ def corpus_fingerprint(root: Path) -> str:
     counts, so a comment-only ignore edit never moves the fingerprint.
 
     Used as a staleness gate: a plan computed against one fingerprint is
-    refused against a changed corpus unless --force. The `fp4:` prefix
+    refused against a changed corpus unless --force. The `fp6:` prefix
     version-separates the format (fp4 = the walk without the blanket
-    dot-dir prune — dot-dirs are content): plans authored against
-    fp1/fp2/fp3 fail cleanly with `corpus_changed` instead of
-    colliding. A bare `touch` (new mtime, same content) does NOT change
-    a fingerprint; a real content edit does.
+    dot-dir prune — dot-dirs are content; fp6 = symlinked directories
+    counted as ENTRIES, audit A2): plans authored against fp1–fp5 fail
+    cleanly with `corpus_changed` instead of colliding. A bare `touch`
+    (new mtime, same content) does NOT change a fingerprint; a real
+    content edit does.
     """
     # Lazy import: ignore.py imports HIDDEN_SKIP_DIRS from this module,
     # so a top-level import here would be a circular-import trap.
@@ -221,8 +309,27 @@ def corpus_fingerprint(root: Path) -> str:
 
     h = hashlib.sha256()
     count = 0
-    for dirpath, _dirnames, filenames in corpus_walk(root):
+    for dirpath, dirnames, filenames in corpus_walk(root):
         dirpath = Path(dirpath)
+        for dn in dirnames:
+            # fp6 (A2): a symlinked directory is an ENTRY. The walk
+            # never descends it (os.walk does not follow links), but
+            # coverage validation counts it — so its NAME and TARGET
+            # belong to the fingerprint, or the gate would bless plans
+            # whose sibling symlink quietly appeared, vanished, or
+            # re-targeted after authoring.
+            dp = dirpath / dn
+            try:
+                if not dp.is_symlink():
+                    continue
+                target = os.readlink(dp)
+            except OSError:
+                continue
+            h.update(str(dp.relative_to(root)).encode("utf-8", "replace"))
+            h.update(b"\0symlink:")
+            h.update(target.encode("utf-8", "replace"))
+            h.update(b"\0")
+            count += 1
         for fn in filenames:
             fp = dirpath / fn
             try:

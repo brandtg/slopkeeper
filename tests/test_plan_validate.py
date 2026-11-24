@@ -22,8 +22,14 @@ from helpers import (
     write_plan,
 )
 from slopkeeper.apply import apply_plan, undo_journal
-from slopkeeper.models import SlopKeeperError
-from slopkeeper.plan import load_plan, render_markdown, straggler_report, validate_plan
+from slopkeeper.models import SlopKeeperError, corpus_fingerprint
+from slopkeeper.plan import (
+    based_on_binding,
+    load_plan,
+    render_markdown,
+    straggler_report,
+    validate_plan,
+)
 
 
 class TestPlanValidation(TempCase):
@@ -1501,6 +1507,61 @@ class TestStragglerReport(TempCase):
         )
         out = validate_plan(plan, self.root)
         self.assertEqual(straggler_report(self.root, out), [])
+
+
+class TestCorpusBindingRequired(TempCase):
+    """A1 (0.2.6): based_on.corpus_fingerprint is the plan's corpus
+    binding — required by validate and apply, warned (never fabricated)
+    by render, and read under BOTH spellings (the pre-T1
+    inventory_sha256 alias stays valid for plans in the wild)."""
+
+    def test_missing_binding_refused(self):
+        plan = load_plan(write_plan(self.root, based_on=None))
+        expect_code(self, lambda: validate_plan(plan, self.root), "plan_no_based_on")
+
+    def test_blank_and_non_string_refused(self):
+        for bad in (
+            None,  # no based_on at all
+            {},  # empty dict
+            "latest",  # not even a dict
+            {"corpus_fingerprint": ""},
+            {"corpus_fingerprint": "   "},
+            {"corpus_fingerprint": 42},
+            {"corpus_fingerprint": ["fp"]},
+        ):
+            self.assertEqual(based_on_binding({"based_on": bad}), "", repr(bad))
+            plan = load_plan(write_plan(self.root, based_on=bad))
+            expect_code(
+                self,
+                lambda p=plan: validate_plan(p, self.root),
+                "plan_no_based_on",
+            )
+
+    def test_alias_binding_accepted(self):
+        plan = load_plan(
+            write_plan(
+                self.root,
+                based_on={"inventory_sha256": corpus_fingerprint(self.root)},
+            )
+        )
+        out = validate_plan(plan, self.root)  # no raise
+        self.assertEqual(len(out["moves"]), 4)
+        self.assertEqual(based_on_binding(plan), corpus_fingerprint(self.root))
+
+    def test_render_opt_out_validates_unbound(self):
+        # require_based_on=False exists for plan render ONLY: the gate
+        # shows the warning block instead of refusing.
+        plan = load_plan(write_plan(self.root, based_on=None))
+        out = validate_plan(plan, self.root, require_based_on=False)
+        self.assertEqual(len(out["moves"]), 4)
+        self.assertEqual(based_on_binding(out), "")
+
+    def test_recovery_names_the_inventory_command(self):
+        plan = load_plan(write_plan(self.root, based_on=None))
+        with self.assertRaises(SlopKeeperError) as cm:
+            validate_plan(plan, self.root)
+        self.assertIn("slopkeeper inventory", cm.exception.recovery)
+        self.assertIn("fingerprint", cm.exception.recovery)
 
 
 if __name__ == "__main__":

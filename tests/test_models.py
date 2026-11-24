@@ -87,15 +87,15 @@ class TestFingerprint(TempCase):
         (self.root / "WATCHLIST.md").write_text("changed\n")
         self.assertNotEqual(fp1, corpus_fingerprint(self.root))
 
-    def test_fingerprint_is_version_prefixed_fp5(self):
-        # v4 format: plans authored against older fingerprints (different
-        # prefix) can never collide with a current one — they fail
-        # cleanly with corpus_changed instead.
-        self.assertTrue(corpus_fingerprint(self.root).startswith("fp5:"))
+    def test_fingerprint_is_version_prefixed_fp6(self):
+        # Walk-contract prefixing: plans authored against older
+        # fingerprints (different prefix) can never collide with a
+        # current one — they fail cleanly with corpus_changed.
+        self.assertTrue(corpus_fingerprint(self.root).startswith("fp6:"))
 
     def test_dot_dir_content_shifts_fingerprint(self):
-        # fp5 walk contract: a file inside a dot-directory is content —
-        # adding or editing it moves the fingerprint (Phase 1 of the
+        # Walk contract (dot-dirs are content since fp4): a file inside
+        # a dot-directory moves the fingerprint (Phase 1 of the
         # reference-rewrites PRD).
         fp1 = corpus_fingerprint(self.root)
         write(self.root / ".claude" / "skills" / "s.md", "# skill\n")

@@ -24,6 +24,7 @@ from .models import (
     SlopKeeperError,
     corpus_path,
     resolve_chains,
+    safe_move_path,
     safe_relpath,
     sha256_file_exact,
     state_dir,
@@ -33,6 +34,7 @@ from .references import (
     CitationIndex,
     _PER_FILE_CAP,
     _expand_token,
+    _parent,
     _post_move_path,
     _token_spans,
     _walk_rel_paths,
@@ -67,6 +69,27 @@ def _req(plan: dict, key: str):
             f"Add '{key}'. See: slopkeeper plan schema",
         )
     return plan[key]
+
+
+def based_on_binding(plan: dict) -> str:
+    """The corpus fingerprint the plan was authored against (A1).
+
+    `corpus_fingerprint` is canonical; `inventory_sha256` is the pre-T1
+    read-only alias — plans in the wild carry it, and both name the same
+    inventory fingerprint. A binding must be a non-empty string: wrong
+    types (dicts, lists) and blank values do not count, so the shape of
+    `based_on` can never masquerade as a real corpus binding. Returns
+    "" when absent or unusable — validate refuses (plan_no_based_on),
+    render warns, apply's gate never fires on nothing.
+    """
+    based_on = plan.get("based_on")
+    if not isinstance(based_on, dict):
+        return ""
+    for key in ("corpus_fingerprint", "inventory_sha256"):
+        v = based_on.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
 
 
 def _external_target(raw: str, ext_roots: list[Path]) -> Path | None:
@@ -132,7 +155,9 @@ def _reject_dead_glob_prefix_rewrites(
         except Exception:
             continue
         for line in text.splitlines():
-            for token, _kind, _s, _e in _token_spans(line):
+            for token, _kind, _s, _e in _token_spans(
+                line, index=index, citing_dir=_parent(tp.as_posix())
+            ):
                 if (
                     not ("*" in token or "{" in token or "<" in token)
                     or token in checked
@@ -235,12 +260,28 @@ def preflight_destinations(root: Path, chains: dict[str, str]) -> None:
         )
 
 
-def validate_plan(plan: dict, root: Path, allow_partial: bool = False) -> dict:
+def validate_plan(
+    plan: dict,
+    root: Path,
+    allow_partial: bool = False,
+    require_based_on: bool = True,
+    allow_symlinks: bool = False,
+) -> dict:
     """Validate a plan against the corpus on disk. Returns the normalized plan.
 
     Raises SlopKeeperError with a code the agent can act on. A plan may
     declare its own scope with "partial": true (delta plans), which is
     equivalent to passing --allow-partial.
+
+    require_based_on=False exists ONLY for `plan render`: the human gate
+    shows a loud "no corpus binding" warning for an unbound plan instead
+    of the pre-0.2.6 behavior of fabricating a fresh fingerprint (which
+    self-certified the plan to the drift gate). validate and apply
+    always require the binding (A1, plan_no_based_on).
+
+    allow_symlinks (CLI --allow-symlinks) lifts the A2 move-path
+    symlink policy (models.safe_move_path) for deliberate traversal;
+    default False refuses moves through or onto symlinks.
     """
     if plan.get("partial") is True:
         allow_partial = True
@@ -291,6 +332,25 @@ def validate_plan(plan: dict, root: Path, allow_partial: bool = False) -> dict:
             "Regenerate or re-target the plan for this corpus.",
         )
 
+    # A1 (0.2.6): the corpus binding is MANDATORY. A plan without
+    # based_on.corpus_fingerprint has no provenance — apply's staleness
+    # gate read `if recorded:` and silently skipped itself, so a plan
+    # authored before a mutation applied clean against the mutated
+    # corpus (the 2026-11-23 audit's A1: "the silent drift failure mode
+    # is closed" only held for plans that carried the field — and the
+    # LLM-authored plan is the one most likely to omit it). --force
+    # escapes `corpus_changed`, never a missing binding.
+    if require_based_on and not based_on_binding(plan):
+        raise SlopKeeperError(
+            "plan_no_based_on",
+            "plan has no corpus binding: based_on.corpus_fingerprint is "
+            "required (a non-empty string)",
+            "author the plan from inventory output; the fingerprint is "
+            "what makes the plan safe to apply. Run `slopkeeper inventory "
+            "<root> --fast --summary` and record its fingerprint as "
+            "based_on.corpus_fingerprint (see `slopkeeper plan schema`).",
+        )
+
     moves = _req(plan, "moves")
     if not isinstance(moves, list):
         raise SlopKeeperError("plan_no_moves", "plan.moves must be a list")
@@ -305,8 +365,14 @@ def validate_plan(plan: dict, root: Path, allow_partial: bool = False) -> dict:
         exactly like its hand-written equivalent."""
         if not isinstance(m, dict) or "from" not in m or "to" not in m:
             raise SlopKeeperError("plan_bad_move", f"{label} must have 'from' and 'to'")
-        src = safe_relpath(m["from"], root)
-        dst = safe_relpath(m["to"], root)
+        # A2: move paths take the deep symlink policy (safe_move_path),
+        # not just safe_relpath's leaf check — a destination whose
+        # intermediate directory is a symlink used to pass validate and
+        # then be FOLLOWED at execute, writing outside the corpus.
+        src = safe_move_path(m["from"], root, allow_symlinks=allow_symlinks)
+        dst = safe_move_path(
+            m["to"], root, destination=True, allow_symlinks=allow_symlinks
+        )
         if src == dst:
             raise SlopKeeperError("plan_noop_move", f"{label}: from == to ({src})")
         if src in seen_src:
@@ -411,7 +477,12 @@ def validate_plan(plan: dict, root: Path, allow_partial: bool = False) -> dict:
                 "the rule's matches, or drop the key.",
             )
         match_raw = r["match"].strip()
-        to_dir = safe_relpath(r["to"], root)  # path_escape on traversal
+        # A2: a rule destination is a move destination for every file the
+        # rule expands to — same deep symlink policy as explicit moves
+        # (path_escape on traversal, symlink_escape on components).
+        to_dir = safe_move_path(
+            r["to"], root, destination=True, allow_symlinks=allow_symlinks
+        )
         to_abs = root / to_dir
         if to_abs.is_file():
             raise SlopKeeperError(
@@ -643,8 +714,13 @@ def validate_plan(plan: dict, root: Path, allow_partial: bool = False) -> dict:
                 '"acknowledge_broken": true consciously accepts a citation '
                 "the entry cannot fix (D2's dead-glob gate).",
             )
-        src = safe_relpath(e["from"], root)
-        dst = safe_relpath(e["to"], root)
+        # A2: both sides of a prefix rewrite are moved paths (the
+        # directory renames through its destination; the source subtree
+        # must be reachable without crossing a link).
+        src = safe_move_path(e["from"], root, allow_symlinks=allow_symlinks)
+        dst = safe_move_path(
+            e["to"], root, destination=True, allow_symlinks=allow_symlinks
+        )
         src_posix = src.as_posix()
         dst_posix = dst.as_posix()
         if src_posix == dst_posix:
@@ -1358,9 +1434,28 @@ def render_markdown(
         )
 
     lines = ["# Scaffolding plan", ""]
-    meta = plan.get("based_on", {})
+    meta = plan.get("based_on")
+    if not isinstance(meta, dict):
+        meta = {}
+    binding = based_on_binding(plan)
     lines.append(f"- Strategy: **{plan.get('strategy', '?')}**")
     lines.append(f"- Corpus: `{plan.get('corpus_root')}`")
+    if not binding:
+        # A1 (0.2.6): render NEVER back-fills a fingerprint — the
+        # pre-0.2.6 fallback computed a FRESH corpus_fingerprint into the
+        # rendered plan, self-certifying a plan that has no real binding
+        # to the corpus. The gate shows the missing binding instead;
+        # apply refuses such a plan (plan_no_based_on).
+        lines.append("")
+        lines.append(
+            "> **WARNING — plan carries no corpus binding.** "
+            "`based_on.corpus_fingerprint` is absent, so nothing ties this "
+            "plan to the corpus as it stood when it was authored: the "
+            "drift gate cannot check what you approve here, and `apply` "
+            "refuses the plan (`plan_no_based_on`). Re-author from "
+            "`slopkeeper inventory <root> --fast --summary` and record "
+            "its fingerprint before showing this to the owner."
+        )
     ext_roots = plan.get("external_roots") or []
 
     def _ext_label(r: object) -> str:
@@ -1388,12 +1483,12 @@ def render_markdown(
             "- Scan paths (ignored dirs the rewrite pass may touch): "
             + ", ".join(f"`{p}`" for p in scan_paths)
         )
-    if meta:
+    if binding:
         # corpus_fingerprint is canonical; inventory_sha256 is the
-        # pre-T1 spelling still present in plans in the wild.
-        fp = meta.get("corpus_fingerprint") or meta.get("inventory_sha256") or "?"
+        # pre-T1 spelling still present in plans in the wild (both read
+        # through based_on_binding — the one place the alias rule lives).
         lines.append(
-            f"- Based on inventory: `{fp[:16]}` ({meta.get('inventory_at', '?')})"
+            f"- Based on inventory: `{binding[:16]}` ({meta.get('inventory_at', '?')})"
         )
     lines.append(
         f"- Moves: {len(moves)} · Folders: {len(plan.get('folders', []))} "
@@ -1814,7 +1909,10 @@ def render_sidecar_path(root: Path) -> Path:
 
 
 def write_render_sidecar(
-    plan_path: Path, root: Path, artifacts: list[str] | None = None
+    plan_path: Path,
+    root: Path,
+    artifacts: list[str] | None = None,
+    warnings: list[str] | None = None,
 ) -> Path:
     """Record which plan bytes were rendered, for a later apply to check.
 
@@ -1827,6 +1925,11 @@ def write_render_sidecar(
     outputs (the gate, the rewrites JSON) when they sit inside the
     corpus — apply excludes them from the rewrite scan, so a gate left
     in the tree is never rewritten by the apply it gates.
+
+    warnings (A1): what the gate flagged while rendering — today
+    ["no_fingerprint"] for a plan with no corpus binding. The sidecar
+    records what the human was SHOWN; apply reads it, and the absence of
+    a fabricated fingerprint is the point (render never back-fills).
     """
     sidecar = render_sidecar_path(root)
     sidecar.parent.mkdir(parents=True, exist_ok=True)
@@ -1837,6 +1940,8 @@ def write_render_sidecar(
     }
     if artifacts:
         doc["artifacts"] = sorted(set(artifacts))
+    if warnings:
+        doc["warnings"] = sorted(set(warnings))
     sidecar.write_text(json.dumps(doc, indent=1), encoding="utf-8")
     return sidecar
 
@@ -1864,6 +1969,10 @@ PLAN_TEMPLATE = {
     "schema": PLAN_SCHEMA,
     "corpus_root": "/absolute/path/to/corpus",
     "strategy": "role-bots|topics|projects|hybrid",
+    # MANDATORY (A1, 0.2.6): validate and apply refuse a plan without a
+    # real corpus_fingerprint (plan_no_based_on); `plan render` shows a
+    # loud warning block instead of back-filling one. Record the value
+    # from `slopkeeper inventory <root> --fast --summary`.
     "based_on": {
         "corpus_fingerprint": "<from inventory.fingerprint>",
         "inventory_at": "<iso timestamp>",
