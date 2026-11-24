@@ -30,34 +30,16 @@ import bisect
 import re
 from pathlib import Path
 
-from .ignore import corpus_walk
+from . import kinds, scan
 from .references import CitationIndex, _PER_FILE_CAP
 
-# The code subset of TEXT_EXTS: languages where path segments are
-# plausibly built with join()/Path()/dirname() math. Markdown, YAML,
+# The code subset of the scannable set: languages where path segments
+# are plausibly built with join()/Path()/dirname() math. Markdown, YAML,
 # JSON and friends are citation territory (the reference scan), not
-# anchor territory.
-CODE_EXTS = {
-    ".py",
-    ".js",
-    ".ts",
-    ".tsx",
-    ".jsx",
-    ".rb",
-    ".go",
-    ".rs",
-    ".c",
-    ".h",
-    ".cpp",
-    ".hpp",
-    ".java",
-    ".kt",
-    ".swift",
-    ".sh",
-    ".bash",
-    ".zsh",
-    ".sql",
-}
+# anchor territory. This was a private copy of inventory's list — the
+# two drifted only because nothing stopped them; kinds.CODE_EXTS is the
+# single table now (P3/R7) and this is the alias every importer knows.
+CODE_EXTS = kinds.CODE_EXTS
 
 _MAX_EVIDENCE_PER_DIR = 64  # same posture as _MAX_MENTIONS_PER_TARGET
 # Evidence text truncation — the same cap as citation_lines'
@@ -204,7 +186,7 @@ def scan_code_anchors(
     root = Path(root)
     anchors: dict[str, list[dict]] = {}
     for tp in rel_paths:
-        if tp.suffix.lower() not in CODE_EXTS:
+        if not kinds.is_code(tp):
             continue
         rel_str = tp.as_posix()
         file_dir_parts = list(tp.parts[:-1])
@@ -234,21 +216,33 @@ def scan_code_anchors(
 
 
 def _corpus_rel_paths(root: Path) -> list[Path]:
-    """The shared walk as a rel-path list (anchors need the full set:
-    the dirs index must know every corpus directory, code file or not)."""
-    out: list[Path] = []
-    for dirpath, _dirnames, filenames in corpus_walk(root):
-        d = Path(dirpath)
-        for fn in filenames:
-            out.append((d / fn).relative_to(root))
-    return out
+    """The corpus file list (anchors need the full set: the dirs index
+    must know every corpus directory, code file or not).
+
+    The single-pass scanner's names-only view — anchors used to run its
+    own `os.walk` to get what every other surface already had.
+    """
+    return scan.corpus_rel_paths(root)
 
 
-def anchored_dirs(root: Path) -> dict[str, list[dict]]:
-    """Whole-corpus anchor map (doctor, plan validate, render)."""
+def anchored_dirs(
+    root: Path,
+    *,
+    rel_paths: list[Path] | None = None,
+    index: CitationIndex | None = None,
+) -> dict[str, list[dict]]:
+    """Whole-corpus anchor map (doctor, plan validate, render).
+
+    `rel_paths`/`index` let a caller that already holds the corpus (the
+    one-pass `doctor`) hand the paths over instead of paying for another
+    traversal; the default walks through the shared scanner.
+    """
     root = Path(root)
-    rel_paths = _corpus_rel_paths(root)
-    return scan_code_anchors(root, rel_paths, CitationIndex(rel_paths))
+    if rel_paths is None:
+        rel_paths = _corpus_rel_paths(root)
+    if index is None:
+        index = CitationIndex(rel_paths)
+    return scan_code_anchors(root, rel_paths, index)
 
 
 def anchored_move_risks(root: Path, plan: dict) -> list[dict]:

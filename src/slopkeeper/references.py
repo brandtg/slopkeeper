@@ -33,55 +33,18 @@ import posixpath
 import re
 from pathlib import Path
 
-from .ignore import corpus_walk
+from . import kinds, scan
 from .models import HIDDEN_SKIP_DIRS, SlopKeeperError
 
 
-# Extensions we are willing to read for reference scanning.
-TEXT_EXTS = {
-    ".md",
-    ".markdown",
-    ".txt",
-    ".rst",
-    ".org",
-    ".json",
-    ".yaml",
-    ".yml",
-    ".toml",
-    ".ini",
-    ".cfg",
-    ".csv",
-    ".tsv",
-    ".html",
-    ".htm",
-    ".xml",
-    ".py",
-    ".js",
-    ".ts",
-    ".tsx",
-    ".jsx",
-    ".rb",
-    ".go",
-    ".rs",
-    ".c",
-    ".h",
-    ".cpp",
-    ".hpp",
-    ".java",
-    ".kt",
-    ".swift",
-    ".sh",
-    ".bash",
-    ".zsh",
-    ".sql",
-    ".tex",
-    ".bib",
-    ".css",
-    ".scss",
-    ".ipynb",
-    ".log",
-    ".jsonl",
-}
+# Extensions we are willing to read for reference scanning. The table
+# lives in kinds.py now (P3/R7) so inventory, anchors, similar, propose
+# and this module cannot disagree about what a file is; the name stays
+# here as the alias test imports use. Membership is the FAST path —
+# `is_text_file` falls back to the NUL sniff for anything unlisted, so
+# a `.dart` or `.tf` file that inventory calls text is finally scannable
+# for citations too (it used to be invisible to this module alone).
+TEXT_EXTS = kinds.TEXT_EXTS
 
 _PER_FILE_CAP = 512 * 1024  # don't index beyond 512KB of a single file
 _MAX_MENTIONS_PER_TARGET = 64  # stop counting after this; it's "widely cited"
@@ -91,8 +54,15 @@ _MAX_MENTIONS_PER_TARGET = 64  # stop counting after this; it's "widely cited"
 _SNIPPET_CAP = 2000
 
 
-def is_text_file(path: Path) -> bool:
-    return path.suffix.lower() in TEXT_EXTS
+def is_text_file(path: Path, head: bytes | None = None) -> bool:
+    """Can `path` be read as text — and therefore hold a citation?
+
+    kinds.classify's answer (extension table, then the NUL sniff), which
+    is the same question inventory answers for `files[].kind`. Passing
+    `head` (the first bytes, already read) keeps a scan that has the
+    bytes from opening the file twice to decide whether to open it.
+    """
+    return kinds.is_scannable(path, head=head)
 
 
 def _name_pattern(name: str) -> re.Pattern[str]:
@@ -413,24 +383,188 @@ def _resolve(
     return ("basename", paths[0])
 
 
-def _basename_pattern(basenames: list[str]) -> re.Pattern[str] | None:
-    """One alternation for every candidate basename, longest first, with
-    the same word-ish boundaries as _name_pattern."""
+class _Hit:
+    """The slice of `re.Match` the basename call sites actually use.
+
+    `group(1)` / `start(1)` / `end(1)` — the matched text as it appears
+    in the line and its span. Keeping the shape means every consumer of
+    the old compiled alternation keeps working untouched.
+    """
+
+    __slots__ = ("text", "lo", "hi")
+
+    def __init__(self, text: str, lo: int, hi: int):
+        self.text = text
+        self.lo = lo
+        self.hi = hi
+
+    def group(self, n: int = 0) -> str:
+        return self.text
+
+    def start(self, n: int = 0) -> int:
+        return self.lo
+
+    def end(self, n: int = 0) -> int:
+        return self.hi
+
+    def span(self, n: int = 0) -> tuple[int, int]:
+        return (self.lo, self.hi)
+
+
+# A citation-shaped word: maximal run of the characters the boundary
+# lookarounds argue about. A basename whose own characters all live in
+# that class can only START at a run boundary (the lookbehind forbids
+# `[\w.-]` before it) and can only END where the lookahead allows, so
+# splitting the line here costs one C-speed pass and turns "try 5,000
+# alternatives at every position" into a trie descent that dies after a
+# hop or two on ordinary prose.
+_RUN_RE = re.compile(r"[\w.-]+")
+# The trailing half of `_name_pattern`'s boundary: what may NOT follow a
+# match. A bare `.` is allowed ("See dsa.md." still cites dsa.md), `.bak`
+# and `_2` are not.
+_BOUND_RE = re.compile(r"[\w-]|\.[A-Za-z0-9]")
+# The class the lookbehind forbids BEFORE a match — also what makes a
+# run start a candidate start.
+_PREV_RE = re.compile(r"[\w.-]")
+_TERMINAL = "$"
+_SIMPLE_NAME_RE = re.compile(r"[\w.-]+\Z")
+
+
+class BasenameMatcher:
+    """Every candidate basename, matched with word-ish boundaries.
+
+    What it replaces (P3, R6's citation-scan prefilter): one regex whose
+    alternation was every candidate basename in the corpus, longest
+    first. `refs` on a 5k-file corpus with distinct names spent 2.2s in
+    `base_pat.finditer` — `re` walks the whole alternation at every
+    position of every line — and 0.24s more COMPILING it, per scan. The
+    candidates now live in a character trie over their casefolded text,
+    and the line is read as candidate starts plus one descent each.
+    Same rule, same answer, no alternation.
+
+    The semantics are `_name_pattern`'s, unchanged: a match starts where
+    the previous character is not name-ish, ends where the lookahead
+    permits, is case-insensitive, takes the longest candidate that
+    qualifies at a start, and never overlaps the previous match.
+
+    Two read modes, chosen once at build time. When every candidate is
+    made of name-ish characters (the common corpus), a match must sit
+    inside one `_RUN_RE` run, so the line is split once and each run
+    start is the only position worth trying. When ANY candidate holds a
+    character outside that class — `cpp+.md`, and the spaced filename
+    that has always been the hard case (`Sample Transcript - Owner's
+    Phone .md`, audit D6) — runs are not the unit any more and every
+    position after a non-name character is a candidate, pre-filtered by
+    the first-character set so ordinary prose still costs one lookup per
+    word rather than a descent.
+
+    Case-insensitivity is `re.IGNORECASE`'s, exactly — which for ASCII
+    is `.lower()`, and NOT `.casefold()`: casefold folds `ß` to `ss` and
+    would match a name the old pattern never matched. So the trie is
+    only trusted where that equivalence is provable, an ASCII candidate
+    set against an ASCII line; anything else goes to `_fallback()`'s
+    compiled alternation. A corpus of German or Turkish filenames, or a
+    line carrying an em dash, pays the old cost; the fuzzer
+    (tests/test_references.py, TestBasenameMatcherParity) is what keeps
+    that boundary honest rather than convenient.
+    """
+
+    __slots__ = ("_names", "_root", "_first", "_run_mode", "_ascii", "_slow")
+
+    def __init__(self, basenames: list[str]):
+        self._names = list(basenames)
+        self._root: dict = {}
+        self._first: set[str] = set()
+        for b in self._names:
+            folded = b.lower()
+            self._first.add(folded[0])
+            node = self._root
+            for ch in folded:
+                node = node.setdefault(ch, {})
+            node[_TERMINAL] = b
+        self._run_mode = all(_SIMPLE_NAME_RE.match(b) for b in self._names)
+        # The trie's `.lower()` keys are `re.IGNORECASE` only while both
+        # sides are ASCII; see the class docstring.
+        self._ascii = all(b.isascii() for b in self._names)
+        self._slow: re.Pattern[str] | None = None
+
+    def _fallback(self) -> re.Pattern[str]:
+        """The compiled alternation, for the rare line the trie cannot
+        index safely: casefolding that changes length (`ß` → `ss`, `İ`,
+        the ligatures) shifts every position after it, so a span
+        computed on the folded text would lie. Building it costs the
+        0.2s the trie exists to avoid, which is why it is built on
+        first use and only ever for a corpus that actually contains
+        such text."""
+        if self._slow is None:
+            alternation = "|".join(
+                re.escape(b) for b in sorted(self._names, key=len, reverse=True)
+            )
+            self._slow = re.compile(
+                r"(?<![\w.-])(" + alternation + r")(?![\w-]|\.[A-Za-z0-9])",
+                re.IGNORECASE,
+            )
+        return self._slow
+
+    def _starts(self, line: str):
+        """Candidate match positions, left to right."""
+        if self._run_mode:
+            for m in _RUN_RE.finditer(line):
+                yield m.start()
+            return
+        first = self._first
+        prev = ""
+        for i, ch in enumerate(line):
+            if (not prev or not _PREV_RE.match(prev)) and ch.lower() in first:
+                yield i
+            prev = ch
+
+    def _slow_used(self) -> bool:
+        """Whether the compiled alternation was ever needed (tests)."""
+        return self._slow is not None
+
+    def finditer(self, line: str):
+        if not (self._ascii and line.isascii()):
+            return self._fallback().finditer(line)
+        hits: list[_Hit] = []
+        end_of_last = 0
+        root = self._root
+        for start in self._starts(line):
+            if start < end_of_last:
+                continue  # matches never overlap (finditer's contract)
+            node = root
+            best = -1
+            k = start
+            n = len(line)
+            while k < n:
+                node = node.get(line[k].lower())
+                if node is None:
+                    break
+                k += 1
+                if node.get(_TERMINAL) is not None and _BOUND_RE.match(line, k) is None:
+                    best = k  # keep descending: a longer candidate may win
+            if best > 0:
+                hits.append(_Hit(line[start:best], start, best))
+                end_of_last = best
+        return iter(hits)
+
+
+def _basename_pattern(basenames: list[str]) -> BasenameMatcher | None:
+    """One matcher for every candidate basename, longest first, with the
+    same word-ish boundaries as _name_pattern.
+
+    The name is the one every call site (and propose.py) already uses;
+    what changed in 0.2.8 is the body — see BasenameMatcher.
+    """
     if not basenames:
         return None
-    alternation = "|".join(
-        re.escape(b) for b in sorted(basenames, key=len, reverse=True)
-    )
-    return re.compile(
-        r"(?<![\w.-])(" + alternation + r")(?![\w-]|\.[A-Za-z0-9])",
-        re.IGNORECASE,
-    )
+    return BasenameMatcher(basenames)
 
 
 def _line_targets(
     line: str,
     index: CitationIndex,
-    base_pat: re.Pattern[str] | None,
+    base_pat: BasenameMatcher | None,
     citing_dir: str | None = None,
 ) -> dict[str, str]:
     """Resolved citation targets on one line → the form that cited them
@@ -478,16 +612,14 @@ def scan_references(root: Path, rel_paths: list[Path]) -> dict[str, list[str]]:
     which knows the plan's full moved set.
     """
     index = CitationIndex(rel_paths)
-    text_files = [p for p in rel_paths if is_text_file(p)]
-    if not index.paths or not text_files:
+    if not index.paths:
         return {}
     base_pat = _basename_pattern(sorted(index.by_basename))
     refs: dict[str, list[str]] = {}
-    for tp in text_files:
+    for tp in rel_paths:
         rel_str = tp.as_posix()
-        try:
-            raw = (root / tp).read_bytes()[:_PER_FILE_CAP]
-        except OSError:
+        raw = _scan_bytes(root, tp)
+        if raw is None:
             continue
         try:
             text = raw.decode("utf-8", errors="replace")
@@ -507,30 +639,58 @@ def scan_references(root: Path, rel_paths: list[Path]) -> dict[str, list[str]]:
     return {k: v for k, v in refs.items() if v}
 
 
-def _walk_rel_paths(root: Path):
-    """corpus_walk lazily as corpus-relative paths — never a list.
+def _scan_bytes(root: Path, tp: Path) -> bytes | None:
+    """The bytes to scan a file for citations, or None (not text, gone).
 
-    The walk contract is the one every corpus-side command shares
-    (skip-list + ignore file); yielding keeps no rel-path materialized.
+    One place for the read policy every scan shares: the extension table
+    decides for the extensions it knows WITHOUT touching the disk, an
+    unknown extension pays one bounded sniff (kinds.SNIFF_BYTES) before
+    the file is opened for real, and a file that cannot be read is
+    skipped the way every scan has always skipped it. `is_text_file` is
+    the same decision without the bytes; callers that then read the file
+    go through here so the decision costs no extra open for the
+    extensions the table already speaks.
     """
-    for dirpath, _dirnames, filenames in corpus_walk(root):
-        d = Path(dirpath)
-        for fn in filenames:
-            yield (d / fn).relative_to(root)
+    known = kinds.kind_of(tp)
+    if known == "binary":
+        return None
+    if known is None:
+        try:
+            with (root / tp).open("rb") as f:
+                head = f.read(kinds.SNIFF_BYTES)
+        except OSError:
+            return None
+        if kinds.classify(tp, head=head) == "binary":
+            return None
+    try:
+        return (root / tp).read_bytes()[:_PER_FILE_CAP]
+    except OSError:
+        return None
+
+
+def _walk_rel_paths(root: Path):
+    """The corpus as corpus-relative paths, from the ONE traversal.
+
+    The walk contract is scan.py's (skip-list + ignore file), and this
+    is its names-only view: the scanner stats each file to decide
+    regularity anyway, so no consumer pays for a second `os.walk` just
+    to learn the names.
+    """
+    return scan.iter_rel_paths(root)
 
 
 def scan_references_stream(root: Path) -> dict:
     """Un-capped linear scan: {path_or_dir: [citing]} + a "stats" key.
 
     Phase 3 (reference-rewrites PRD): the 2000-file scan ceiling is
-    gone. Two linear passes over the shared walk — the first feeds the
-    citation index (resolution needs the complete path set: a citer may
-    name a file the walk reaches later, so tokens cannot be resolved
-    mid-walk), the second streams text files one at a time under the
-    per-file read cap. No rel-path list is materialized and nothing
-    refuses at any file count; callers report the loud counts
-    (files_scanned, hits) instead of ever skipping silently. Same
-    resolution rules and shape as scan_references (which stays for
+    gone. Resolution needs the complete path set before any token can
+    be read (a citer may name a file the walk reaches later), so the
+    names come off ONE traversal and the text files are streamed after,
+    one read each under the per-file cap. Since 0.2.8 (R6) the names
+    come from the single-pass scanner instead of a second `os.walk` per
+    pass; nothing refuses at any file count and callers report the loud
+    counts (files_scanned, hits) instead of ever skipping silently.
+    Same resolution rules and shape as scan_references (which stays for
     callers that already hold rel paths, e.g. inventory) — the two
     agree exactly (test_stream_matches_eager).
 
@@ -539,18 +699,16 @@ def scan_references_stream(root: Path) -> dict:
     bound). Callers pop "stats" to recover the plain refs mapping.
     """
     root = Path(root)
-    index = CitationIndex(_walk_rel_paths(root))
+    rel_paths = list(scan.iter_rel_paths(root))
+    index = CitationIndex(rel_paths)
     base_pat = _basename_pattern(sorted(index.by_basename))
     refs: dict[str, list[str]] = {}
     files_scanned = 0
     hits = 0
-    for tp in _walk_rel_paths(root):
-        if not is_text_file(tp):
-            continue
+    for tp in rel_paths:
         rel_str = tp.as_posix()
-        try:
-            raw = (root / tp).read_bytes()[:_PER_FILE_CAP]
-        except OSError:
+        raw = _scan_bytes(root, tp)
+        if raw is None:
             continue
         try:
             text = raw.decode("utf-8", errors="replace")
@@ -915,7 +1073,7 @@ def _link_replacement(
 def _line_rewrite(
     line: str,
     index: CitationIndex,
-    base_pat: re.Pattern[str] | None,
+    base_pat: BasenameMatcher | None,
     chains: dict[str, str],
     citing_pre: str,
     citing_post: str,
@@ -1268,7 +1426,13 @@ def plan_rewrites(
     skip_rewrites: list[dict] = []
     skip_lines = skip_lines or {}
     for scan_rel in scan_files:
-        if not is_text_file(Path(str(scan_rel))):
+        # Resolved against the corpus: `is_text_file` sniffs the bytes for
+        # the extensions the table is silent about (0.2.8), and a bare
+        # relative name would be sniffed wherever the process happens to
+        # be sitting — silently "binary" for a corpus file the CWD has no
+        # copy of. External-root scan files are absolute already (join
+        # leaves those alone).
+        if not is_text_file(root / str(scan_rel)):
             continue
         report_rel = _post_move_path(str(scan_rel), chains)
         in_corpus = not os.path.isabs(report_rel)
@@ -1479,10 +1643,10 @@ def citation_lines(
     for tp in rel_paths:
         if tp.as_posix() == target:
             continue  # a file doesn't cite itself
-        if not is_text_file(tp):
+        raw = _scan_bytes(root, tp)
+        if raw is None:
             continue
         try:
-            raw = (root / tp).read_bytes()[:_PER_FILE_CAP]
             text = raw.decode("utf-8", errors="replace")
         except Exception:
             continue
@@ -1547,10 +1711,12 @@ def refs_lookup(
     if nonexistent:
         exact: list[dict] = []
         for tp in rel_paths:
-            if not is_text_file(tp) or tp.as_posix() == name:
+            if tp.as_posix() == name:
+                continue
+            raw = _scan_bytes(root, tp)
+            if raw is None:
                 continue
             try:
-                raw = (root / tp).read_bytes()[:_PER_FILE_CAP]
                 text = raw.decode("utf-8", errors="replace")
             except Exception:
                 continue
@@ -1632,11 +1798,11 @@ def dangling_citations(
 
     out: list[dict] = []
     for tp in rel_paths:
-        if not is_text_file(tp):
-            continue
         rel_str = tp.as_posix()
+        raw = _scan_bytes(root, tp)
+        if raw is None:
+            continue
         try:
-            raw = (root / tp).read_bytes()[:_PER_FILE_CAP]
             text = raw.decode("utf-8", errors="replace")
         except Exception:
             continue

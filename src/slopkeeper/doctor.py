@@ -7,19 +7,28 @@
 Answers the questions the agent needs answered first: how big is this,
 is it a git repo, how messy is the root, which strategy fits, and what
 will the inventory cost in tokens.
+
+Every answer comes off ONE traversal (P3/R6). The 0.2.7 command walked
+the corpus about seven times — inventory, the fingerprint, the nested
+corpora, the visibility survey, the nested-repo survey, the anchor scan's
+own path list, and the dangling-citation scan's file list — and opened
+most files three or four times on the way. `scan.prepare` walks once,
+stat-ing and hashing each file and recording what the pruning dropped,
+and every survey below folds from that. The number that used to be two
+instants stitched together (the inventory's list and the fingerprint's
+digest) is now one walk's answer, which is also what a plan binds to.
 """
 
 from __future__ import annotations
 
-import os
-import stat
 from pathlib import Path
 
 from .anchors import anchored_dirs
-from .ignore import IGNORE_NAME, HIDDEN_SKIP_DIRS, load_ignore, nested_corpora
+from .ignore import IGNORE_NAME, load_ignore
 from .inventory import collect
-from .models import STATE_DIR, SlopKeeperError
-from .references import dangling_citations
+from .models import SlopKeeperError
+from .references import CitationIndex, dangling_citations
+from .scan import prepare
 
 # Rough token heuristic: ~4 chars per token on markdown/JSON-ish text.
 CHARS_PER_TOKEN = 4
@@ -30,83 +39,75 @@ _CACHE_DIR_FILES = 5000
 _MAX_LISTED = 10
 
 
-def _rel_walk_dirs(root: Path, ignore, nested: set[str]):
-    """os.walk with the corpus's prune contract, but IGNORED FILES KEPT.
-
-    The strandings detector needs ignored and visible files side by
-    side (the copied-.gitignore trap), so dir-level ignores prune the
-    descent (a fully-ignored subtree cannot strand) while per-file
-    ignore status is computed inside. Skip-list members and nested
-    corpora are pruned as everywhere else.
-    """
-    for dirpath, dirnames, filenames in os.walk(root):
-        rel_dir = Path(dirpath).resolve().relative_to(root)
-        kept = []
-        for d in dirnames:
-            if d in HIDDEN_SKIP_DIRS or d == STATE_DIR:
-                continue
-            rel = (rel_dir / d).as_posix() if rel_dir.parts else d
-            if ignore.is_ignored(rel, is_dir=True) or rel in nested:
-                continue
-            kept.append(d)
-        dirnames[:] = sorted(kept)
-        yield (
-            str(rel_dir) if rel_dir.parts else ".",
-            sorted(filenames),
-        )
+def _parent_dir(rel: str) -> str:
+    """The root-relative posix directory a rel path sits in ("." = root)."""
+    head, sep, _tail = rel.rpartition("/")
+    return head if sep else "."
 
 
-def _visibility_scan(
-    root: Path, ignore, nested: set[str]
-) -> tuple[list[dict], dict, list[Path], list[dict]]:
-    """(stranded dirs, dot-dir stats, visible file list, non-regular files).
+def _visibility_from_scan(scan) -> tuple[list[dict], dict, list[Path], list[dict]]:
+    """(stranded dirs, dot-dir stats, file list, non-regular files).
+
+    The four answers the Phase 11 reports used to need their own walk
+    for, folded from the one traversal's records:
 
     stranded: dirs where ignored and non-ignored files coexist — a
     copied .gitignore strands half a folder and the tool sees only the
-    visible half. dot-dir stats roll file counts and .jsonl counts up
-    into each first-segment dot directory (the transcript-dump trap).
-    The file list feeds the dangling-citation scan, so both answers
-    cost one walk. Non-regular entries (devices, FIFOs, sockets —
-    sandbox deny-list mounts) are named so a sandboxed run explains
-    its own count drift instead of poisoning the fingerprint.
+    visible half. The walk keeps ignored names in the report precisely
+    so this comparison can be made;
+    dot-dir stats roll file counts and .jsonl counts up into each
+    first-segment dot directory (the transcript-dump trap), counting
+    every entry the walk saw in that subtree, ignored or not, regular
+    or not — the shape the old raw-filenames loop had;
+    the file list feeds the dangling-citation scan (visible AND ignored
+    files, the same set the old survey handed over), with two
+    tool-layer exceptions the old raw-`os.walk` survey could not make
+    because it kept its own rules: the corpus's own `.slopkeeperignore`
+    (config, not content — counting it had doctor report dangling
+    citations inside the ignore file) and a symlink that goes nowhere
+    (not a visible file, and the one entry no walk can read). `stats`,
+    the fingerprint and this survey now agree because they ARE the same
+    walk.
+    non-regular entries (devices, FIFOs, sockets — sandbox deny-list
+    mounts) are named so a sandboxed run explains its own count drift
+    instead of poisoning the fingerprint.
     """
+    ignored_by_dir: dict[str, list[str]] = {}
+    for rel in scan.report.ignored_files:
+        ignored_by_dir.setdefault(_parent_dir(rel), []).append(rel)
+    nonreg_by_dir: dict[str, list[dict]] = {}
+    for row in scan.report.non_regular:
+        nonreg_by_dir.setdefault(_parent_dir(row["path"]), []).append(row)
+
     stranded: list[dict] = []
     dotdirs: dict[str, dict] = {}
     files: list[Path] = []
-    non_regular: list[dict] = []
-    for rel_dir, filenames in _rel_walk_dirs(root, ignore, nested):
-        ignored_n = 0
-        visible_n = 0
-        for fn in filenames:
-            rel = f"{rel_dir}/{fn}" if rel_dir != "." else fn
-            fp = root / rel
-            try:
-                mode = fp.stat().st_mode
-            except OSError:
-                mode = 0
-            if mode and not stat.S_ISREG(mode):
-                non_regular.append({"path": rel, "mode": stat.S_IFMT(mode)})
-                continue
-            if ignore.is_ignored(rel, is_dir=False):
-                ignored_n += 1
-            else:
-                visible_n += 1
-            files.append(Path(rel))
-        if ignored_n and visible_n:
+    for visit in scan.visits:
+        rel_dir = visit.rel
+        visible = [e.rel for e in visit.files]
+        ignored = ignored_by_dir.get(rel_dir, ())
+        if ignored and visible:
             stranded.append(
-                {"dir": rel_dir, "ignored": ignored_n, "visible": visible_n}
+                {"dir": rel_dir, "ignored": len(ignored), "visible": len(visible)}
             )
+        every = sorted([*ignored, *visible])
+        files.extend(Path(r) for r in every)
         first = rel_dir.split("/")[0]
         if first.startswith(".") and first != ".":
             st = dotdirs.setdefault(first, {"files": 0, "jsonl": 0})
-            for fn in filenames:
+            # Every entry the walk listed here, pruned-away ones included.
+            for row in nonreg_by_dir.get(rel_dir, ()):
                 st["files"] += 1
-                if fn.endswith(".jsonl"):
+                if row["path"].endswith(".jsonl"):
                     st["jsonl"] += 1
-    return stranded, dotdirs, files, non_regular
+            for rel in every:
+                st["files"] += 1
+                if rel.endswith(".jsonl"):
+                    st["jsonl"] += 1
+    return stranded, dotdirs, files, list(scan.report.non_regular)
 
 
-def _nested_repos_and_modules(root: Path, ignore) -> tuple[list[str], list[str]]:
+def _nested_repos_and_modules(scan, ignore) -> tuple[list[str], list[str]]:
     """Nested git repos (dir/.git) and node_modules dirs, un-ignored only.
 
     A nested repo's files ARE corpus content since fp4 (only .git
@@ -114,25 +115,24 @@ def _nested_repos_and_modules(root: Path, ignore) -> tuple[list[str], list[str]]
     realizing it is there, so it is detected and its dir suggested for
     the ignore file. Copying the suggested lines silences the warning
     (ignored dirs are filtered out here).
+
+    The names come out of the single walk's report: `.git` and
+    `node_modules` are skip-list members, so the traversal is the only
+    place that still sees them being pruned. One consequence worth
+    naming: a repo inside an already-pruned subtree (an ignored dir, a
+    nested corpus) is no longer found here — it was never reportable
+    when the parent was ignored anyway, and a nested corpus has its own
+    doctor run to say so.
     """
     repos: list[str] = []
     modules: list[str] = []
-    for dirpath, dirnames, _filenames in os.walk(root):
-        rel_dir = Path(dirpath).resolve().relative_to(root)
-        hit_repo = ".git" in dirnames
-        hit_node = "node_modules" in dirnames
-        rel_str = str(rel_dir) if rel_dir.parts else "."
-        if rel_dir.parts:  # the corpus's own .git is stats.git_repo's business
-            if hit_repo and not ignore.is_ignored(rel_str, is_dir=True):
-                repos.append(rel_str)
-            if hit_node and not ignore.is_ignored(rel_str, is_dir=True):
-                modules.append(rel_str)
-        # never descend into the layers themselves
-        dirnames[:] = sorted(
-            d
-            for d in dirnames
-            if d not in HIDDEN_SKIP_DIRS and d not in (".git", "node_modules")
-        )
+    for rel_dir, names in scan.report.hidden_children.items():
+        if ignore.is_ignored(rel_dir, is_dir=True):
+            continue
+        if ".git" in names:
+            repos.append(rel_dir)
+        if "node_modules" in names:
+            modules.append(rel_dir)
     return sorted(repos), sorted(modules)
 
 
@@ -154,7 +154,11 @@ def doctor(root: Path) -> dict:
             "Pass the directory you want to organize.",
         )
 
-    inv = collect(root, fast=True)
+    # One pass, every answer. `collect` folds the inventory document and
+    # the fingerprint off these records; the surveys below read the
+    # report the same walk filled while it pruned.
+    scan = prepare(root)
+    inv = collect(root, fast=True, scan=scan)
     s = inv["stats"]
     n = s["files"]
 
@@ -241,8 +245,9 @@ def doctor(root: Path) -> dict:
             f"is partial. Largest top-level dirs: {named} — inventory "
             "those per-dir (`slopkeeper inventory <root>/<dir> --fast`)."
         )
-    # Phase 7: nested corpora are named, never silently missing.
-    nested = nested_corpora(root)
+    # Phase 7: nested corpora are named, never silently missing — the
+    # walk names them as it prunes them, so this is a read, not a survey.
+    nested = sorted(set(scan.report.nested))
     if nested:
         advice.append(
             f"Nested corpus/corpora detected: {', '.join(nested)} — each "
@@ -251,12 +256,12 @@ def doctor(root: Path) -> dict:
             "separately (`slopkeeper status <path>`); a wholesale move of "
             "its directory is the nested corpus's own business."
         )
-    # Phase 11 diagnostics: one shared walk answers the four questions
-    # the reports answered by hand — nested repos, stranded folders,
-    # cache-like dot dirs, and the visibility file list for dangling
-    # citations.
-    stranded, dotdirs, walk_files, non_regular = _visibility_scan(root, ig, set(nested))
-    repos, modules = _nested_repos_and_modules(root, ig)
+    # Phase 11 diagnostics: the four questions the reports answered by
+    # hand — nested repos, stranded folders, cache-like dot dirs, and
+    # the visibility file list for dangling citations — are all facts the
+    # one walk already learned.
+    stranded, dotdirs, walk_files, non_regular = _visibility_from_scan(scan)
+    repos, modules = _nested_repos_and_modules(scan, ig)
     suggested_lines: list[str] = []
     if repos or modules:
         suggested_lines = [f"{d}/" for d in _dedupe_prefixes(repos + modules)]
@@ -339,7 +344,11 @@ def doctor(root: Path) -> dict:
     # Phase 9: directories built in code — the cost of moving them that
     # no rewrite pass can fully fix (__file__ math is computed, not
     # written). Informational; evidence rows are in code_anchors.
-    code_anchors = anchored_dirs(root)
+    # The anchor scan needs the corpus path list and the dir index; both
+    # are the walk's, so it reads code files and walks nothing.
+    code_anchors = anchored_dirs(
+        root, rel_paths=scan.rel_paths(), index=CitationIndex(scan.rel_paths())
+    )
     if code_anchors:
         top = sorted(code_anchors.items(), key=lambda kv: (-len(kv[1]), kv[0]))
         names = ", ".join(f"`{d}`" for d, _ in top[:5])

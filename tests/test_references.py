@@ -15,6 +15,7 @@ from helpers import write
 from slopkeeper.references import citation_lines
 from slopkeeper.references import (
     CitationIndex,
+    _basename_pattern,
     _resolve,
     _token_spans,
     _urlish,
@@ -579,6 +580,259 @@ class TestRefsLookupHonestState(unittest.TestCase):
         self.assertTrue(out["nonexistent_path"])
         self.assertFalse(out["exists"])
         self.assertFalse(out["ambiguous"])
+
+
+# --- the basename matcher (P3 prefilter) ------------------------------------
+#
+# `_basename_pattern` used to compile every candidate basename into one
+# alternation. It is now a trie over casefolded candidates plus a
+# run-splitting prefilter, which is a different machine — so the bar is
+# not "the suite still passes", it is "the answer is identical". These
+# tests hold the old pattern in the file itself and compare spans, on a
+# table of the cases that used to be subtle and on a seeded fuzz over
+# names that a corpus really has.
+
+_OLD_PATTERN = r"(?<![\w.-])({alt})(?![\w-]|\.[A-Za-z0-9])"
+
+
+def _old_hits(names: list[str], line: str):
+    import re
+
+    alt = "|".join(re.escape(n) for n in sorted(names, key=len, reverse=True))
+    pat = re.compile(_OLD_PATTERN.format(alt=alt), re.IGNORECASE)
+    return [(m.group(1), m.start(1), m.end(1)) for m in pat.finditer(line)]
+
+
+def _new_hits(names: list[str], line: str):
+    matcher = _basename_pattern(sorted(names))
+    assert matcher is not None
+    return [(m.group(1), m.start(1), m.end(1)) for m in matcher.finditer(line)]
+
+
+class TestBasenameMatcherParity(unittest.TestCase):
+    def test_empty_candidate_set_is_no_matcher(self):
+        self.assertIsNone(_basename_pattern([]))
+
+    def test_hand_cases(self):
+        cases = [
+            # (candidates, line)
+            (["api.md"], "see api.md"),
+            (["api.md"], "See api.md."),  # bare trailing period is allowed
+            (["api.md"], "oldapi.md.bak"),  # longer name and .bak: no match
+            (["api.md"], "docs/api.md"),  # path mention: match at the tail
+            (["api.md"], "api.md.bak"),
+            (["api.md"], "api.md_5"),
+            (["dsa.md", "dsa.md.md"], "dsa.md.md"),  # longest candidate wins
+            (["a.md", "A.MD"], "x a.md A.MD"),  # case-insensitive both ways
+            (["note one.md"], "read note one.md now"),  # spaced name (D6)
+            (["cpp+.md"], "build cpp+.md"),  # punctuation outside the run class
+            (["x.md"], "(x.md)"),
+            (["x.md"], "x.md:"),
+            (["1.2.3"], "v1.2.3"),  # a digit-led candidate mid-word: no
+            (["log."], "the log. file"),
+            (["api.md", "api.markdown"], "api.markdown"),
+            (["a.md"], "ca.md"),  # lookbehind: preceded by a word char
+            (["a.md"], "-a.md"),  # hyphen is name-ish: no match
+            (["a.md"], "/a.md"),  # slash is not: match
+            (["v1.0.md"], "my.files/v1.0.md"),
+            (["x.md"], "x.md) and y.md"),  # two hits, spans preserved
+        ]
+        for names, line in cases:
+            with self.subTest(names=names, line=line):
+                self.assertEqual(_new_hits(names, line), _old_hits(names, line))
+
+    def test_fuzz_against_the_old_pattern(self):
+        # Seeded, so a failure is reproducible from the test alone.
+        import random
+
+        rng = random.Random(20261124)
+        bits = [
+            "api",
+            "API",
+            "dossier",
+            "note",
+            "report",
+            "v1.0",
+            "my.files",
+            "cpp+",
+            "a+b",
+            "f000",
+            "F000",
+            "sp ace",
+            "Sample Transcript - Owner's Phone .md",
+            "old",
+            "oldapi",
+            "dsa",
+            "a",
+            "x",
+            "md",
+            "log",
+            "trailing",
+            "dots",
+            "_org",
+            "one[two]",
+            "half#tag",
+            "spark-1.2.3",
+            "data.backup",
+        ]
+        exts = [".md", ".txt", ".MD", ".py", "", ".md.bak", ".json", ".tar.gz"]
+        seps = [" ", "\t", "/", ", ", "(", ")", '"', "`", "[", "]", "|", "", "  ", "->"]
+        prose = ["see", "the", "file", "api", "old", "note", "docs", "and", "x", "md"]
+        comparisons = 0
+        for _ in range(1200):
+            names = set()
+            for _n in range(rng.randint(1, 8)):
+                names.add(rng.choice(bits) + rng.choice(exts))
+            names = {n for n in names if len(n) >= 3 and "." in n}  # by_basename's rule
+            if not names:
+                continue
+            line = "".join(
+                rng.choice(bits + prose + [rng.choice(sorted(names))])
+                + rng.choice(seps)
+                for _ in range(rng.randint(1, 8))
+            )
+            comparisons += 1
+            self.assertEqual(
+                _new_hits(sorted(names), line),
+                _old_hits(sorted(names), line),
+                f"names={sorted(names)} line={line!r}",
+            )
+        self.assertGreater(comparisons, 800)
+
+    def test_non_ascii_falls_back_to_the_compiled_alternation(self):
+        # The trie keys are .lower(), which is `re.IGNORECASE` exactly
+        # only while both sides are ASCII. Outside that the matcher must
+        # hand the line to the real pattern rather than guess — and
+        # `strasse.md` vs `straße.md` is the case that proves it:
+        # casefold() would fold ß to ss and match, and the old pattern
+        # never did.
+        ascii_matcher = _basename_pattern(["api.md", "strasse.md"])
+        self.assertEqual(
+            [m.group(1) for m in ascii_matcher.finditer("see strasse.md")],
+            ["strasse.md"],
+        )
+        self.assertFalse(ascii_matcher._slow_used())  # served by the trie
+        unicode_matcher = _basename_pattern(["straße.md"])
+        self.assertEqual(
+            [m.group(1) for m in unicode_matcher.finditer("straße.md")], ["straße.md"]
+        )
+        self.assertEqual(list(unicode_matcher.finditer("strasse.md")), [])
+        self.assertTrue(unicode_matcher._slow_used())  # the fallback answered
+
+
+class TestRewriteCoversSniffedTypes(unittest.TestCase):
+    """The rewrite pass must read the CORPUS, not the process CWD.
+
+    `is_text_file` gained the NUL sniff in 0.2.8, which made every call
+    site's path argument load-bearing: the pass used to ask about a bare
+    relative name (harmless while the answer was a set lookup) and now
+    opens that name wherever the process happens to sit — so a corpus
+    `app/main.dart` sniffed as "binary" (i.e. skipped, its citation left
+    broken) whenever the CWD had no such file, and a `Makefile` got
+    classified from the REPO's Makefile. Same answer from any CWD is the
+    contract this pins.
+    """
+
+    def setUp(self):
+        import shutil
+        import tempfile
+
+        self.tmp = Path(tempfile.mkdtemp(prefix="sk-rw-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.root = self.tmp / "corpus"
+        self.decoy = self.tmp / "elsewhere"
+        self.decoy.mkdir()
+
+    def _w(self, base: Path, rel: str, data):
+        fp = base / rel
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(data, bytes):
+            fp.write_bytes(data)
+        else:
+            fp.write_text(data, encoding="utf-8")
+        return fp
+
+    def test_unlisted_citations_rewritten_identically_from_any_cwd(self):
+        import os
+
+        from slopkeeper.references import CitationIndex, plan_rewrites
+        from slopkeeper.scan import corpus_rel_paths
+
+        self._w(self.root, "docs/api.md", "# api\n")
+        for rel in ("app/main.dart", "infra/main.tf", "noext", ".dotfile"):
+            self._w(self.root, rel, "see docs/api.md for the contract\n")
+        # Decoys: the SAME names in the CWD, full of NUL bytes. A CWD-side
+        # sniff would call every corpus file binary and silently skip it.
+        for rel in ("app/main.dart", "infra/main.tf", "noext", ".dotfile"):
+            self._w(self.decoy, rel, b"\x00\x01binary imposter\n")
+
+        rels = corpus_rel_paths(self.root)
+        index = CitationIndex(rels)
+        chains = {"docs": "reference/docs"}
+
+        def run():
+            return plan_rewrites(self.root, index, chains, rels)
+
+        here = run()
+        cwd = os.getcwd()
+        try:
+            os.chdir(self.decoy)
+            there = run()
+        finally:
+            os.chdir(cwd)
+        self.assertEqual(here, there)
+        rewrites = here[0]
+        for rel in ("app/main.dart", "infra/main.tf", "noext", ".dotfile"):
+            self.assertIn(rel, rewrites, f"{rel} holds a citation and was skipped")
+            sites = rewrites[rel]
+            self.assertTrue(
+                any("reference/docs/api.md" in str(row) for row in sites),
+                f"{rel}: no rewrite toward the new path: {sites}",
+            )
+
+
+class TestSniffScannability(unittest.TestCase):
+    """R7: `is_text_file` now agrees with inventory's `kind: text`."""
+
+    def setUp(self):
+        import shutil
+        import tempfile
+
+        self.tmp = Path(tempfile.mkdtemp(prefix="sk-sniff-"))
+        addCleanup = self.addCleanup
+        addCleanup(shutil.rmtree, self.tmp, True)
+
+    def _write(self, rel: str, text: str) -> Path:
+        fp = self.tmp / rel
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        fp.write_text(text, encoding="utf-8")
+        return fp
+
+    def test_unlisted_text_extension_is_scanned(self):
+        # inventory called these `kind: text`; the citation scan refused
+        # to open them, so a move left the citation broken in silence.
+        self._write("docs/api.md", "# api\n")
+        self._write("app/main.dart", "// see docs/api.md for the contract\n")
+        self._write("infra/main.tf", "// module at docs/api.md\n")
+        refs = scan_references_stream(self.tmp)
+        self.assertIn("docs/api.md", refs)
+        self.assertIn("app/main.dart", refs["docs/api.md"])
+        self.assertIn("infra/main.tf", refs["docs/api.md"])
+
+    def test_unlisted_binary_extension_is_still_skipped(self):
+        self._write("docs/api.md", "# api\n")
+        (self.tmp / "blob.dat").write_bytes(b"\x00\x01 see docs/api.md\n")
+        refs = scan_references_stream(self.tmp)
+        self.assertNotIn("blob.dat", refs.get("docs/api.md", []))
+        self.assertFalse(is_text_file(self.tmp / "blob.dat"))
+
+    def test_text_file_predicate_matches_inventory_kind(self):
+        from slopkeeper.inventory import _kind
+
+        fp = self._write("x/weird.qqq", "hello docs/api.md\n")
+        self.assertEqual(_kind(fp), "text")
+        self.assertTrue(is_text_file(fp))
+        self.assertTrue(self._write("x/other.qqq", "abc\x00def\n") is not None)
 
 
 if __name__ == "__main__":

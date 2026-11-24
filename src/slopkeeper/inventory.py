@@ -7,6 +7,16 @@
 Output is a single JSON document under the standard envelope. Designed so a
 model can read it whole for a few hundred files, or work from `summary`
 clusters for thousands.
+
+Since 0.2.8 the document is folded from ONE pass (`scan.scan_corpus`):
+the file list, the directory roll-ups, the symlinked-dir names, the
+nested-corpus list and — the part that used to be a lie — the
+fingerprint all describe the same walk. Before that, `collect` listed
+one traversal and `corpus_fingerprint_detail` digested a SECOND one
+moments later, so an agent could read a file list and a digest that
+belonged to two different corpora (the audit's B5). Pass a prepared scan
+in with `scan=` and the whole command costs one traversal, which is what
+`doctor` and `clusters` now do.
 """
 
 from __future__ import annotations
@@ -19,62 +29,20 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 
-from .ignore import corpus_walk, load_ignore, nested_corpora
-from .models import corpus_fingerprint_detail
-from .references import is_text_file, scan_references
+from . import kinds
+from .references import scan_references
 
-HEAD_BYTES = 4096
+# HEAD_BYTES is re-exported: status.py imports the head budget from
+# this module, and the number belongs to the pass that reads it.
+from .scan import HEAD_BYTES, WalkReport, scan_corpus  # noqa: F401
+
+# The extension tables live in kinds.py now (P3/R7: five consumers, five
+# private copies of "what is binary" drifting apart). These names stay
+# as the module-level aliases tests and status.py already import.
+BINARY_EXTS = kinds.BINARY_EXTS
+CODE_EXTS = kinds.CODE_EXTS
+
 HEAD_CHARS = 400
-
-BINARY_EXTS = {
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".gif",
-    ".webp",
-    ".ico",
-    ".pdf",
-    ".zip",
-    ".gz",
-    ".tar",
-    ".bz2",
-    ".xz",
-    ".7z",
-    ".mp3",
-    ".mp4",
-    ".mov",
-    ".wav",
-    ".sqlite",
-    ".db",
-    ".pyc",
-    ".so",
-    ".dylib",
-    ".exe",
-    ".woff",
-    ".woff2",
-    ".ttf",
-}
-CODE_EXTS = {
-    ".py",
-    ".js",
-    ".ts",
-    ".tsx",
-    ".jsx",
-    ".rb",
-    ".go",
-    ".rs",
-    ".c",
-    ".h",
-    ".cpp",
-    ".hpp",
-    ".java",
-    ".kt",
-    ".swift",
-    ".sh",
-    ".bash",
-    ".zsh",
-    ".sql",
-}
 
 DEFAULT_MAX_FILES = 8000
 
@@ -130,41 +98,40 @@ def _extract_head(fp: Path, ext: str) -> str | None:
 
 
 def _kind(path: Path) -> str:
-    ext = path.suffix.lower()
-    if ext in BINARY_EXTS:
-        return "binary"
-    if ext in CODE_EXTS:
-        return "code"
-    if ext == ".md":
-        return "doc"
-    if is_text_file(path):
-        return "text"
-    # Unknown extension: sniff for NUL bytes.
-    try:
-        with path.open("rb") as f:
-            return "binary" if b"\0" in f.read(8192) else "text"
-    except OSError:
-        return "binary"
+    """The kind of a file on disk (table, then the NUL sniff — kinds.py).
+
+    Kept as this module's entry point because status.py imports it; the
+    walk itself classifies without a second open via `FileEntry.kind`.
+    """
+    return kinds.classify(path)
 
 
-def _head(root: Path, rel: Path, kind: str) -> dict:
+def _head(entry) -> dict:
+    """{title, head} for one inventoried file.
+
+    The bytes are the walk's (`FileEntry.head`, the same open that
+    produced the content hash); only a BINARY file still costs an
+    external call, and that one is a subprocess, not a read.
+    """
+    kind = entry.kind
     if kind == "binary":
         # Loud by default: a binary head is either extracted text or the
         # explicit no-signal marker — never a silent None (the field
         # report's pdftotext/md5sum archaeology, now tool output).
-        extracted = _extract_head(root / rel, rel.suffix.lower())
+        ext = entry.path.suffix.lower()
+        extracted = _extract_head(entry.path, ext)
         if extracted is None:
             return {"title": None, "head": NO_SIGNAL}
         title = next(
             (s.strip()[:120] for s in extracted.splitlines() if s.strip()), None
         )
         return {"title": title, "head": extracted[:HEAD_CHARS]}
-    try:
-        with (root / rel).open("rb") as f:
-            raw = f.read(HEAD_BYTES)
-    except OSError:
+    if entry.head is None:
+        # Unreadable (chmod 000, or a file that vanished mid-walk): the
+        # graceful-degradation path the audit checked — title null, no
+        # crash, the file still listed.
         return {"title": None, "head": None}
-    text = raw.decode("utf-8", errors="replace")
+    text = entry.head.decode("utf-8", errors="replace")
     return {"title": _title_from_text(text, kind), "head": text[:HEAD_CHARS]}
 
 
@@ -198,38 +165,81 @@ def _prefix_clusters(names: list[str]) -> dict[str, list[str]]:
     }
 
 
+def _scan_is_complete(scan) -> bool:
+    """Does this scan carry everything the inventory document needs?
+
+    `collect` folds hashes, kinds and head bytes out of the records it
+    is handed, and a pass built without one of those facilities would
+    silently produce a weaker document: a fingerprint digested from
+    mtimes instead of content (a plan bound to the wrong thing), `kind:
+    null` rows, null titles. Anything missing and collect walks for
+    itself instead. An unreadable file is not a missing facility — it
+    has the same shape in a complete scan.
+    """
+    from .models import SHA256_CAP_BYTES
+
+    for e in scan.files:
+        if e.kind is None:
+            return False
+        if e.kind != "binary" and e.head is None and not e.read_error:
+            return False
+        if not e.hashed and e.size <= SHA256_CAP_BYTES and not e.read_error:
+            return False
+    return True
+
+
 def collect(
     root: Path,
     depth: int | None = None,
     fast: bool = False,
     max_files: int = DEFAULT_MAX_FILES,
+    *,
+    scan=None,
 ) -> dict:
-    """Walk root and build the inventory document (no envelope)."""
+    """Walk root and build the inventory document (no envelope).
+
+    `scan` is a prepared `scan.CorpusScan` (see scan.prepare): doctor
+    and clusters hold one pass and hand it to every surface that wants
+    the corpus, so the walk happens once per command. Omit it and
+    collect runs its own. Either way the fingerprint in the document is
+    the digest of THAT walk.
+    """
     root = root.resolve()
-    ignore = load_ignore(root)
+    if scan is None or not _scan_is_complete(scan):
+        scan = scan_corpus(
+            root,
+            want_sha=True,
+            want_head=True,
+            want_kind=True,
+            report=WalkReport(),
+        )
+    ignore_rules = scan.report.ignore_rules
     files: list[dict] = []
     dirs: dict[str, dict] = {}
     total_bytes = 0
     rel_paths: list[Path] = []
     truncated = False
     top_dir_counts: dict[str, int] = {}
-    # fp6/A2: top-level-of-any-depth symlinked directories, named. The
-    # walk never descends them (os.walk does not follow links) so they
-    # were invisible — yet coverage validation counts them (iterdir) and
-    # the fingerprint now binds name+target. Inventory must not disagree
-    # with what a plan is held to: they join `dirs` as zero-file
-    # ENTRIES and are named in stats.
+    # fp6/A2: symlinked directories at any depth, named. The walk never
+    # descends them (os.walk does not follow links) so they were
+    # invisible — yet coverage validation counts them (iterdir) and the
+    # fingerprint binds name+target. Inventory must not disagree with
+    # what a plan is held to: they join `dirs` as zero-file ENTRIES and
+    # are named in stats.
     symlinked_dirs: list[str] = []
 
-    for dirpath, dirnames, filenames in corpus_walk(root):
-        rel_dir = Path(dirpath).resolve().relative_to(root)
-        for d in dirnames:
-            try:
-                if not (Path(dirpath) / d).is_symlink():
-                    continue
-            except OSError:
-                continue
-            rel_name = (rel_dir / d).as_posix() if rel_dir.parts else d
+    for visit in scan.visits:
+        rel_dir = Path(visit.rel) if visit.rel != "." else Path()
+        d_depth = len(rel_dir.parts)
+        if depth is not None and d_depth > depth:
+            # The depth cut stops DESCENT, so the old walk never produced
+            # a visit below the cut at all: neither its files nor its own
+            # child entries belong in this listing. (A visit AT the cut
+            # still contributes its symlinked children — the old loop read
+            # `dirnames` before clearing it, and coverage validation counts
+            # those entries, so the quirk is the contract.)
+            continue
+        for rel_name, _target in visit.symlinked:
             symlinked_dirs.append(rel_name)
             dirs.setdefault(
                 rel_name,
@@ -240,48 +250,40 @@ def collect(
                     "last_modified": None,
                 },
             )
-        d_depth = len(rel_dir.parts)
-        if depth is not None and d_depth >= depth:
-            dirnames[:] = []
-        dir_key = rel_dir.as_posix() if rel_dir.parts else "."
+        dir_key = visit.rel
         top_key = rel_dir.parts[0] if rel_dir.parts else "(root)"
         if truncated:
             # Past the cap the entries stop; the counting does not.
             # The truncation culprit is named from these totals, not
             # guessed after a silent walk-stop.
-            for _fn in filenames:
+            for _e in visit.files:
                 top_dir_counts[top_key] = top_dir_counts.get(top_key, 0) + 1
             continue
         dirs.setdefault(
             dir_key,
             {"path": dir_key, "file_count": 0, "total_files": 0, "last_modified": None},
         )
-        for fn in sorted(filenames):
-            fp = Path(dirpath) / fn
+        for entry in visit.files:
             if len(rel_paths) >= max_files:
                 truncated = True
                 top_dir_counts[top_key] = top_dir_counts.get(top_key, 0) + 1
                 continue
-            try:
-                st = fp.stat()
-            except OSError:
-                continue
-            rel = fp.relative_to(root)
-            total_bytes += st.st_size
+            rel = Path(entry.rel)
+            total_bytes += entry.size
             top_dir_counts[top_key] = top_dir_counts.get(top_key, 0) + 1
-            kind = _kind(fp)
+            kind = entry.kind
             e = {
-                "path": rel.as_posix(),
-                "bytes": st.st_size,
-                "mtime": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).strftime(
+                "path": entry.rel,
+                "bytes": entry.size,
+                "mtime": datetime.fromtimestamp(entry.mtime, tz=timezone.utc).strftime(
                     "%Y-%m-%d"
                 ),
-                "ext": fp.suffix.lower(),
+                "ext": entry.path.suffix.lower(),
                 "kind": kind,
             }
             # Binaries get a head too (Phase 11): extracted text via an
             # optional system extractor, or the loud no-signal marker.
-            e.update(_head(root, rel, kind))
+            e.update(_head(entry))
             files.append(e)
             rel_paths.append(rel)
             # roll up dir stats
@@ -308,13 +310,14 @@ def collect(
     top_dirs = {k: v for k, v in dirs.items() if k.count("/") == 0 and k != "."}
     top_files = [f for f in files if "/" not in f["path"]]
 
-    # B6: ONE fingerprint call answers both — the digest the plan binds
-    # to, and what the walk could not see. `skipped_unstatable` is the
-    # loud half: files that vanished or denied stat mid-walk. Silence
-    # here used to poison the drift gate (the digest of a corpus that
-    # is not the corpus); now inventory names the count, doctor echoes
-    # it, and apply refuses to tend against it.
-    fingerprint, fp_health = corpus_fingerprint_detail(root)
+    # B6 + B5: ONE walk answers both — the digest of the corpus this
+    # document lists, and what the walk could not see.
+    # `skipped_unstatable` is the loud half: files that vanished or
+    # denied stat mid-walk. Silence here used to poison the drift gate
+    # (the digest of a corpus that is not the corpus); now inventory
+    # names the count, doctor echoes it, and apply refuses to tend
+    # against it.
+    fingerprint, fp_health = scan.fingerprint_health()
 
     inventory = {
         "root": str(root),
@@ -330,7 +333,7 @@ def collect(
             "loose_top_level_dirs": len(
                 [d for d in top_dirs if not (root / d / "README.md").exists()]
             ),
-            "ignore_rules": ignore.rule_count,
+            "ignore_rules": ignore_rules,
             # B6: the walk's blind spot, counted (paths named in
             # `skipped_unstatable_paths` when non-zero). A non-zero
             # count means something is writing to the corpus under the
@@ -344,7 +347,7 @@ def collect(
             # Phase 7: subtrees with their own .slopkeeper/manifest.json
             # are separate corpora — invisible above, named here so no
             # one has to `find` for why the counts dropped.
-            "nested_corpora": nested_corpora(root),
+            "nested_corpora": sorted(set(scan.report.nested)),
             # fp6/A2: symlinked directories the walk does not descend —
             # named, so inventory agrees with coverage validation (the
             # audit's dirs: 0 surprise). Plans must cover these entries

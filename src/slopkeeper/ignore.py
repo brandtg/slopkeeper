@@ -31,11 +31,18 @@ negation, nested ignore files, a global ignore — hit a wall first.
 from __future__ import annotations
 
 import fnmatch
-import os
 import re
 from pathlib import Path, PurePosixPath
 
-from .models import HIDDEN_SKIP_DIRS, MANIFEST_NAME, STATE_DIR
+# Re-exported: these are the walk contract's constants and `corpus_walk`
+# documents them, so `from .ignore import HIDDEN_SKIP_DIRS` (doctor,
+# references) keeps working even though the traversal body now lives in
+# scan.py. `os` left with it — the walk is not this module's job twice.
+from .models import (  # noqa: F401
+    HIDDEN_SKIP_DIRS,
+    MANIFEST_NAME,
+    STATE_DIR,
+)
 
 IGNORE_NAME = ".slopkeeperignore"
 
@@ -174,6 +181,13 @@ def corpus_walk(root: Path, nested_out: list[str] | None = None):
     could not have grown the ignore rules without drifting apart.
     Expects an absolute root, as every caller resolves before walking.
 
+    Since 0.2.8 the traversal itself lives in `scan.walk_visits` (the
+    single pass every read surface folds from) and this is the
+    names-only projection over it: one implementation of the contract,
+    two granularities. `want_*` flags there are what an item in this
+    tuple can never express, which is why the fingerprint and inventory
+    consume visits directly rather than names.
+
     Nested corpora (reference-rewrites PRD Phase 7): any directory
     below the root carrying its own `.slopkeeper/manifest.json` is a
     separate tended corpus — pruned from the walk exactly like a
@@ -200,46 +214,13 @@ def corpus_walk(root: Path, nested_out: list[str] | None = None):
     them are refused by default (models.safe_move_path); --allow-symlinks
     is the deliberate bypass.
     """
-    root = Path(root)
-    ignore = load_ignore(root)
-    for dirpath, dirnames, filenames in os.walk(root):
-        rel_dir = Path(dirpath).relative_to(root)
-        kept_dirs = []
-        for d in dirnames:
-            if d in HIDDEN_SKIP_DIRS:
-                continue
-            rel = (rel_dir / d).as_posix() if rel_dir.parts else d
-            if ignore.is_ignored(rel, is_dir=True):
-                continue
-            if (Path(dirpath) / d / STATE_DIR / MANIFEST_NAME).exists():
-                # A nested corpus: `d` is always a proper descendant
-                # here (≠ root — the root's own .slopkeeper is caught
-                # by the skip-list above), so its own manifest makes it
-                # a separate tended tree. Invisible to the parent,
-                # named in nested_out — the parent's reports say what
-                # they skip.
-                if nested_out is not None:
-                    nested_out.append(rel)
-                continue
-            kept_dirs.append(d)
-        dirnames[:] = sorted(kept_dirs)
-        kept_files = []
-        for fn in filenames:
-            # The ignore file itself is tool layer, not content — it
-            # shapes every walk and must never appear in one (else
-            # writing a comment would shift the fingerprint).
-            if fn == IGNORE_NAME and not rel_dir.parts:
-                continue
-            rel = (rel_dir / fn).as_posix() if rel_dir.parts else fn
-            if not ignore.is_ignored(rel, is_dir=False):
-                # fp5: only regular files are content. Devices, FIFOs
-                # and sockets (sandbox mounts) are pruned — reading one
-                # can block forever, and stat-counting one poisoned
-                # fingerprint comparability across environments.
-                if not (Path(dirpath) / fn).is_file():
-                    continue
-                kept_files.append(fn)
-        yield dirpath, dirnames, sorted(kept_files)
+    # Lazy import: scan.py imports this module (the contract's rules and
+    # helpers live here), so a top-level import would close the loop.
+    from .scan import WalkReport, walk_visits
+
+    report = WalkReport(nested=nested_out)
+    for visit in walk_visits(root, report=report):
+        yield str(visit.path), list(visit.subdirs), [e.name for e in visit.files]
 
 
 def nested_corpora(root: Path) -> list[str]:

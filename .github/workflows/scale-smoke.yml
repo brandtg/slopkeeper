@@ -1,0 +1,35 @@
+# SPDX-FileCopyrightText: 2026 Greg Brandt <brandt.greg@gmail.com>
+#
+# SPDX-License-Identifier: MIT
+
+# The P3 scale smoke: 5k-file inventory / doctor / refs, asserting both
+# the wall-clock floor and the one-traversal-per-command count. Weekly,
+# not per-commit — generating the corpus costs tens of seconds and the
+# per-commit gate already proves the same invariants on a ten-file
+# fixture (tests/test_scan.py). A regression here means a surface grew
+# a second walk, or the fingerprint stopped being a fold.
+
+name: scale-smoke
+
+on:
+  schedule:
+    # Mondays ~06:17 UTC (off the hour, so it never races the other
+    # Monday-morning jobs).
+    - cron: "17 6 * * 1"
+  workflow_dispatch: {}
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.14"
+      - name: Install project + dev group
+        run: uv sync --group dev
+      - name: Scale smoke (slow-marked, opt-in)
+        run: SLOPKEEPER_RUN_SLOW=1 uv run pytest -q tests/test_scale_smoke.py
+      - name: Bench numbers (recorded, never gating)
+        run: uv run python tests/bench_reference_scan.py --scale

@@ -58,6 +58,7 @@ slopkeeper = ["strategies/*.json", "AGENT_GUIDE.md", "SKILL.md"]
 testpaths = ["tests"]
 markers = [
   "bench: slow benchmark, excluded from the default suite (run tests/bench_reference_scan.py directly)",
+  "slow: scale smoke (5k+ files) — opt in with SLOPKEEPER_RUN_SLOW=1; weekly CI, not per-commit",
 ]
 
 [tool.ruff]
