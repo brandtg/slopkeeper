@@ -20,7 +20,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from .ignore import corpus_walk, load_ignore, nested_corpora
-from .models import corpus_fingerprint
+from .models import corpus_fingerprint_detail
 from .references import is_text_file, scan_references
 
 HEAD_BYTES = 4096
@@ -308,10 +308,18 @@ def collect(
     top_dirs = {k: v for k, v in dirs.items() if k.count("/") == 0 and k != "."}
     top_files = [f for f in files if "/" not in f["path"]]
 
+    # B6: ONE fingerprint call answers both — the digest the plan binds
+    # to, and what the walk could not see. `skipped_unstatable` is the
+    # loud half: files that vanished or denied stat mid-walk. Silence
+    # here used to poison the drift gate (the digest of a corpus that
+    # is not the corpus); now inventory names the count, doctor echoes
+    # it, and apply refuses to tend against it.
+    fingerprint, fp_health = corpus_fingerprint_detail(root)
+
     inventory = {
         "root": str(root),
         "generated_at": datetime.now(tz=timezone.utc).isoformat(timespec="seconds"),
-        "fingerprint": corpus_fingerprint(root),
+        "fingerprint": fingerprint,
         "stats": {
             "files": len(files),
             "dirs": len([k for k in dirs if k != "."]),
@@ -323,6 +331,11 @@ def collect(
                 [d for d in top_dirs if not (root / d / "README.md").exists()]
             ),
             "ignore_rules": ignore.rule_count,
+            # B6: the walk's blind spot, counted (paths named in
+            # `skipped_unstatable_paths` when non-zero). A non-zero
+            # count means something is writing to the corpus under the
+            # scan — `apply` refuses such a tend.
+            "skipped_unstatable": fp_health["skipped_unstatable"],
             # Phase 11: per-top-dir totals, counted even past the walk
             # cap — the truncation culprit is named, never guessed.
             "top_dir_file_counts": dict(
@@ -352,6 +365,13 @@ def collect(
             "by_month": _count_by(files, "mtime", 24, key_len=7),
         },
     }
+
+    if fp_health["skipped_unstatable"]:
+        # Named only when non-zero: the count is the always-on contract,
+        # the paths are the diagnostic (B6).
+        inventory["stats"]["skipped_unstatable_paths"] = fp_health[
+            "skipped_unstatable_paths"
+        ]
 
     if not fast and len(files) <= 800:
         inventory["references"] = scan_references(root, rel_paths)

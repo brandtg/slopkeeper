@@ -951,7 +951,10 @@ def cmd_apply(args) -> int:
 
 def cmd_undo(args) -> int:
     data = undo_journal(
-        Path(args.journal), _resolve_dir(args.root), execute=args.execute
+        Path(args.journal),
+        _resolve_dir(args.root),
+        execute=args.execute,
+        force=args.force,
     )
     emit_json(envelope("undo", data))
     return EXIT_OK
@@ -1317,7 +1320,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="skip the corpus-changed fingerprint gate (the "
         "based_on.corpus_fingerprint binding itself is required — "
-        "--force does not bypass plan_no_based_on)",
+        "--force does not bypass plan_no_based_on). Also escapes the "
+        "corpus_unstable churn refusal (files that vanished or denied "
+        "stat mid-walk); the count then rides the envelope as "
+        "skipped_unstatable, and the gate-vs-at-execute fingerprints "
+        "are recorded in the journal header",
     )
     sp.add_argument("--allow-partial", action="store_true")
     sp.add_argument(
@@ -1346,6 +1353,16 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("journal")
     sp.add_argument("root")
     sp.add_argument("--execute", action="store_true")
+    sp.add_argument(
+        "--force",
+        action="store_true",
+        help="undo even a journal malformed in the MIDDLE (B2). A torn last "
+        "line — the crash-mid-write case — is always tolerated; mid-file "
+        "corruption means the record was edited or truncated, and undo "
+        "refuses instead of replaying a partial tend. With --force the ops "
+        "that did parse are reversed and the bad lines are counted in "
+        "journal_corrupt_lines",
+    )
     sp.set_defaults(func=cmd_undo)
 
     sp = sub.add_parser(

@@ -1087,7 +1087,12 @@ class TestRuleMoves(TempCase):
         self.assertNotIn("reports/_org/b.txt", srcs)
         # `*` stays inside one path segment
         self.assertNotIn("reports/_org/sub/c.md", srcs)
-        # a whole-segment `**` crosses directories (and requires one)
+        # a whole-segment `**` spans ZERO or more directories (A6,
+        # 0.2.7): gitignore says `a/**/b` matches `a/b`, and this is the
+        # ONE glob grammar (ignore.py) — a rule pattern means the same
+        # thing an ignore-file pattern means. Pre-fix it required an
+        # intervening directory, so `**/*.md` silently missed the flat
+        # files at the prefix.
         plan = load_plan(
             write_plan(
                 self.root,
@@ -1097,7 +1102,8 @@ class TestRuleMoves(TempCase):
         out = validate_plan(plan, self.root)
         srcs = {m["from"] for m in out["moves"]}
         self.assertIn("reports/_org/sub/c.md", srcs)
-        self.assertNotIn("reports/_org/a.md", srcs)
+        self.assertIn("reports/_org/a.md", srcs)
+        self.assertNotIn("reports/_org/b.txt", srcs)
 
     def test_rule_dest_outside_root_refused(self):
         plan = load_plan(
@@ -1277,7 +1283,10 @@ class TestRuleMoves(TempCase):
         out = validate_plan(plan, self.root)
         by_src = {m["from"]: m["to"] for m in out["moves"]}
         self.assertEqual(by_src["reports/_org/sub/c.md"], "reports/org/sub/c.md")
-        self.assertNotIn("reports/_org/loose.md", by_src)  # `*` needs one segment
+        # A6 (0.2.7): `**` spans ZERO directories, so the flat file at the
+        # prefix matches too — and preserve: tree keeps it at the same
+        # (empty) depth below the static prefix.
+        self.assertEqual(by_src["reports/_org/loose.md"], "reports/org/loose.md")
 
     def test_bad_preserve_value_refused(self):
         plan = load_plan(

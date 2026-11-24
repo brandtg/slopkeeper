@@ -1521,10 +1521,17 @@ class TestPhase14RemoveEmptied(TempCase):
     def test_partial_apply_skips_removal(self):
         # A mid-run move failure leaves the run partial; the removal
         # never fires (loud failure first, T5's precedent).
+        #
+        # 0.2.7 (B4): file moves go through apply._move_no_clobber
+        # (os.link + os.unlink), not shutil.move — patch THAT seam (and
+        # shutil.move, still the directory/merge path) so the injected
+        # OSError lands on the hop the test counts.
         from slopkeeper import cli as _cli
+        from slopkeeper import apply as _apply
 
         plan_path = self._plan()
         real_move = shutil.move
+        real_link_move = _apply._move_no_clobber
         state = {"hops": 0}
 
         def failing_move(src, dst):
@@ -1533,10 +1540,21 @@ class TestPhase14RemoveEmptied(TempCase):
                 raise OSError(13, "Permission denied")
             return real_move(src, dst)
 
+        def failing_link_move(src, dst):
+            state["hops"] += 1
+            if state["hops"] >= 3:
+                raise OSError(13, "Permission denied")
+            return real_link_move(Path(src), Path(dst))
+
         buf = io.StringIO()
         with unittest.mock.patch("shutil.move", side_effect=failing_move):
-            with contextlib.redirect_stdout(buf):
-                code = _cli.main(["apply", str(plan_path), str(self.root), "--execute"])
+            with unittest.mock.patch.object(
+                _apply, "_move_no_clobber", side_effect=failing_link_move
+            ):
+                with contextlib.redirect_stdout(buf):
+                    code = _cli.main(
+                        ["apply", str(plan_path), str(self.root), "--execute"]
+                    )
         out = json.loads(buf.getvalue())
         self.assertEqual(code, 1)
         self.assertTrue(out["data"]["partial"])
@@ -2171,6 +2189,10 @@ class TestJournal(TempCase):
 
 
 class TestErrorPaths(TempCase):
+    @unittest.skipIf(
+        os.geteuid() == 0,
+        "chmod 000 does not deny a read to root — the test would be vacuous",
+    )
     def test_edit_unreadable(self):
         (self.root / "WATCHLIST.md").chmod(0o000)
         plan_path = write_edit_plan(self.root)
@@ -2237,19 +2259,27 @@ class TestPartialApply(TempCase):
         )
 
     def test_second_hop_oserror_is_partial_exit_1_and_points_at_undo(self):
-        # The ticket's mock: shutil.move raises OSError from the second
-        # hop on. Hop 1 lands (and is journaled); hops 2-3 fail mid-run.
-        real_move = shutil.move
+        # The ticket's mock: the move raises OSError from the second hop
+        # on. Hop 1 lands (and is journaled); hops 2-3 fail mid-run.
+        #
+        # 0.2.7 (B4): the file-move seam is apply._move_no_clobber (an
+        # atomic os.link + os.unlink), not shutil.move — patch the seam
+        # the code actually uses, keeping the hop-count injection.
+        from slopkeeper import apply as _apply
+
+        real_link_move = _apply._move_no_clobber
         state = {"hops": 0}
 
         def failing_move(src, dst):
             state["hops"] += 1
             if state["hops"] >= 2:
                 raise OSError(13, "Permission denied")
-            return real_move(src, dst)
+            return real_link_move(src, dst)
 
         plan_path = self._three_move_plan()
-        with unittest.mock.patch("shutil.move", side_effect=failing_move):
+        with unittest.mock.patch.object(
+            _apply, "_move_no_clobber", side_effect=failing_move
+        ):
             code, out = self._run_main(
                 ["apply", str(plan_path), str(self.root), "--execute"]
             )
@@ -2300,16 +2330,21 @@ class TestPartialApply(TempCase):
         # — an agent keying off ok:true missed it. Pre-flight (and
         # plan_stale_src) cannot see a vanish that happens DURING the
         # loop, so hop 1's execution deletes hop 2's source.
-        real_move = shutil.move
+        # (0.2.7/B4: patched on the file-move seam, apply._move_no_clobber.)
+        from slopkeeper import apply as _apply
+
+        real_link_move = _apply._move_no_clobber
 
         def vanish_globex_then_move(src, dst):
             g = self.root / "globex_dossier.md"
             if g.exists():
                 g.unlink()
-            return real_move(src, dst)
+            return real_link_move(src, dst)
 
         plan_path = self._three_move_plan()
-        with unittest.mock.patch("shutil.move", side_effect=vanish_globex_then_move):
+        with unittest.mock.patch.object(
+            _apply, "_move_no_clobber", side_effect=vanish_globex_then_move
+        ):
             code, out = self._run_main(
                 ["apply", str(plan_path), str(self.root), "--execute"]
             )

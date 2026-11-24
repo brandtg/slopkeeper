@@ -143,8 +143,14 @@ class TestTendLock(TempCase):
 
     def test_lock_released_when_execution_blows_up(self):
         plan_path = write_plan(self.root)
-        boom = mock.patch(
-            "slopkeeper.apply.shutil.move", side_effect=RuntimeError("disk gone")
+        # 0.2.7/B4: the file-move seam is apply._move_no_clobber (atomic
+        # no-replace link/unlink), so that is where the explosion is
+        # injected — same contract: a raise mid-execute must release the
+        # lock via finally, not the success path.
+        from slopkeeper import apply as _apply
+
+        boom = mock.patch.object(
+            _apply, "_move_no_clobber", side_effect=RuntimeError("disk gone")
         )
         with boom:
             with self.assertRaises(RuntimeError):
