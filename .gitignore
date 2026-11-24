@@ -11,4 +11,3 @@ dist/
 htmlcov/
 .ruff_cache/
 .venv/
-docs/site/site/

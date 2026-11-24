@@ -180,7 +180,7 @@ def _reject_merge_collisions(root: Path, moves: list[dict]) -> None:
         dst = str(m["to"]).rstrip("/")
         src_abs = root / src
         if not src_abs.is_dir() or (root / dst).exists():
-            # An existing destination is the dst_exists pre-flight's
+            # An existing destination is the plan_dst_exists pre-flight's
             # business (a collision, never a merge).
             continue
         created = any(
@@ -208,6 +208,31 @@ def _reject_merge_collisions(root: Path, moves: list[dict]) -> None:
                     "this plan; the merge refuses a name collision. Rename "
                     "one destination, or drop one of the two moves.",
                 )
+
+
+def preflight_destinations(root: Path, chains: dict[str, str]) -> None:
+    """Refuse (plan_dst_exists) a final destination that already exists.
+
+    The single implementation behind BOTH surfaces (P0/A8): apply ran
+    this pre-flight but validate did not, so a plan could pass the human
+    gate and only then be refused at execute. A destination that is
+    another move's source is a chain hop (a->b, b->c) — legal, the
+    executor orders hops so nothing is overwritten — so it is skipped
+    here, exactly as apply always skipped it.
+    """
+    collisions = []
+    for src, dst in chains.items():
+        if src == dst:
+            continue
+        if dst not in chains and corpus_path(root, Path(dst)).exists():
+            collisions.append({"src": src, "dst": dst})
+    if collisions:
+        raise SlopKeeperError(
+            "plan_dst_exists",
+            f"{len(collisions)} destination(s) already exist: "
+            f"{[c['dst'] for c in collisions][:5]}",
+            "Choose different destinations or resolve the collision in the plan.",
+        )
 
 
 def validate_plan(plan: dict, root: Path, allow_partial: bool = False) -> dict:
@@ -245,7 +270,7 @@ def validate_plan(plan: dict, root: Path, allow_partial: bool = False) -> dict:
             )
 
     root = root.resolve()
-    # `.slopkeeperignore` (DESIGN §6.6): ignored paths are invisible to
+    # `.slopkeeperignore`: ignored paths are invisible to
     # the plan pipeline. Checked at validate AND apply (apply re-runs
     # this function), so an ignore file edited after authoring is
     # caught, never silently moved through.
@@ -713,6 +738,11 @@ def validate_plan(plan: dict, root: Path, allow_partial: bool = False) -> dict:
     # knowable name collision now, naming both moves.
     _reject_merge_collisions(root, normalized)
 
+    # A8: a destination already occupied on disk is refused HERE too,
+    # not only at execute — the shared pre-flight means validate/render
+    # (the human gate) can never bless a plan apply would refuse.
+    preflight_destinations(root, chains)
+
     # D2's validate-time gate: a prefix_rewrites entry whose glob/brace
     # citations cannot be coherently rewritten post-move is refused —
     # the swap would name nothing. Conscious override: acknowledge_broken.
@@ -917,7 +947,7 @@ def validate_plan(plan: dict, root: Path, allow_partial: bool = False) -> dict:
                 "— fix or drop it.",
             )
 
-    # Deliberate skips (DESIGN §6.1): top-level entries the plan
+    # Deliberate skips: top-level entries the plan
     # ignores, named explicitly so "we never looked at it" is a recorded
     # decision instead of a magic default. Names only — one path
     # component — and each must exist at the top level (a skip of
@@ -1773,7 +1803,7 @@ def render_markdown(
     return "\n".join(lines) + "\n"
 
 
-# --- §5.6 approval provenance: rendered gate → executed-plan binding ---------
+# --- approval provenance: rendered gate → executed-plan binding ---------
 
 RENDER_SCHEMA = "slopkeeper/render@1"
 RENDER_SIDECAR = "last-render.json"
@@ -1814,7 +1844,7 @@ def write_render_sidecar(
 def load_render_sidecar(root: Path) -> dict | None:
     """The last render's record, or None when absent/corrupt/foreign.
 
-    Advisory by design (§5.6: warn, never refuse): no sidecar means
+    Advisory by design (warn, never refuse): no sidecar means
     nothing to compare; a corrupt or foreign-schema one must never block
     an apply, so it reads exactly like "no last render".
     """

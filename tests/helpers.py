@@ -81,8 +81,8 @@ def snapshot_tree(root: Path):
 def prune_slopkeeper(snapshot):
     """Drop the tool's own .slopkeeper residue from a tree snapshot.
 
-    §5.5 blesses the empty tend.lock dotfile remaining after ANY execute
-    attempt (the lock is taken before the pre-flight, and the OS releases
+    The empty tend.lock dotfile remaining after ANY execute attempt is
+    expected (the lock is taken before the pre-flight, and the OS releases
     it on process death — the file itself stays). The atomicity
     comparisons assert the CORPUS is byte-identical, not the tool's
     dotdir, so .slopkeeper/ is pruned from both sides.

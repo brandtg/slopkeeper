@@ -159,7 +159,8 @@ intentional name. When you add a fixture or an example, invent an
 
 4. slopkeeper strategies show <suggested-id>   (or your choice)
      → the partitioning rubric. Apply it. Strategies:
-       role-bots | topics | projects | hybrid (default for mixed corpora)
+       role-bots | topics | projects | by-kind | hybrid (default for mixed
+       corpora)
 
 4b. slopkeeper propose <root> [--scan-path <dir>] [--external-root <dir>]
      → the layout fork as data: 2-3 candidate partitions (by-project,
@@ -377,7 +378,7 @@ slopkeeper move <src> <dst> <root> --execute  (for real)
   files count, because bytes on disk are what must survive). A
   mismatch means the move dropped something — read it, never ship it.
 - The usual refusals apply: `path_escape`, `move_source_ignored`,
-  `dst_exists`, `corpus_changed` (the plan is built against a fresh
+  `plan_dst_exists`, `corpus_changed` (the plan is built against a fresh
   fingerprint; if the corpus changes between gate and execute, re-run).
   The generated plan is materialized under `.slopkeeper/` and bound
   into the journal header — the audit trail is complete without any
@@ -666,7 +667,7 @@ unexplained silence.
 | `plan_no_moves` | `moves` is not a list, or is empty on a non-partial plan | a plan needs at least one move — unless it carries `"partial": true` (a zero-move partial plan is valid: the draft filed everything as unresolved; validate it and `apply --execute` records the backlog) |
 | `plan_stale_src` | a source vanished | re-inventory, regenerate |
 | `corpus_changed` | fingerprint mismatch | re-inventory; `--force` only if yours |
-| `dst_exists` | destination occupied | resolve collision in plan |
+| `plan_dst_exists` | destination occupied (validate and apply share this pre-flight) | resolve collision in plan |
 | `referenced_moves` | strict mode: refs would break | rewrite refs first |
 | `plan_nested_moves` | dir + its contents both moved | move dir whole OR its files |
 | `plan_bad_keep` | keep entry is neither string nor {path} object | use `"name"` or `{"path": "name", "reason": "..."}` |

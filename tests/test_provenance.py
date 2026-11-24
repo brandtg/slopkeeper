@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: MIT
 
-"""DESIGN.md §5.6 — approval provenance: bind the executed plan to its bytes.
+"""Approval provenance: bind the executed plan to its bytes.
 
 apply --execute records plan_sha256 (manifest + journal header); render
 --out writes .slopkeeper/last-render.json; apply compares and WARNS on

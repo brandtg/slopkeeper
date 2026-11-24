@@ -90,7 +90,7 @@ class TestFingerprint(TempCase):
     def test_fingerprint_is_version_prefixed_fp5(self):
         # v4 format: plans authored against older fingerprints (different
         # prefix) can never collide with a current one — they fail
-        # cleanly with corpus_changed instead (DESIGN.md §5.2, §6.6).
+        # cleanly with corpus_changed instead.
         self.assertTrue(corpus_fingerprint(self.root).startswith("fp5:"))
 
     def test_dot_dir_content_shifts_fingerprint(self):
@@ -102,7 +102,7 @@ class TestFingerprint(TempCase):
         self.assertNotEqual(fp1, corpus_fingerprint(self.root))
 
     def test_touch_does_not_change_fingerprint(self):
-        # The documented-behavior pin, FLIPPED by §5.2 (was: touch
+        # The documented-behavior pin, FLIPPED in the content-hash round (was: touch
         # invalidates). Staleness is content-based: same size, same
         # content, new mtime → identical fingerprint. mtime is still
         # hashed, but a bare touch can't move it past the content.
@@ -113,7 +113,7 @@ class TestFingerprint(TempCase):
         self.assertEqual(fp1, corpus_fingerprint(self.root))
 
     def test_same_size_content_edit_changes_fingerprint(self):
-        # The false-negative hole §5.2 closes: a byte-for-byte swap of
+        # The false-negative hole the content hashes close: a byte-for-byte swap of
         # equal length (same size, different content) must change the
         # fingerprint even though the old mtime-only gate would too —
         # here it changes because of the CONTENT, not the timestamp.
@@ -124,7 +124,7 @@ class TestFingerprint(TempCase):
 
 
 class TestSafeRelpathHostile(TempCase):
-    """Hostile-input table for safe_relpath (TEST_PLAN models row).
+    """Hostile-input table for safe_relpath.
 
     Designed behavior (src round): absolute paths outside root, '..'
     traversal, null bytes, and paths that normalize to the corpus root
@@ -202,8 +202,8 @@ class TestFingerprintGate(TempCase):
     def test_dotfiles_are_fingerprinted_pin(self):
         # Actual behavior: only hidden DIRS are skipped (models.py
         # filters os.walk's dirnames); a root-level dotfile IS hashed.
-        # TEST_PLAN's "skips hidden dirs/dotfiles" wording does not
-        # match the code — pinned here, flagged in the summary.
+        # The old "skips hidden dirs/dotfiles" test-plan wording does
+        # not match the code — pinned here, flagged in the summary.
         fp1 = corpus_fingerprint(self.root)
         write(self.root / ".env", "SECRET=1\n")
         self.assertNotEqual(fp1, corpus_fingerprint(self.root))

@@ -4,7 +4,7 @@
 
 """Guard: every code raised in src has a row in AGENT_GUIDE.md.
 
-DESIGN §4.1 — "new code plus a row in the guide, or it doesn't ship."
+ "new code plus a row in the guide, or it doesn't ship."
 This test makes that rule enforceable instead of aspirational: it scans
 src/ for `SlopKeeperError(` first-argument string literals (stdlib re, no
 deps) and asserts each appears in the first column of AGENT_GUIDE.md's
@@ -69,8 +69,7 @@ class TestErrorCodeContract(unittest.TestCase):
             missing,
             set(),
             "codes raised in src/ but missing a row in AGENT_GUIDE.md's "
-            "'Error codes you will see' table (DESIGN §4.1): "
-            + ", ".join(sorted(missing)),
+            "'Error codes you will see' table: " + ", ".join(sorted(missing)),
         )
 
     def test_every_documented_code_is_raised(self):

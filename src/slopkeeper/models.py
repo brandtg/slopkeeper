@@ -34,8 +34,8 @@ CURRENT_FP_PREFIX = "fp5"
 # CONTENT as of fp4: `.claude/skills`, `.hermes` memories and cron prompts
 # are the files most likely to cite corpus paths, and the walk must see
 # them. Per-corpus noise (`.cache`, `.claude/projects` transcript dumps)
-# is the `.slopkeeperignore` file's job, with doctor suggesting the lines
-# (DESIGN.md §6.6). Legacy state dirs (.janitor, .scaffolder) stay listed:
+# is the `.slopkeeperignore` file's job, with doctor suggesting the lines.
+# Legacy state dirs (.janitor, .scaffolder) stay listed:
 # pre-launch corpora carrying them must never have them walked as content.
 HIDDEN_SKIP_DIRS = {
     ".git",
@@ -175,7 +175,7 @@ def sha256_file(path: Path, cap_bytes: int = 64 * 1024 * 1024) -> str | None:
 
 
 def sha256_file_exact(path: Path, chunk_bytes: int = 1 << 20) -> str:
-    """sha256 of a file's EXACT bytes, streamed — no size cap (DESIGN §5.6).
+    """sha256 of a file's EXACT bytes, streamed — no size cap.
 
     sha256_file's 64 MiB cap is a corpus-scan courtesy; it must never
     turn a plan's provenance hash into None. Provenance reuses the same
@@ -191,7 +191,7 @@ def sha256_file_exact(path: Path, chunk_bytes: int = 1 << 20) -> str:
 
 def corpus_fingerprint(root: Path) -> str:
     """Stable digest of content per non-skipped file — staleness is
-    content-based (DESIGN.md §5.2, §6.6).
+    content-based.
 
     Each entry hashes (relpath, size, sha256) with the content hash
     from sha256_file, streamed in chunks — files are never slurped
@@ -251,7 +251,7 @@ def state_dir(root: Path) -> Path:
     return Path(root) / STATE_DIR
 
 
-# --- tending lock (DESIGN.md §5.5) ------------------------------------------
+# --- tending lock ------------------------------------------
 
 TEND_LOCK_NAME = "tend.lock"
 
@@ -288,7 +288,7 @@ def tend_lock(root: Path):
     try:
         import fcntl  # POSIX-only; imported here so Windows never sees it
     except ImportError:
-        # No fcntl (Windows): fail soft per §5.5 — proceed unlocked.
+        # No fcntl (Windows): fail soft — proceed unlocked.
         # Covered on POSIX via the None-in-sys.modules import blocker.
         yield
         return

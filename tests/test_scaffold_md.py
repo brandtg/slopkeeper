@@ -126,6 +126,25 @@ class TestScaffoldRoster(TempCase):
             by_path, {"bots/alpha": True, "topics/notes": False, "bots/gamma": False}
         )
 
+    def test_strategy_state_md_default_when_entry_omits_key(self):
+        # B11: scaffold reads the RAW plan — validate_plan's bot default
+        # never reaches it — so a pack that ships folder_template.
+        # state_md:true must supply the default itself, for folders of
+        # the pack's own kind.
+        plan_path = write_plan(
+            self.root,
+            strategy="role-bots",
+            folders=[
+                {"path": "bots/alpha", "kind": "bot"},  # omit → template default
+                {"path": "bots/beta", "kind": "bot", "state_md": False},  # explicit
+                {"path": "misc/stash", "kind": "case"},  # foreign kind → no STATE
+            ],
+        )
+        scaffold_from_plan(plan_path, self.root, execute=True)
+        self.assertTrue((self.root / "bots/alpha/STATE.md").exists())
+        self.assertFalse((self.root / "bots/beta/STATE.md").exists())
+        self.assertFalse((self.root / "misc/stash/STATE.md").exists())
+
 
 # --- AGENTS.md template role slots + roster keep rows ---
 
@@ -157,6 +176,26 @@ class TestTemplateVariants(unittest.TestCase):
             {"agents_md_skeleton": "# <Name>\n"},
         )
         self.assertIn("## Role / scope\nR.", out)
+
+    def test_kind_placeholder_filled_and_not_duplicated(self):
+        # A7: by-kind's skeleton opened "# <Kind>" — the placeholder
+        # survived rendering (a folder AGENTS.md with no name in it);
+        # and hybrid's ## Kind section was followed by a redundant
+        # trailing "**Kind:**" line.
+        from slopkeeper.scaffold import _render_agents_md
+        from slopkeeper.strategies import get_strategy
+
+        by_kind = get_strategy("by-kind")["folder_template"]
+        out = _render_agents_md(
+            {"path": "docs", "kind": "topic", "role": "R."}, by_kind
+        )
+        self.assertIn("# docs", out)
+        self.assertNotIn("<Kind>", out)
+
+        hybrid = get_strategy("hybrid")["folder_template"]
+        out = _render_agents_md({"path": "x", "kind": "case", "role": "R."}, hybrid)
+        self.assertIn("## Kind", out)  # the skeleton's own section survives
+        self.assertNotIn("**Kind:**", out)  # the duplicate line is gone
 
     def test_empty_keep_rows_are_skipped(self):
         from slopkeeper.scaffold import _auto_roster

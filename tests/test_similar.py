@@ -76,9 +76,39 @@ class TestSimilarity(TempCase):
         self.assertEqual(out[0]["referrers"], 3)
 
     def test_stale_version_pair(self):
-        # Same basename in two dirs: the older copy with DIFFERENT
-        # content is the likely older version; identical copies are
-        # not versions.
+        # Same basename in two dirs, DIFFERENT content, older mtime —
+        # but only version-y names pair (B9): mtime ranks candidates,
+        # the name has to agree a version relationship exists.
+        import os
+
+        (self.root / "a").mkdir()
+        (self.root / "b").mkdir()
+        (self.root / "a/report-final.md").write_text("new content\n")
+        (self.root / "b/report-final.md").write_text("old content\n")
+        os.utime(self.root / "a/report-final.md", (2000, 2000))
+        os.utime(self.root / "b/report-final.md", (1000, 1000))
+        (self.root / "c").mkdir()
+        (self.root / "c/dup.md").write_text("same\n")
+        (self.root / "d").mkdir()
+        (self.root / "d/dup.md").write_text("same\n")
+        paths = [
+            "a/report-final.md",
+            "b/report-final.md",
+            "c/dup.md",
+            "d/dup.md",
+        ]
+        out = collect_similarity(self.root, files=[{"path": p} for p in paths])
+        stale = out["stale_versions"]
+        self.assertEqual(len(stale), 1)
+        self.assertEqual(stale[0]["file"], "b/report-final.md")
+        self.assertEqual(stale[0]["likely_newer"], "a/report-final.md")
+
+    def test_stale_version_pair_needs_name_signal(self):
+        # B9: the touch-reset trap. A sync tool (rsync, git checkout)
+        # shuffles mtimes across unrelated same-stem files; mtime alone
+        # used to manufacture "older versions" out of them. Without a
+        # version signal in either name (v\d, final, copy, backup, old,
+        # ~), nothing pairs.
         import os
 
         (self.root / "a").mkdir()
@@ -87,21 +117,33 @@ class TestSimilarity(TempCase):
         (self.root / "b/report.md").write_text("old content\n")
         os.utime(self.root / "a/report.md", (2000, 2000))
         os.utime(self.root / "b/report.md", (1000, 1000))
-        (self.root / "c").mkdir()
-        (self.root / "c/dup.md").write_text("same\n")
-        (self.root / "d").mkdir()
-        (self.root / "d/dup.md").write_text("same\n")
-        paths = [
-            "a/report.md",
-            "b/report.md",
-            "c/dup.md",
-            "d/dup.md",
-        ]
-        out = collect_similarity(self.root, files=[{"path": p} for p in paths])
-        stale = out["stale_versions"]
-        self.assertEqual(len(stale), 1)
-        self.assertEqual(stale[0]["file"], "b/report.md")
-        self.assertEqual(stale[0]["likely_newer"], "a/report.md")
+        # A signal on ONE side of the pair is corroboration enough.
+        (self.root / "a/plan.md").write_text("new plan\n")
+        (self.root / "b/plan.md").write_text("old plan\n")
+        os.utime(self.root / "a/plan.md", (2000, 2000))
+        os.utime(self.root / "b/plan.md", (1000, 1000))
+        (self.root / "a/plan_old.md").write_text("ancient\n")
+        os.utime(self.root / "a/plan_old.md", (500, 500))
+        out = collect_similarity(
+            self.root,
+            files=[
+                {"path": p}
+                for p in [
+                    "a/report.md",
+                    "b/report.md",
+                    "a/plan.md",
+                    "b/plan.md",
+                ]
+            ],
+        )
+        self.assertEqual(out["stale_versions"], [])
+        # plan.md vs plan_old.md share no stem ("plan" vs "plan_old") —
+        # the signal matters INSIDE a same-stem group, not across names.
+        out2 = collect_similarity(
+            self.root,
+            files=[{"path": p} for p in ["a/plan.md", "b/plan.md", "a/plan_old.md"]],
+        )
+        self.assertEqual(out2["stale_versions"], [])
 
     def test_identical_subtree_collapsed(self):
         # Four copies of one vendored subtree → ONE cluster entry
@@ -133,7 +175,7 @@ class TestSimilarity(TempCase):
         self.assertIn("loose.md", out["unclustered"])
 
 
-# --- regression: precision over recall (TEST_PLAN similar.py rows) ---
+# --- regression: precision over recall ---
 
 
 # A token chain: each adjacent pair shares exactly one token and the

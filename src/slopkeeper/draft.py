@@ -143,12 +143,14 @@ def draft(root: Path, min_sim: float | None = None, depth: int | None = None) ->
             "Partition per-directory instead.",
         )
 
-    # Vector cache (§5.3): reuse cached per-doc tf whose sha256 matches
+    # Vector cache: reuse cached per-doc tf whose sha256 matches
     # the manifest@2 hash for that path. Keying on the MANIFEST (the
     # last-tended state), not the working disk, is the spec'd behavior —
     # a re-tend (apply/undo/--record) refreshes both. Slop is always
     # vectorized fresh: it is the O(new) cost the loop is allowed.
-    params = {"t1": min_sim}
+    # Params are content-only (see collect_similarity): min_sim tunes
+    # matching, never tf, so it must not key — or thrash — the cache.
+    params: dict = {}
     cache_docs = load_vector_cache(root, params)
     manifest_files = manifest.get("files", {})
 

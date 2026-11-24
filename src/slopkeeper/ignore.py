@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: MIT
 
-"""`.slopkeeperignore` — the per-corpus invisible set (DESIGN.md §6.6).
+"""`.slopkeeperignore` — the per-corpus invisible set.
 
 One rule everywhere: an ignored path is a path the tool pretends does
 not exist. It is not inventoried, not fingerprinted, not in new_files,

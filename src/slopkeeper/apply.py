@@ -36,7 +36,12 @@ from .models import (
     state_dir,
     tend_lock,
 )
-from .plan import load_plan, load_render_sidecar, validate_plan
+from .plan import (
+    load_plan,
+    load_render_sidecar,
+    preflight_destinations,
+    validate_plan,
+)
 from .references import (
     CitationIndex,
     _apply_line_replacements,
@@ -51,7 +56,7 @@ from .references import (
 )
 from .status import load_manifest, write_manifest
 
-# §5.6: a mismatch between the plan's bytes and the last render is a
+# a mismatch between the plan's bytes and the last render is a
 # WARNING, never a refusal — the human may hand-edit the plan JSON after
 # rendering (the documented AGENT_GUIDE flow). It only makes silent
 # render→apply drift visible.
@@ -708,7 +713,7 @@ def apply_plan(
     strict_references: bool = False,
     journal_path: Path | None = None,
 ) -> dict:
-    """Dry-run or execute a plan (DESIGN.md §5.5 tending lock).
+    """Dry-run or execute a plan (tending lock).
 
     Execute mode holds the advisory lock on .slopkeeper/tend.lock across
     the WHOLE pre-flight+execute span — acquisition happens before the
@@ -731,7 +736,7 @@ def apply_plan(
 
 
 def _render_mismatch_warning(root: Path, plan_sha256: str) -> str | None:
-    """§5.6: RENDER_WARNING iff the plan's bytes differ from the last render.
+    """RENDER_WARNING iff the plan's bytes differ from the last render.
 
     No sidecar (never rendered, or corrupt/foreign-schema — see
     load_render_sidecar) means nothing to compare: no warning, no crash.
@@ -757,7 +762,7 @@ def _apply_plan(
     root = corpus_root.resolve()
     plan = load_plan(plan_path)
     plan = validate_plan(plan, root, allow_partial=allow_partial)
-    # §5.6 provenance: the hash of the exact plan bytes being applied —
+    # provenance: the hash of the exact plan bytes being applied —
     # recorded in the manifest, the journal header, and checked against
     # the last render. load_plan just read this file, so it is hashable.
     plan_sha256 = sha256_file_exact(plan_path)
@@ -790,21 +795,11 @@ def _apply_plan(
     # never disagree). Nothing left to check here.
     edits = plan.get("edits", [])
 
-    # 2. Pre-flight every destination on disk.
-    collisions = []
-    for src, dst in chains.items():
-        if src == dst:
-            continue
-        dst_abs = corpus_path(root, Path(dst))
-        if dst_abs.exists() and dst not in chains:
-            collisions.append({"src": src, "dst": dst})
-    if collisions:
-        raise SlopKeeperError(
-            "dst_exists",
-            f"{len(collisions)} destination(s) already exist: "
-            f"{[c['dst'] for c in collisions][:5]}",
-            "Choose different destinations or resolve the collision in the plan.",
-        )
+    # 2. Pre-flight every destination on disk. SHARED with validate_plan
+    # (preflight_destinations) so the two surfaces cannot disagree; this
+    # call re-observes the disk under the tend lock, after the
+    # fingerprint gate — the last look before any write.
+    preflight_destinations(root, chains)
 
     # 3. Reference risk scan + 3b. the citation rewrite pass — ONE
     # engine now (B2): the pass runs first and its per-site records
@@ -990,7 +985,7 @@ def _apply_plan(
     # so a hop never lands on a path another pending move still owns.
     # The journal records the ACTUAL executed pair per move — both hops
     # of a file chain, not a rewrite — so undo replays it exactly.
-    # First line is the §5.6 provenance header binding the journal to
+    # First line is the provenance header binding the journal to
     # the plan's exact bytes; undo skips non-move ops, so it tolerates
     # the header wherever it sits.
     journal = journal_path or _default_journal(root)
@@ -1247,7 +1242,7 @@ def _apply_plan(
 
 
 def undo_journal(journal_path: Path, corpus_root: Path, execute: bool = False) -> dict:
-    """Reverse a journal (§5.5: execute mode runs under the tend lock).
+    """Reverse a journal (execute mode runs under the tend lock).
 
     Dry-run undo is a pure read: no lock, safe beside a running tend.
     """
@@ -1389,7 +1384,7 @@ def _undo_journal(journal_path: Path, corpus_root: Path, execute: bool = False) 
         )
     result = {"mode": "executed" if execute else "dry-run", "operations": ops}
     if execute:
-        # §5.4: the manifest describes the CURRENT tended state, and the
+        # the manifest describes the CURRENT tended state, and the
         # plan this journal came from did not happen — refresh the
         # snapshot so it reflects the post-undo disk.
         result["manifest"] = _refresh_manifest_after_undo(root)

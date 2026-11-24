@@ -574,12 +574,13 @@ def cmd_move(args) -> int:
         "partial": True,
     }
     # Every refusal the plan path has applies here: path_escape,
-    # plan_noop_move, move_source_ignored, plan_stale_src, dst_exists
-    # (raised by apply's pre-flight on --execute). Nothing new to learn.
+    # plan_noop_move, move_source_ignored, plan_stale_src,
+    # plan_dst_exists (the shared validate/apply destination
+    # pre-flight). Nothing new to learn.
     plan = validate_plan(plan, root)
 
     if not args.execute:
-        # The gate IS the render on stdout (plan render's §2 precedent):
+        # The gate IS the render on stdout (plan render's precedent):
         # the human approves real paths with real reference numbers.
         ref_report, rewrite_summary = build_gate_report(plan, root)
         print(
@@ -814,7 +815,7 @@ def cmd_plan_render(args) -> int:
     )
     if args.out:
         _write_output(args.out, md)
-        # §5.6: bind the rendered gate to the plan's exact bytes so a
+        # bind the rendered gate to the plan's exact bytes so a
         # later apply can warn on silent render→apply drift. A stdout
         # render records nothing — and carries no artifact paths for
         # apply to exclude from the rewrite pass.
@@ -828,7 +829,7 @@ def cmd_plan_render(args) -> int:
         )
         payload = {"written_to": args.out, "bytes": len(md)}
     else:
-        # §2 exception, on plan schema's precedent: the output IS the
+        # markdown exception, on plan schema's precedent: the output IS the
         # artifact — a stdout render prints the gate markdown itself.
         print(md)
         payload = {"bytes": len(md)}
@@ -847,7 +848,7 @@ def cmd_plan_render(args) -> int:
 
 
 def cmd_plan_schema(_args) -> int:
-    # §2 exception, on plan render's markdown precedent: the output IS
+    # markdown exception, on plan render's markdown precedent: the output IS
     # the artifact. `slopkeeper plan schema > plan.json` must yield a plan
     # skeleton — the envelope form failed plan_bad_schema.
     print(json.dumps(PLAN_TEMPLATE, indent=2))
@@ -855,7 +856,7 @@ def cmd_plan_schema(_args) -> int:
 
 
 def cmd_guide(_args) -> int:
-    # §2 exception, on plan schema's precedent: the output IS the artifact
+    # markdown exception, on plan schema's precedent: the output IS the artifact
     # the agent reads. Packaged so pipx/venv installs carry the guide even
     # with no repo checkout (src/slopkeeper/AGENT_GUIDE.md symlinks the root
     # copy — one canonical file).
@@ -1345,7 +1346,7 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     if getattr(args, "command", None) is None or getattr(args, "func", None) is None:
         # Bare `slopkeeper` (or `slopkeeper repl`) is the human REPL; subcommands keep
-        # the JSON envelope for agents (DESIGN §2.7).
+        # the JSON envelope for agents.
         from .tui import repl
 
         return repl(getattr(args, "root", None))
