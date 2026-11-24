@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "slopkeeper"
-version = "0.2.4"
+version = "0.2.5"
 description = "Someone has to clean up after your agents. Inventory, plan, human gate, all-or-nothing apply with undo: the agent classifies, the human approves, and nothing is ever deleted."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -42,7 +42,6 @@ slopkeeper = "slopkeeper.cli:main"
 # Dev-only tooling. Zero-dep is a RUNTIME rule: these ride in via
 # `uv sync --group dev` and never touch the project's runtime dependencies.
 dev = [
-  "mkdocs-material>=9.5",
   "pytest>=8.0.0",
   "pytest-cov>=6.1.1",
   "reuse>=5.0.2",
