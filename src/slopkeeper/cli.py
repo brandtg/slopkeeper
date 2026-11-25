@@ -28,6 +28,7 @@ from .models import (
     HIDDEN_SKIP_DIRS,
     PLAN_SCHEMA,
     SlopKeeperError,
+    add_warning,
     corpus_fingerprint,
     emit_json,
     envelope,
@@ -114,7 +115,13 @@ def _shape_inventory_files(inv: dict, fields: list[str]) -> dict:
 def cmd_inventory(args) -> int:
     root = _resolve_dir(args.root)
     fields = [f.strip() for f in (args.fields or "").split(",") if f.strip()]
-    inv = collect(root, depth=args.depth, fast=args.fast, max_files=args.max_files)
+    inv = collect(
+        root,
+        depth=args.depth,
+        fast=args.fast,
+        max_files=args.max_files,
+        scope=getattr(args, "scope", None),
+    )
     if fields:
         inv = _shape_inventory_files(inv, fields)
     payload = inv
@@ -127,6 +134,8 @@ def cmd_inventory(args) -> int:
             "dirs": inv.get("dirs", []),
             "files": [f["path"] for f in inv["files"]],
         }
+        if inv.get("scope") is not None:
+            payload["scope"] = inv["scope"]
     if args.out:
         # T7 + B11: with --out the shaped payload lives only in the
         # file — --summary and --fields shape the FILE too (they used
@@ -175,7 +184,9 @@ def cmd_clusters(args) -> int:
     scan = prepare(root)
     inv = collect(root, depth=args.depth, scan=scan)
     files = inv["files"]
-    data = collect_similarity(root, files, sha_of=scan.sha_of)
+    data = collect_similarity(
+        root, files, sha_of=scan.sha_of, force=getattr(args, "force", False)
+    )
     if args.min_size > 1:
         data["clusters"] = [c for c in data["clusters"] if c["size"] >= args.min_size]
     if inv.get("references"):
@@ -330,7 +341,12 @@ def _draft_out_path(raw: str | None, root: Path) -> Path:
 def cmd_draft(args) -> int:
     root = _resolve_dir(args.root)
     out_path = _draft_out_path(args.out, root)
-    data = draft_plan(root, min_sim=args.min_sim, depth=args.depth)
+    data = draft_plan(
+        root,
+        min_sim=args.min_sim,
+        depth=args.depth,
+        force=getattr(args, "force", False),
+    )
     if data.get("plan") is None:
         # T7: the envelope is token-bounded accounting — the draft body
         # lives only in the --out file, never on stdout.
@@ -356,10 +372,18 @@ def cmd_draft(args) -> int:
             "new_count": data["new_count"],
             "out_path": str(out_path),
         }
+        if data.get("dedup_count"):
+            payload["dedup_count"] = data["dedup_count"]
         hint = (
             "DRAFT, NOT A DECISION: review every move and reason, "
             "reclassify as needed, then render for the human gate."
         )
+        if data.get("dedup_count"):
+            hint += (
+                f" {data['dedup_count']} byte-identical duplicate(s) filed as "
+                "dedup moves into archive/duplicates/ (archived, never "
+                "deleted; undo restores)."
+            )
         if data.get("undrafted"):
             payload["undrafted"] = data["undrafted"]
             und = data["undrafted"]
@@ -737,6 +761,7 @@ def cmd_plan_validate(args) -> int:
         root,
         allow_partial=args.allow_partial,
         allow_symlinks=args.allow_symlinks,
+        strict_case=getattr(args, "strict_case", False),
     )
     stragglers = straggler_report(root, plan)
     # Phase 9: informational cost rows for moves of code-anchored dirs.
@@ -757,6 +782,15 @@ def cmd_plan_validate(args) -> int:
         "code_anchored_moves": len(anchor_risks),
         "emptied_dirs": len(emptied),
     }
+    if plan.get("scope"):
+        data["scope"] = plan["scope"]
+    if plan.get("dedup"):
+        data["dedup"] = len(plan["dedup"])
+    if plan.get("case_collisions"):
+        # P4 (6): informational on a case-sensitive filesystem; the human
+        # decides. --strict-case would have refused it instead.
+        data["case_collisions"] = plan["case_collisions"]
+        add_warning(data, "case_collision")
     if plan.get("rules"):
         data["rules"] = plan["rules"]
     if plan.get("rule_warnings"):
@@ -816,6 +850,7 @@ def cmd_plan_render(args) -> int:
         allow_partial=args.allow_partial,
         require_based_on=False,
         allow_symlinks=args.allow_symlinks,
+        strict_case=getattr(args, "strict_case", False),
     )
 
     # Reference counts for the human gate: the same un-capped stream
@@ -834,16 +869,20 @@ def cmd_plan_render(args) -> int:
     # B8: emptied-by-file dirs and their destination breakdowns ride on
     # the validated plan.
     emptied = plan.get("emptied_dir_suggestions") or []
-    md = render_markdown(
+    # P4 (3): the --out FILE is the full-detail artifact (every move);
+    # stdout past the 200-move cap drops to the Summary table so the
+    # terminal stays skimmable. summary_only None = auto (decide by count).
+    md_full = render_markdown(
         plan,
         ref_report,
         rewrite_summary,
         stragglers=stragglers,
         code_anchor_risks=anchor_risks,
         emptied_dirs=emptied,
+        summary_only=False,
     )
     if args.out:
-        _write_output(args.out, md)
+        _write_output(args.out, md_full)
         # bind the rendered gate to the plan's exact bytes so a
         # later apply can warn on silent render→apply drift. A stdout
         # render records nothing — and carries no artifact paths for
@@ -859,12 +898,36 @@ def cmd_plan_render(args) -> int:
             # plan carries the warning instead of a fabricated binding.
             warnings=None if based_on_binding(plan) else ["no_fingerprint"],
         )
-        payload = {"written_to": args.out, "bytes": len(md)}
+        payload = {"written_to": args.out, "bytes": len(md_full)}
+        if plan.get("case_collisions"):
+            payload["case_collisions"] = plan["case_collisions"]
+            add_warning(payload, "case_collision")
     else:
         # markdown exception, on plan schema's precedent: the output IS the
-        # artifact — a stdout render prints the gate markdown itself.
+        # artifact — a stdout render prints the gate markdown itself. Past
+        # the cap it prints the summary + a pointer, and `next` says so.
+        paginated = len(plan["moves"]) > 200
+        md = (
+            render_markdown(
+                plan,
+                ref_report,
+                rewrite_summary,
+                stragglers=stragglers,
+                code_anchor_risks=anchor_risks,
+                emptied_dirs=emptied,
+                summary_only=True,
+            )
+            if paginated
+            else md_full
+        )
         print(md)
         payload = {"bytes": len(md)}
+        if paginated:
+            payload["paginated"] = True
+            payload["moves"] = len(plan["moves"])
+        if plan.get("case_collisions"):
+            payload["case_collisions"] = plan["case_collisions"]
+            add_warning(payload, "case_collision")
     if args.rewrites_out:
         # B1: the full line-level rewrite detail as JSON — the render
         # shows it capped, the file carries everything.
@@ -875,7 +938,17 @@ def cmd_plan_render(args) -> int:
         _write_output(args.rewrites_out, json.dumps(detail, indent=1))
         payload["rewrites_out"] = args.rewrites_out
     if args.out:
-        emit_json(envelope("plan.render", payload))
+        # The `next` hint points AT THE FILE: past the cap the terminal
+        # only saw the summary, and even the file render tells the human
+        # to approve the full list there (P4, 3).
+        nxt = next_step(
+            "apply",
+            f"slopkeeper apply {args.plan} {root} --execute",
+            f"Full human gate written to {args.out} — show that file to the "
+            "owner (the terminal render is summary-only past 200 moves), "
+            "then apply --execute once approved.",
+        )
+        emit_json(envelope("plan.render", payload, nxt))
     return EXIT_OK
 
 
@@ -907,6 +980,7 @@ def cmd_apply(args) -> int:
         allow_partial=args.allow_partial,
         strict_references=args.strict_references,
         allow_symlinks=args.allow_symlinks,
+        strict_case=getattr(args, "strict_case", False),
     )
     if args.rewrites_out:
         # B1: the line-level rewrite detail as JSON, matching
@@ -1113,6 +1187,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="write the (summary/fields-shaped) inventory JSON here "
         "(stdout carries counts only)",
     )
+    sp.add_argument(
+        "--scope",
+        default=None,
+        metavar="DIR",
+        help="inventory ONE corpus-relative subtree only (P4 bounded tend) "
+        "— files, dirs, clusters and the fingerprint all describe that "
+        "scope; author a scoped plan against this view",
+    )
     sp.set_defaults(func=cmd_inventory)
 
     sp = sub.add_parser(
@@ -1136,6 +1218,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument(
         "--out",
         help="write the full clusters JSON here (stdout carries counts only)",
+    )
+    sp.add_argument(
+        "--force",
+        action="store_true",
+        help="run the blocked candidate matcher past the memory bound "
+        "(P4): pairs sharing rare tokens only, not the full O(n²) sweep, "
+        "so large corpora cluster without per-directory partitioning",
     )
     sp.set_defaults(func=cmd_clusters)
 
@@ -1180,6 +1269,13 @@ def build_parser() -> argparse.ArgumentParser:
         default="draft-plan.json",
         help="where to write the draft plan JSON (resolved against your "
         "CWD; refused if inside the corpus root)",
+    )
+    sp.add_argument(
+        "--force",
+        action="store_true",
+        help="draft past the filed-file memory bound (P4): the "
+        "nearest-neighbour scan runs candidate-blocked, so a large corpus "
+        "re-tends instead of refusing with corpus_too_big",
     )
     sp.set_defaults(func=cmd_draft)
 
@@ -1290,6 +1386,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="write the validated plan (expanded moves + stragglers) as JSON here",
     )
+    v.add_argument(
+        "--strict-case",
+        action="store_true",
+        help="refuse a plan whose destinations collide ignoring case "
+        "(plan_dst_case_collision) — the silent clobber on a case-insensitive "
+        "mount; default: report it as a warning only",
+    )
     v.set_defaults(func=cmd_plan_validate)
 
     r = psub.add_parser("render", help="render the human-gate markdown")
@@ -1308,6 +1411,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="write the full line-level rewrite detail ({file: [{line, old, "
         "new}]}) as JSON here (B1)",
+    )
+    r.add_argument(
+        "--strict-case",
+        action="store_true",
+        help="refuse (plan_dst_case_collision) case-insensitive destination "
+        "collisions the gate would otherwise only warn about",
     )
     r.set_defaults(func=cmd_plan_render)
 
@@ -1352,6 +1461,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="write the line-level rewrite detail ({file: [{line, old, new}]}) "
         "as JSON here (B1)",
+    )
+    sp.add_argument(
+        "--strict-case",
+        action="store_true",
+        help="refuse (plan_dst_case_collision) case-insensitive destination "
+        "collisions — for a corpus headed for a mounted case-insensitive volume",
     )
     sp.set_defaults(func=cmd_apply)
 

@@ -166,7 +166,9 @@ def load_ignore(root: Path) -> CorpusIgnore:
     return CorpusIgnore(text.splitlines())
 
 
-def corpus_walk(root: Path, nested_out: list[str] | None = None):
+def corpus_walk(
+    root: Path, nested_out: list[str] | None = None, scope: str | None = None
+):
     """os.walk over the corpus with the full skip contract applied.
 
     Yields (dirpath, dirnames, filenames): dirnames are pruned and
@@ -219,7 +221,7 @@ def corpus_walk(root: Path, nested_out: list[str] | None = None):
     from .scan import WalkReport, walk_visits
 
     report = WalkReport(nested=nested_out)
-    for visit in walk_visits(root, report=report):
+    for visit in walk_visits(root, report=report, scope=scope):
         yield str(visit.path), list(visit.subdirs), [e.name for e in visit.files]
 
 

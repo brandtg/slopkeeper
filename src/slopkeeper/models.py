@@ -291,9 +291,7 @@ def sha256_file_exact(path: Path, chunk_bytes: int = 1 << 20) -> str:
 UNSTATABLE_NAMED = 10
 
 
-def corpus_fingerprint_detail(
-    root: Path,
-) -> tuple[str, dict]:
+def corpus_fingerprint_detail(root: Path, scope: str | None = None) -> tuple[str, dict]:
     """(fingerprint, health) — the B6-loud form of corpus_fingerprint.
 
     health carries `skipped_unstatable` (an int) and, when non-zero,
@@ -316,10 +314,10 @@ def corpus_fingerprint_detail(
     """
     from .scan import fingerprint_scan
 
-    return fingerprint_scan(root)
+    return fingerprint_scan(root, scope=scope)
 
 
-def corpus_fingerprint(root: Path) -> str:
+def corpus_fingerprint(root: Path, scope: str | None = None) -> str:
     """Stable digest of content per non-skipped file — staleness is
     content-based.
 
@@ -355,7 +353,7 @@ def corpus_fingerprint(root: Path) -> str:
     doctor, apply's churn refusal) call corpus_fingerprint_detail; this
     is the string-only convenience wrapper over it.
     """
-    return corpus_fingerprint_detail(root)[0]
+    return corpus_fingerprint_detail(root, scope=scope)[0]
 
 
 # --- state dir ---------------------------------------------------------------

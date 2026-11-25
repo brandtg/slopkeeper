@@ -432,8 +432,11 @@ class TestRenderRulesAndStragglers(TempCase):
         self.assertIn("`reports/_org/sub/c.md`", md)
 
     def test_render_caps_move_tables(self):
-        # A 61k-move rule plan cannot gate on a 61k-row table: rows cap
-        # loudly, the per-destination Summary stays complete.
+        # P4 (3): a 61k-move rule plan cannot gate on a 61k-row table.
+        # Past the 200-move cap the STDOUT render drops to the Summary
+        # table (complete, one row per destination) and defers the per-move
+        # detail to --out / validate --out. summary_only=False forces the
+        # full detail (what --out writes).
         files = {f"pile/f{i:03d}.md": "x\n" for i in range(250)}
         build_corpus(self.root, files)
         plan = load_plan(
@@ -442,10 +445,19 @@ class TestRenderRulesAndStragglers(TempCase):
         out = validate_plan(plan, self.root)
         md = render_markdown(out, {}, None)
         # 254 = 250 expanded + 4 explicit (the write_plan defaults)
-        self.assertIn("showing the first 200 of 254 moves", md)
+        self.assertIn("254 moves", md)
+        self.assertIn("per-move detail omitted", md)
+        self.assertIn("plan render --out", md)
         self.assertIn("| `out/` | 250 |", md)  # summary table: complete
-        # folders starved by the cap never render as empty tables
+        # the per-move detail tables are gone entirely (no starved folder,
+        # and no full 250-row dump)
+        self.assertNotIn("## → `out/`", md)
         self.assertNotIn("## → `research/dossiers/`", md)
+        # --out renders the FULL detail (every move), no omission note
+        full = render_markdown(out, {}, None, summary_only=False)
+        self.assertIn("## → `out/`", full)
+        self.assertNotIn("per-move detail omitted", full)
+        self.assertIn("`pile/f000.md`", full)
 
 
 class TestRenderCodeAnchors(TempCase):

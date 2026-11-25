@@ -201,7 +201,7 @@ intentional name. When you add a fixture or an example, invent an
        dangling-citation count
        (`refs --dangling` lists them).
 
-2. slopkeeper inventory <root> [--fast --summary | --out inv.json]
+2. slopkeeper inventory <root> [--fast --summary | --out inv.json | --scope DIR]
      → <800 files: full JSON with heads + cross-references (read it whole)
        >800 files: --fast --summary, then per-dir inventories as needed
        --fields path,title,mtime (B11): the lean per-file projection —
@@ -213,18 +213,31 @@ intentional name. When you add a fixture or an example, invent an
        --out inv.json: the SHAPED payload (--summary/--fields are
        honored in the file, not ignored) lands there; stdout carries
        only counts (stats + out_path) — read the file, not the terminal.
+       --scope DIR (P4 bounded tend): inventory ONE corpus-relative
+       subtree only — files, dirs, clusters and the fingerprint all
+       describe that scope; author a scoped plan against this view so
+       its `based_on.corpus_fingerprint` is the scope's digest.
        stats.symlinked_dirs names symlinked directories the walk does
        not descend — entries the plan must cover (keep/unresolved/
        skip), never content; moves crossing them are refused
        (symlink_escape — Hard rule 8).
 
-3. slopkeeper clusters <root> [--out clusters.json]
+3. slopkeeper clusters <root> [--out clusters.json] [--force]
      → similarity HINTS: content clusters, scrape pairs, dupes, hubs,
        stale-version pairs (same basename, different content, older
        mtime — "likely older version"), and identical subtrees
-       collapsed to one entry naming every copy.
+       collapsed to one entry naming every copy. Subtrees match on the
+       WHOLE recursive path:hash signature (P4) — a copied tree one
+       level deep is caught, not just flat siblings.
        Name each cluster, merge/split by judgment. Never apply a cluster
        as-is; and check `hubs` before moving a file cited by many others.
+       Scale (P4): past 3000 files the matcher switches to candidate
+       blocking (inverted rare-token→docs index; cosine only on pairs
+       sharing ≥2 rare tokens), so a 5k+ corpus clusters in memory
+       instead of refusing. The ceiling is now a memory bound (~50k);
+       past THAT `similarity_cap` refuses unless --force (the blocked
+       scan is O(Σ rare-token²), not O(n²)). `draft` is blocked the same
+       way (its `corpus_too_big` is a memory bound + --force).
        --out clusters.json: full payload in the file, counts on stdout.
 
 4. slopkeeper strategies show <suggested-id>   (or your choice)
@@ -233,13 +246,23 @@ intentional name. When you add a fixture or an example, invent an
        corpora)
 
 4b. slopkeeper propose <root> [--scan-path <dir>] [--external-root <dir>]
-     → the layout fork as data: 2-3 candidate partitions (by-project,
-       by-kind, hybrid — each naming its strategy), each with
-       move_count, citation_break_count, code_anchor_count and
-       unresolved_estimate. Read-only; never authors a plan. Declare
-       citing dirs (--scan-path for an ignored subtree, --external-root
-       for a skills store) or the break counts ignore them. See
-       "Choosing a layout: propose" below.
+     → the layout fork as data: five candidate partitions (by-project,
+       by-role, by-topic, by-kind, hybrid — each naming its strategy),
+       each scored with move_count, citation_break_count,
+       code_anchor_count, unresolved_estimate and orphaned_estimate.
+       by-role asks "what IS this pile": a top-level dir carrying its
+       own AGENTS.md/README.md is a standing role workspace and its
+       subtree stays whole; files under no role dir are unresolved —
+       that count is the answer about the pile, never a guess. by-topic
+       names `topics/<label>` folders from the TF-IDF content clusters
+       (candidate-blocked past 3000 files, like clusters); unclustered
+       files stay unresolved. Both are mechanical approximations of
+       judgment-heavy rubrics: read their counts, not their moves.
+       Read-only; never authors a plan. Declare citing dirs
+       (--scan-path for an ignored subtree, --external-root for a skills
+       store) or the break counts ignore them. An unknown candidate name
+       is refused (`propose_unknown_candidate`) with the valid list.
+       See "Choosing a layout: propose" below.
 
 5. Write the plan JSON. Get the template:
      slopkeeper plan schema
@@ -254,6 +277,23 @@ intentional name. When you add a fixture or an example, invent an
    dumped) gets its files planned like any other — name nested files
    directly in moves. Only use skip for a folder you genuinely did
    not examine, and say so to the owner.
+   Optional top-level `scope` (P4): a list of folder prefixes ("notes",
+   "docs/2025") — or run `inventory --scope notes` and copy its value —
+   makes a partial review the normal shape of a plan instead of a
+   hand-filtered subset. validate then requires coverage of the scope
+   only, and apply checks the fingerprint of the scope only, so edits
+   in a sibling folder no longer stall this plan (`corpus_changed`).
+   A scope that names nothing — missing or ignored — is refused
+   (`plan_scope_escape`). Keep `skip` for genuinely off-limits entries,
+   not for the rest of the corpus.
+   Optional `"dedup": ["sub/a.md", "sub/b.md"]` (P4) groups files the
+   scan found byte-identical: they move together beside the first one.
+   It is always a move, never a delete — a `dedup` group whose files
+   are not identical is refused (`plan_dedup_not_identical`), and there
+   is no way to express deletion in a plan at all.
+   On case-insensitive volumes every destination must stay distinct when
+   compared case-insensitively; validate and apply refuse a plan whose
+   two destinations differ only by case (`plan_dst_case_collision`).
 
 6. slopkeeper plan validate <plan.json> <root>
      → fix every error code it gives you (a plan without
@@ -353,11 +393,30 @@ fork into data — one candidate per strategy's mechanical core:
   setup.py, requirements.txt, pom.xml) keeps its whole subtree in
   place — never split. Everything without a project signal is counted
   as unresolved, not guessed.
+- **by-role** (the role-bots rubric): a top-level dir that directly
+  carries its own `AGENTS.md` or `README.md` is a standing role
+  workspace — the rubric gives every role folder an AGENTS.md, and its
+  presence is the only judgment-free signal a tool can read. That whole
+  subtree stays (never split a role's workspace). A file under no role
+  dir has no role signal and is counted unresolved, never guessed: the
+  unresolved/orphaned count IS the answer to "what is this pile" — if
+  it is near zero, the corpus is a bot-workspace collection; if it is
+  most of the corpus, it is not.
 - **by-kind** (the mechanical floor): every file sorts into docs/,
   data/, scripts/ or media/ (misc for the unknown). Structure
   flattens; nothing is left unresolved.
-- **hybrid**: project subtrees stay whole, and the leftovers kind-sort
-  into hybrid's shared buckets (scripts/, data/, research/).
+- **by-topic** (the topics rubric): "partition by subject" as a
+  deterministic pass — the same TF-IDF content clusters (filename +
+  title + head tokens) as `slopkeeper clusters` name `topics/<label>`
+  folders (the cluster's most distinctive shared terms). The topics
+  rubric is judgment-heavy, so this is the comparison-cost estimate,
+  never a suggested plan: clustered files move, unclustered files stay
+  unresolved, and you read the clusters output before trusting a
+  folder. Past 3000 files it clusters candidate-blocked, like every
+  other similarity surface.
+- **hybrid**: project subtrees stay whole (the projects rule hybrid
+  inherits), and the leftovers kind-sort into hybrid's shared buckets
+  (scripts/, data/, research/).
 
 Per candidate: `move_count` (files whose dest differs from today),
 `citation_break_count` (moved files cited from a file that does not
@@ -366,6 +425,13 @@ the gate agree), `code_anchor_count` (anchored dirs the layout
 disturbs — `__file__` math no pass can rewrite), and
 `unresolved_estimate` (files the layout cannot place).
 
+The payload also carries `orphaned_estimate` per candidate: the files
+this layout would strand as judgment work. by-kind and hybrid orphan
+nothing (0) — and the number says so rather than pretending the layout
+is free; by-role and by-topic orphan exactly the files carrying no
+role signal or sharing no vocabulary, which is the honest measure of
+how much of the pile those judgment-heavy rubrics actually explain.
+
 Declare citing dirs or the break counts ignore them:
 `--scan-path <dir>` for an ignored subtree inside the corpus,
 `--external-root <dir>` for a skills store or cron dir outside it
@@ -373,9 +439,11 @@ Declare citing dirs or the break counts ignore them:
 member with scan_path_skip_list). Verify any count with
 `refs <root> <path> --scan-path <dir>`.
 
-Read-only: no fingerprint effect, no writes, and it never authors a
-plan. Pick a layout, write the plan (rules or moves), then `plan
-validate` — the human still gates.
+Read-only: no fingerprint effect, no writes (by-topic clusters in
+memory and writes no vector cache), and it never authors a plan. An
+unknown candidate name is refused with the valid list
+(`propose_unknown_candidate`). Pick a layout, write the plan (rules or
+moves), then `plan validate` — the human still gates.
 
 ## Re-tending (the recurring loop)
 
@@ -795,6 +863,10 @@ unexplained silence.
 | `corpus_unstable` | the fingerprint walk could not stat N files (they vanished or denied stat mid-scan) — something is writing to the corpus while it is read (B6); inventory/doctor report the same count as `stats.skipped_unstatable` | stop the writer (sync client, editor, build) and re-run; `--force` proceeds and carries the count as `skipped_unstatable` on the envelope |
 | `plan_no_based_on` | the plan carries no corpus binding — `based_on.corpus_fingerprint` is missing, blank, or not a string (0.2.6: validate and apply always required it; the gate silently skipped itself without it) | author the plan from inventory output: run `slopkeeper inventory <root> --fast --summary` and record its `fingerprint` as `based_on.corpus_fingerprint`; `--force` does not bypass this |
 | `plan_dst_exists` | destination occupied (validate and apply share this pre-flight) | resolve collision in plan |
+| `plan_dst_case_collision` | two destinations differ only by case (x.md / X.md), or a destination casefolds onto an existing file — a silent clobber on a case-insensitive mount (P4 6); reported as a `case_collision` warning by default | give each destination a distinct name regardless of case; pass `--strict-case` (validate/render/apply) to refuse it outright for a corpus headed for a mounted volume |
+| `plan_scope_escape` | a scoped plan (`plan.scope`) has a move, rule or dedup that leaves or enters the scope, or the scope is not a directory inside the corpus | a bounded tend may only touch files entirely inside its scope — drop the crossing move, or remove the `"scope"` key to tend the whole corpus |
+| `plan_bad_dedup` | a `dedup` entry is malformed, keep==drop, or keep/drop are not existing files | every dedup is `{"op": "dedup", "keep": "<survivor>", "drop": "<the copy to archive>", "to": "<fresh path, e.g. archive/duplicates/<name>>"}` |
+| `plan_dedup_not_identical` | a `dedup` drop is not byte-identical to its keep | a dedup only archives a true duplicate; refresh `identical_groups` via `clusters`, or make it a normal `move` if the files are not actually duplicates |
 | `referenced_moves` | strict mode: refs would break | rewrite refs first |
 | `plan_nested_moves` | dir + its contents both moved | move dir whole OR its files |
 | `plan_bad_keep` | keep entry is neither string nor {path} object | use `"name"` or `{"path": "name", "reason": "..."}` |
@@ -816,7 +888,7 @@ unexplained silence.
 | `roots_unreadable` / `roots_bad_schema` | roots registry file corrupt/foreign | delete it; re-add roots |
 | `no_roots` | `status --all` with an empty registry | `roots add` first, or run `status <root>` directly |
 | `no_root` | `status` with neither a root nor `--all` | name a root or use `--all` |
-| `similarity_cap` | clusters handed more than 3000 files (the O(n²) matcher would crawl) | partition per-directory: `slopkeeper clusters <root>/<subdir>`, or organize smaller scopes |
+| `similarity_cap` | clusters handed more than the MEMORY_MAX_FILES bound (the blocked matcher will not fit in RAM) | partition per-directory (`slopkeeper clusters <root>/<dir>`), organize smaller scopes, or `--force` to run the blocked candidate matcher anyway (it prices only pairs sharing rare tokens, not O(n²)) — corpora past the old 3000 cap now cluster without `--force` |
 | `plan_not_json` | plan file is not valid JSON | fix the JSON syntax and re-validate |
 | `plan_unreadable` | plan file cannot be read | check the path exists and is readable |
 | `plan_not_object` | plan JSON parses but is not an object | the plan is a JSON object with `schema` and `moves` — not a bare list |
@@ -847,7 +919,7 @@ unexplained silence.
 | `journal_unreadable` | the journal file cannot be read | check the journal path |
 | `journal_empty` | the journal contains no entries | nothing to undo |
 | `journal_corrupt` | a journal line is malformed in the MIDDLE (not the torn last line a crash leaves), so the recovery record itself was edited or truncated (B2) — undo refuses instead of replaying a partial tend; dry-run reports the count as `journal_corrupt_lines` | inspect the journal, fix or drop the bad line, undo again — or `--force` to reverse the ops that did parse |
-| `corpus_too_big` | draft's filed-file count exceeds its 3000 cap (clusters refuses with `similarity_cap`) | partition per-directory, or narrow the draft |
+| `corpus_too_big` | draft's filed-file count exceeds the MEMORY_MAX_FILES memory bound (clusters refuses with `similarity_cap`) | partition per-directory, or `--force` to run the candidate-blocked nearest-neighbour scan past the bound |
 | `plan_bad_rewrites` | plan.rewrites is not `{"mode": "auto"}` or `{"mode": "off"}` | set `"mode"` to `auto` (default) or `off`; it is the only key |
 | `rewrite_expect_mismatch` | an external root's `expect` count differs from the computed rewrite count | verify with `refs --scan-path`, fix `"expect"`, or drop the assertion |
 | `plan_bad_scan_path` | a `scan_paths` entry is not an absolute, existing directory | declare absolute directories that exist — or drop scan_paths |
@@ -860,6 +932,7 @@ unexplained silence.
 | `merge_collision` | a directory move's destination is created by another move of the same plan, and a child name collides with an existing path or another move's destination (E1) | rename one destination or drop one of the two moves — the merge refuses a name collision instead of nesting the directory |
 | `target_unwritable` | a rewrite or edit target denies writes (sandbox deny-list, read-only mount) — refused before ANY move | run apply outside the sandbox or grant write access; nothing was moved |
 | `unknown_strategy` | no strategy with that id | `slopkeeper strategies` for the available ids |
+| `propose_unknown_candidate` | `candidate_moves(root, "<id>")` (or an internal call) named a candidate that does not exist | known candidates: by-project, by-role, by-topic, by-kind, hybrid — see `slopkeeper propose` |
 | `skill_unknown_agent` | `skill install` target is neither a known agent nor a path-like string | use a known agent (claude, opencode, hermes) or pass a skills directory path — the skill lands in `<dir>/slopkeeper/` |
 | `skill_target_not_dir` | `skill install` destination exists as a file | remove it or pass a different skills directory |
 
@@ -884,8 +957,22 @@ unexplained silence.
   corpora of any size linearly (the 2000-file cap is gone); apply's
   `reference_scan` reports `files_scanned`/`elapsed_ms`, never a
   silent skip. Per-file read cap 512 KiB. (The inventory's embedded
-  cross-reference scan only runs at ≤ 800 files; clusters/draft keep
-  their 3000 cap.)
-- Clusters and draft: 3000 files. Past it `clusters` refuses with
-  `similarity_cap` (draft: `corpus_too_big`) — partition
-  per-directory instead.
+  cross-reference scan only runs at ≤ 800 files.)
+- Clusters and draft: no cliff. Up to 3000 files the matcher is exact
+  all-pairs; past it it switches to candidate blocking (inverted
+  rare-token index, O(Σ rare-token²) instead of O(n²)), so 5k and 50k
+  corpora organize without `--force`. `similarity_cap` /
+  `corpus_too_big` fire only past the 50k memory bound, and `--force`
+  is the documented override — blocked pairs are always a subset of
+  what the full matcher would find, so a blocked cluster is never a
+  fabricated merge. Per-directory partitioning is still the cheap
+  first move for a huge pile; `--scope` is the cheap first move for a
+  huge tend.
+- The plan render paginates: a plan past 200 moves prints the per-
+  folder table as one summary row per destination (the whole approval
+  picture, ~n_destinations lines) plus the reference risk section on
+  stdout, with `"truncated": true` on the envelope. `plan render
+  --out <file>` always writes the FULL detail markdown and its
+  envelope names it in `payload.written_to` — read that file when the
+  summary is not enough. `plan validate --out` already carried the
+  full expanded moves.

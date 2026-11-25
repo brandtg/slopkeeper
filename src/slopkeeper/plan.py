@@ -118,6 +118,92 @@ def _keep_path(k) -> str | None:
     return None
 
 
+def normalize_scope(raw, root: Path) -> str:
+    """Validate and canonicalize plan.scope to a corpus-relative dir.
+
+    A bounded tend: the plan covers ONE subtree (the queue mechanism that
+    makes a 60k tree a sequence of small tends). The scope must be a
+    non-empty corpus-relative path that exists as a directory under the
+    root; `.` and the root itself are not scopes. Returns the posix path
+    with no trailing slash.
+    """
+    if raw is None:
+        raise SlopKeeperError(
+            "plan_scope_escape",
+            "plan.scope must be a corpus-relative directory, not empty",
+            'Set "scope": "<dir>" to a directory inside the corpus (the '
+            "subtree this bounded tend organizes), or drop the key to plan "
+            "the whole corpus.",
+        )
+    if not isinstance(raw, str) or not raw.strip():
+        raise SlopKeeperError(
+            "plan_scope_escape",
+            f"plan.scope must be a non-empty string (got {raw!r})",
+            'Set "scope": "<dir>" to a directory inside the corpus.',
+        )
+    rel = safe_relpath(raw, root).as_posix().rstrip("/")
+    if not (root / rel).is_dir():
+        raise SlopKeeperError(
+            "plan_scope_escape",
+            f"plan.scope {raw!r} is not a directory inside the corpus",
+            "Name an existing directory relative to the corpus root (see "
+            "slopkeeper inventory <root> --scope <dir>); a scope organizes "
+            "one subtree, it does not create one.",
+        )
+    return rel
+
+
+def _under_scope(rel: str, scope: str) -> bool:
+    """Is the corpus-relative path `rel` inside the scope directory?"""
+    return rel == scope or rel.startswith(scope + "/")
+
+
+def casefold_dst_collisions(root: Path, chains: dict[str, str]) -> list[dict]:
+    """Destinations that are distinct strings but collide case-insensitively.
+
+    On a mounted case-insensitive volume (a macOS/NTFS external drive) the
+    plan's exact-string dst checks (plan_dup_dst, plan_dst_exists) miss
+    `x.md` and `X.md` landing on one inode, or a destination differing from
+    an existing file only by case — both a silent clobber there. Returns
+    [{dst, conflicts_with}] for every such pair. Informational on a
+    case-sensitive filesystem (the warning); a refusal under --strict-case
+    for corpora destined for a mounted volume (P4, 6).
+    """
+    collisions: list[dict] = []
+    by_fold: dict[str, str] = {}
+    for _src, dst in chains.items():
+        fold = dst.casefold()
+        prior = by_fold.get(fold)
+        if prior is not None and prior != dst:
+            collisions.append({"dst": dst, "conflicts_with": prior})
+        else:
+            by_fold.setdefault(fold, dst)
+        # Destination that casefolds onto an EXISTING corpus file whose
+        # exact name differs — a clobber on a case-insensitive mount.
+        if not (root / dst).exists():
+            hit = _casefold_existing(root, dst)
+            if hit is not None:
+                collisions.append({"dst": dst, "conflicts_with": hit})
+    return collisions
+
+
+def _casefold_existing(root: Path, dst: str) -> str | None:
+    """An existing corpus file whose path casefolds to `dst` but differs."""
+    parent_rel = Path(dst).parent.as_posix()
+    parent = root if parent_rel in (".", "") else root / parent_rel
+    name = Path(dst).name
+    if not parent.is_dir():
+        return None
+    try:
+        siblings = {p.name for p in parent.iterdir()}
+    except OSError:
+        return None
+    for s in siblings:
+        if s != name and s.casefold() == name.casefold():
+            return f"{parent_rel}/{s}" if parent_rel not in (".", "") else s
+    return None
+
+
 def _reject_dead_glob_prefix_rewrites(
     root: Path, entries: list[dict], chains: dict[str, str]
 ) -> None:
@@ -269,6 +355,7 @@ def validate_plan(
     allow_partial: bool = False,
     require_based_on: bool = True,
     allow_symlinks: bool = False,
+    strict_case: bool = False,
 ) -> dict:
     """Validate a plan against the corpus on disk. Returns the normalized plan.
 
@@ -285,6 +372,16 @@ def validate_plan(
     allow_symlinks (CLI --allow-symlinks) lifts the A2 move-path
     symlink policy (models.safe_move_path) for deliberate traversal;
     default False refuses moves through or onto symlinks.
+
+    strict_case (CLI --strict-case, P4 6) refuses a plan whose
+    destinations collide case-insensitively (plan_dst_case_collision) —
+    the silent clobber on a case-insensitive mount. Off by default, where
+    the collision is reported as a warning the gate/envelope shows.
+
+    plan["scope"] (P4 2, corpus-relative dir) bounds the whole tend to one
+    subtree: coverage, stragglers, emptied-dir detection and apply's
+    fingerprint comparison all operate within scope, and a move that would
+    leave or enter the scope is refused (plan_scope_escape).
     """
     if plan.get("partial") is True:
         allow_partial = True
@@ -335,6 +432,16 @@ def validate_plan(
             "Regenerate or re-target the plan for this corpus.",
         )
 
+    # P4 (2): an optional scope bounds the whole tend to one subtree. The
+    # coverage/straggler/emptied-dir checks and apply's fingerprint gate
+    # then operate within scope, and moves that cross the boundary are
+    # refused (checked in _normalize_move and the rule expansion).
+    scope = plan.get("scope")
+    if scope is not None:
+        scope = normalize_scope(scope, root)
+        plan["scope"] = scope
+    scope_prefix = scope + "/" if scope else None
+
     # A1 (0.2.6): the corpus binding is MANDATORY. A plan without
     # based_on.corpus_fingerprint has no provenance — apply's staleness
     # gate read `if recorded:` and silently skipped itself, so a plan
@@ -378,6 +485,19 @@ def validate_plan(
         )
         if src == dst:
             raise SlopKeeperError("plan_noop_move", f"{label}: from == to ({src})")
+        if scope is not None and not (
+            _under_scope(src.as_posix(), scope) and _under_scope(dst.as_posix(), scope)
+        ):
+            # A bounded tend may not move a file into or out of its scope
+            # — that is a different subtree's business (and would make the
+            # scoped fingerprint gate lie about what it bound).
+            raise SlopKeeperError(
+                "plan_scope_escape",
+                f"{label}: move {src} → {dst} leaves or enters scope '{scope}'",
+                "A scoped plan may only move files that live entirely "
+                "inside its scope. Drop the move, or remove the plan's "
+                '"scope" key to tend the whole corpus.',
+            )
         if src in seen_src:
             raise SlopKeeperError("plan_dup_src", f"two moves share source {src}")
         if dst in seen_dst:
@@ -558,8 +678,11 @@ def validate_plan(
 
     if rules:
         # One corpus walk feeds every rule (only rule plans pay for it).
+        # A scoped plan expands rules WITHIN scope: a match outside it is
+        # not this tend's files (and a rule matching nothing in-scope
+        # refuses as plan_bad_rules — the clearer signal than an escape).
         visible: list[str] = []
-        for dirpath, _dirnames, filenames in corpus_walk(root):
+        for dirpath, _dirnames, filenames in corpus_walk(root, scope=scope):
             rel_dir = Path(dirpath).relative_to(root)
             for fn in filenames:
                 visible.append((rel_dir / fn).as_posix() if rel_dir.parts else fn)
@@ -682,6 +805,109 @@ def validate_plan(
             }
             for i, r in enumerate(rules)
         ]
+
+    # Dedup ops (P4, 4): `identical_groups` gains a plan affordance. A
+    # dedup is a journaled MOVE of the loser into a duplicates archive —
+    # never a delete — with the survivor (`keep`) named so the gate can
+    # show WHY this file leaves. The whole safety rests on the two really
+    # being byte-identical, so validate hashes both and refuses anything
+    # less; undo restores the loser by path (a move, so the journal and
+    # undo already cover it). It runs through the same `_normalize_move`
+    # as every other move, so chains, collisions, scope and the
+    # destination pre-flight all see it identically.
+    dedup_raw = plan.get("dedup") or []
+    if not isinstance(dedup_raw, list):
+        raise SlopKeeperError(
+            "plan_bad_dedup",
+            f"dedup must be a list of {{op, keep, drop, to}} objects, got "
+            f"{type(dedup_raw).__name__}",
+            'Declare "dedup": [{"op": "dedup", "keep": "a.md", '
+            '"drop": "copy_of_a.md", "to": "archive/duplicates/copy_of_a.md"}] '
+            "— or omit it.",
+        )
+    dedup_moves: list[dict] = []
+    for i, e in enumerate(dedup_raw):
+        if (
+            not isinstance(e, dict)
+            or set(e) - {"op", "keep", "drop", "to", "reason"}
+            or e.get("op") != "dedup"
+            or not isinstance(e.get("keep"), str)
+            or not e["keep"].strip()
+            or not isinstance(e.get("drop"), str)
+            or not e["drop"].strip()
+            or not isinstance(e.get("to"), str)
+            or not e["to"].strip()
+        ):
+            raise SlopKeeperError(
+                "plan_bad_dedup",
+                f'dedup[{i}] must be {{"op": "dedup", "keep", "drop", "to"}} '
+                f"strings, got {e!r}",
+                'Every dedup is {"op": "dedup", "keep": "<survivor>", '
+                '"drop": "<the copy that archives>", "to": "<fresh path, e.g. '
+                'archive/duplicates/<name>>"} — drop is a move, never a delete.',
+            )
+        keep_rel = safe_relpath(e["keep"], root)
+        drop_rel = safe_relpath(e["drop"], root)
+        if keep_rel == drop_rel:
+            raise SlopKeeperError(
+                "plan_bad_dedup",
+                f"dedup[{i}]: keep and drop are the same file ({keep_rel})",
+                "A dedup archives a COPY of keep; they must be two files.",
+            )
+        for which, rel in (("keep", keep_rel), ("drop", drop_rel)):
+            fp = corpus_path(root, rel)
+            if not fp.is_file():
+                raise SlopKeeperError(
+                    "plan_bad_dedup",
+                    f"dedup[{i}]: {which} is not an existing file: {rel}",
+                    "Both sides of a dedup must exist as files at plan time.",
+                )
+        if scope is not None and (
+            not _under_scope(drop_rel.as_posix(), scope)
+            or not _under_scope(safe_relpath(e["to"], root).as_posix(), scope)
+        ):
+            raise SlopKeeperError(
+                "plan_scope_escape",
+                f"dedup[{i}] archives outside scope '{scope}'",
+                "A scoped plan may only dedup files inside its scope.",
+            )
+        # The one thing that makes a dedup safe: identical bytes. A cap-
+        # free hash so a 2 MB difference past the first block never reads
+        # as "identical".
+        if sha256_file_exact(corpus_path(root, keep_rel)) != sha256_file_exact(
+            corpus_path(root, drop_rel)
+        ):
+            raise SlopKeeperError(
+                "plan_dedup_not_identical",
+                f"dedup[{i}]: drop {drop_rel} is not byte-identical to keep {keep_rel}",
+                "A dedup only ever archives a true duplicate (never a "
+                "delete), so the two must match exactly. Re-run `clusters` "
+                "to refresh identical_groups, or move the file as a normal "
+                "move if they are not in fact duplicates.",
+            )
+        m = _normalize_move(
+            {
+                "from": drop_rel.as_posix(),
+                "to": e["to"],
+                "reason": str(e.get("reason", "")).strip()
+                or f"dedup: byte-identical copy of {keep_rel.as_posix()}",
+            },
+            f"dedup[{i}]",
+        )
+        m["op"] = "dedup"
+        m["keep"] = keep_rel.as_posix()
+        normalized.append(m)
+        dedup_moves.append(m)
+    plan["dedup"] = [
+        {
+            "op": "dedup",
+            "keep": m["keep"],
+            "drop": m["from"],
+            "to": m["to"],
+            "reason": m["reason"],
+        }
+        for m in dedup_moves
+    ]
 
     # Prefix rewrites (optional, B8): declared renames of directories the
     # plan empties FILE BY FILE. Such a directory has no chain entry (no
@@ -821,6 +1047,27 @@ def validate_plan(
     # not only at execute — the shared pre-flight means validate/render
     # (the human gate) can never bless a plan apply would refuse.
     preflight_destinations(root, chains)
+
+    # P4 (6): case-insensitive destination collisions. On a case-sensitive
+    # filesystem this is a warning (the rows ride the envelope + the gate);
+    # on a corpus headed for a mounted case-insensitive volume --strict-case
+    # turns the silent clobber (x.md vs X.md onto one inode) into a refusal.
+    case_collisions = casefold_dst_collisions(root, chains)
+    if case_collisions:
+        plan["case_collisions"] = case_collisions
+        if strict_case:
+            sample = [
+                f"{c['dst']} ~ {c['conflicts_with']}" for c in case_collisions[:5]
+            ]
+            raise SlopKeeperError(
+                "plan_dst_case_collision",
+                f"{len(case_collisions)} destination(s) collide ignoring case "
+                f"(--strict-case): {sample}",
+                "On a case-insensitive volume these land on one file. Give "
+                "each destination a distinct name regardless of case, or drop "
+                "--strict-case if the corpus is only ever stored on a "
+                "case-sensitive filesystem.",
+            )
 
     # D2's validate-time gate: a prefix_rewrites entry whose glob/brace
     # citations cannot be coherently rewritten post-move is refused —
@@ -1043,11 +1290,15 @@ def validate_plan(
         )
     skip = set(skip_raw)
     for s in sorted(skip):
-        if not (root / s).exists():
+        skip_base = root if scope is None else root / scope
+        if not (skip_base / s).exists():
+            where = (
+                "the top level of the corpus" if scope is None else f"scope '{scope}'"
+            )
             raise SlopKeeperError(
                 "plan_bad_skip",
                 f"skip names a nonexistent entry: {s}",
-                "Skip only entries that exist at the top level of the corpus.",
+                f"Skip only entries that exist at {where}.",
             )
     plan["skip"] = sorted(skip)
 
@@ -1055,15 +1306,41 @@ def validate_plan(
     # unresolved (or named in skip). Nested entries are NOT individually
     # required — moving a directory covers its contents — but nothing
     # stops nested sources: a recursive sweep moves docs/x.md directly.
+    #
+    # With a scope (P4 2) the "top level" is the level directly under the
+    # scope: coverage, and the keep/unresolved bookkeeping it compares
+    # against, all operate within scope, so out-of-scope files are absent
+    # from coverage complaints (the queue-of-bounded-tends mechanism).
     if not allow_partial:
-        covered = {"."}
+        base = root if scope is None else root / scope
+
+        def _cov_key(p: str):
+            """The coverage key for a corpus-relative path: its first
+            component, taken below the scope when one is set."""
+            if scope is None:
+                parts = Path(p).parts
+            elif p == scope:
+                return None  # the scope dir itself is not a content entry
+            elif p.startswith(scope_prefix):
+                parts = Path(p[len(scope_prefix) :]).parts
+            else:
+                parts = Path(p).parts
+            return parts[0] if parts else None
+
+        covered = set()
         for m in normalized:
-            covered.add(Path(m["from"]).parts[0])
-            covered.add(Path(m["to"]).parts[0])  # destinations are covered too
+            k1 = _cov_key(m["from"])
+            k2 = _cov_key(m["to"])
+            if k1:
+                covered.add(k1)
+            if k2:
+                covered.add(k2)
         for e in plan["edits"]:
             if Path(e["file"]).is_absolute():
                 continue  # external edit: outside the corpus, covers nothing
-            covered.add(Path(e["file"]).parts[0])  # edited in place: covered
+            k = _cov_key(e["file"])
+            if k:
+                covered.add(k)  # edited in place: covered
 
         keeps = set()
         for k in plan.get("keep", []):
@@ -1074,13 +1351,15 @@ def validate_plan(
                     f"keep entry is neither a string nor a {{path}} object: {k!r}",
                     'Use "keep": ["name", {"path": "name", "reason": "..."}].',
                 )
-            keeps.add(Path(kp).parts[0])
+            ck = _cov_key(kp)
+            if ck:
+                keeps.add(ck)
         # The never-content set (tool layer + legacy state) is excluded from
         # coverage the way the old blanket dot-rule was — it is the walk
         # contract, not a plan decision. Everything else visible at the top
         # level must be covered.
         hidden = HIDDEN_SKIP_DIRS | {STATE_DIR}
-        for entry in list(root.iterdir()):
+        for entry in list(base.iterdir()):
             if entry.name in skip or entry.name in hidden:
                 continue  # declared skips and the never-content set are not content
             if entry.name.startswith(".") and not entry.is_dir():
@@ -1102,7 +1381,12 @@ def validate_plan(
                     for u in plan.get("unresolved", [])
                     if isinstance(u, dict)
                 }
-                if entry.name not in unresolved and entry.name not in keeps:
+                unresolved_keys = {_cov_key(str(u)) for u in unresolved}
+                if (
+                    entry.name not in unresolved
+                    and entry.name not in unresolved_keys
+                    and entry.name not in keeps
+                ):
                     raise SlopKeeperError(
                         "plan_incomplete",
                         f"top-level entry '{entry.name}' is not covered by moves, "
@@ -1175,6 +1459,10 @@ def straggler_report(root: Path, plan: dict) -> list[dict]:
     moves = plan.get("moves", [])
     if not moves:
         return []
+    # P4 (2): a scoped plan's stragglers are only the files left behind
+    # inside scope — siblings in another (untouched) scope are not this
+    # tend's leftovers.
+    scope = plan.get("scope")
     ignore = load_ignore(root)
     srcs = {m["from"] for m in moves}
     dir_srcs = {s for s in srcs if (root / s).is_dir()}
@@ -1183,7 +1471,9 @@ def straggler_report(root: Path, plan: dict) -> list[dict]:
         {
             str(Path(s).parent)
             for s in srcs
-            if s not in dir_srcs and not s.startswith(dir_src_prefixes)
+            if s not in dir_srcs
+            and not s.startswith(dir_src_prefixes)
+            and (scope is None or _under_scope(s, scope))
         }
     )
     exempt = set(srcs)
@@ -1269,7 +1559,7 @@ def dirs_emptied_by(root: Path, plan: dict) -> list[str]:
         return rel in file_srcs or rel.startswith(dir_src_prefixes)
 
     all_files: list[str] = []
-    for dirpath, _dirnames, filenames in corpus_walk(root):
+    for dirpath, _dirnames, filenames in corpus_walk(root, scope=plan.get("scope")):
         rel_dir = Path(dirpath).relative_to(root)
         for fn in filenames:
             all_files.append((rel_dir / fn).as_posix() if rel_dir.parts else fn)
@@ -1334,7 +1624,7 @@ def emptied_dir_suggestions(root: Path, plan: dict) -> list[dict]:
         return rel in file_srcs or rel.startswith(dir_src_prefixes)
 
     all_files: list[str] = []
-    for dirpath, _dirnames, filenames in corpus_walk(root):
+    for dirpath, _dirnames, filenames in corpus_walk(root, scope=plan.get("scope")):
         rel_dir = Path(dirpath).relative_to(root)
         for fn in filenames:
             all_files.append((rel_dir / fn).as_posix() if rel_dir.parts else fn)
@@ -1384,6 +1674,7 @@ def render_markdown(
     stragglers: list[dict] | None = None,
     code_anchor_risks: list[dict] | None = None,
     emptied_dirs: list[dict] | None = None,
+    summary_only: bool | None = None,
 ) -> str:
     """Human-gate document: grouped, risk-stamped, diff-friendly.
 
@@ -1419,6 +1710,12 @@ def render_markdown(
     _STRAGGLER_DIRS = 10
     _STRAGGLER_EXAMPLES = 5
     _REWRITE_ROW_CAP = 500
+    # P4 (3): a rule-expanded plan can carry tens of thousands of moves;
+    # past the cap the STDOUT render drops to the Summary table (where
+    # things go) and defers the per-move detail to `--out`. `summary_only`
+    # None means auto (the cap decides); callers pass True/False to force.
+    if summary_only is None:
+        summary_only = len(plan.get("moves", [])) > _MOVE_TABLE_CAP
 
     def _cell(text: object) -> str:
         """Table-cell-safe inline code: backticks and pipes out."""
@@ -1497,6 +1794,14 @@ def render_markdown(
         f"- Moves: {len(moves)} · Folders: {len(plan.get('folders', []))} "
         f"· Unresolved: {len(plan.get('unresolved', []))}"
     )
+    if plan.get("dedup"):
+        lines.append(f"- Duplicates to archive: {len(plan['dedup'])}")
+    if plan.get("scope"):
+        # A bounded tend names its subtree at the top of the gate.
+        lines.append(
+            f"- **Scope: `{plan['scope']}/`** — only this subtree is "
+            "tended; sibling scopes are untouched."
+        )
     for r in plan.get("rules") or []:
         # Phase 8: the rule itself is summarized; the concrete moves it
         # expanded into are listed in the tables below — the human
@@ -1565,22 +1870,44 @@ def render_markdown(
             lines.append(f"| `{folder}/` | {len(by_folder[folder])} |")
         lines.append("")
 
+    # P4 (4): dedup ops are moves that archive a byte-identical COPY (the
+    # survivor `keep` stays put) — rendered as their own section so the
+    # gate shows WHAT is being archived and WHAT it duplicates, never as
+    # an anonymous move into archive/duplicates/.
+    dedups = plan.get("dedup") or []
+    if dedups:
+        lines.append("## ♻️ Duplicates to archive (dedup — never deleted)")
+        lines.append("")
+        lines.append("| copy (moves) | → to | duplicate of (stays) |")
+        lines.append("|---|---|---|")
+        for d in dedups:
+            lines.append(f"| `{d['drop']}` | `{d['to']}` | `{d['keep']}` |")
+        lines.append("")
+        lines.append(
+            "Each row is a journaled MOVE of an exact byte-identical copy "
+            "into the duplicates archive; the named `duplicate of` file "
+            "stays as the survivor and `undo` restores the copy exactly. "
+            "Nothing is deleted."
+        )
+        lines.append("")
+
     refs = reference_report or {}
-    rows_shown = 0
-    truncated = False
-    for folder in sorted(by_folder):
-        if rows_shown >= _MOVE_TABLE_CAP:
-            truncated = True
-            break  # never an empty table for a starved folder
+    if summary_only:
+        # P4 (3): past the cap the terminal render stays skimmable — the
+        # complete Summary table above, plus a pointer to the full list.
+        lines.append(
+            f"_{len(moves)} moves — per-move detail omitted (over the "
+            f"{_MOVE_TABLE_CAP}-move gate limit). Full detail: "
+            "`plan render --out <file>` (the file always carries every "
+            "move) or `plan validate --out <file>`._"
+        )
+        lines.append("")
+    for folder in [] if summary_only else sorted(by_folder):
         lines.append(f"## → `{folder}/`")
         lines.append("")
         lines.append("| from | final | refs | reason |")
         lines.append("|---|---|---|---|")
         for m in sorted(by_folder[folder], key=lambda x: x["from"]):
-            if rows_shown >= _MOVE_TABLE_CAP:
-                truncated = True
-                break
-            rows_shown += 1
             # ref_report is keyed by move SOURCE PATH (cli.py cmd_plan_render);
             # fall back to basename for hand-built basename-keyed reports.
             # Looking up by basename alone hid the risk for every nested
@@ -1597,16 +1924,11 @@ def render_markdown(
                 n = r.get("external_references", 0)
             ref_cell = f"⚠️ {n}" if n else "—"
             reason = (m.get("reason") or "").replace("|", "\\|")
+            if m.get("op") == "dedup":
+                reason = (reason or "dedup").replace("|", "\\|") + " ♻️"
             if m.get("rewrite") is False:
                 reason = (reason + " [rewrite: off]").strip()
             lines.append(f"| `{m['from']}` | `{m['final']}` | {ref_cell} | {reason} |")
-        lines.append("")
-    if truncated:
-        lines.append(
-            f"(showing the first {rows_shown} of {len(moves)} moves — the "
-            "Summary table above is complete; full list in the validated "
-            "plan JSON: `plan validate --out`)"
-        )
         lines.append("")
 
     if stragglers:
@@ -1971,11 +2293,18 @@ def load_render_sidecar(root: Path) -> dict | None:
 PLAN_TEMPLATE = {
     "schema": PLAN_SCHEMA,
     "corpus_root": "/absolute/path/to/corpus",
-    "strategy": "role-bots|topics|projects|hybrid",
+    "strategy": "role-bots|topics|projects|by-kind|hybrid",
+    # Bounded tend (P4, 2): organize ONE subtree, leave siblings alone.
+    # Coverage, stragglers, emptied-dir detection and the fingerprint gate
+    # all operate inside scope; a move that crosses the boundary is refused
+    # (plan_scope_escape). Author against `inventory <root> --scope <dir>`.
+    # Drop the key to plan the whole corpus.
+    "scope": None,
     # MANDATORY (A1, 0.2.6): validate and apply refuse a plan without a
     # real corpus_fingerprint (plan_no_based_on); `plan render` shows a
     # loud warning block instead of back-filling one. Record the value
-    # from `slopkeeper inventory <root> --fast --summary`.
+    # from `slopkeeper inventory <root> --fast --summary` (with --scope,
+    # the value from `inventory <root> --scope <dir> --summary`).
     "based_on": {
         "corpus_fingerprint": "<from inventory.fingerprint>",
         "inventory_at": "<iso timestamp>",
@@ -1987,6 +2316,12 @@ PLAN_TEMPLATE = {
             "reason": "one line, shown to the human",
         }
     ],
+    # Duplicate copies (P4, 4): archive a byte-identical copy (a move,
+    # never a delete; undo restores). validate verifies keep and drop are
+    # the same bytes; `clusters`' identical_groups is the source. Empty,
+    # not an example: a template dedup would refuse on missing files, so
+    # the shape is documented in AGENT_GUIDE.md ("Duplicate copies").
+    "dedup": [],
     # Empty, not an example: a template rule would fire plan_bad_rules
     # (matched no visible files) on every corpus. The shape is documented
     # in AGENT_GUIDE.md ("Rule-based moves").
