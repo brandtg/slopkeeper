@@ -43,7 +43,7 @@ import unicodedata
 from pathlib import Path
 
 from . import kinds, scan
-from .models import HIDDEN_SKIP_DIRS, SlopKeeperError
+from .models import HIDDEN_SKIP_DIRS, SlopKeeperError, resolve_chains
 
 
 # Extensions we are willing to read for reference scanning. The table
@@ -2684,3 +2684,781 @@ def check_edits_after_rewrites(
                 f"find text occurs {n} times in {f}",
                 "Make the find text unique, or split the edit.",
             )
+
+
+# --- import citations (P6 Slice A): a citation kind of its own ----------------
+#
+# `import utils.helpers` names `utils/helpers.py` as surely as a markdown
+# link names `docs/api.md`, and moving that file breaks it. It is still a
+# DIFFERENT kind of citation for this tool, in two ways that decide the
+# whole design:
+#
+#   * The rewrite pass NEVER rewrites an import. A dotted module path is
+#     not a path token (`utils.helpers` has no slash and no extension, so
+#     the token engine never sees it), and a language-safe edit of a module
+#     path is AST work the core does not do. So the pass's promise — every
+#     citation of a moved path gets fixed — does not reach here, and the
+#     honest thing is to price the cost BEFORE the human approves rather
+#     than discover it after.
+#   * An unresolved import is the NORMAL case, never a defect: stdlib and
+#     third-party packages name nothing in the corpus. So "resolved" is a
+#     fact about the corpus and no surface here ever refuses a tend for it.
+#
+# Detection is a per-language statement grammar (regex, deliberately not a
+# parser: this is a hint surface, and the audit keeps AST work out of the
+# stdlib-only core) plus a module-path to tree-path resolver:
+#
+#   python   `import a.b.c`, `from a.b import c, d`, `from . import x`,
+#            `importlib.import_module("a.b")` — a dotted name resolves
+#            against the corpus root, the usual package roots (`src`,
+#            `lib`), the citing file's own directory and its parent, and
+#            finally any corpus directory that could serve as the package
+#            root. Leading dots resolve where they mean to: up from the
+#            citing file.
+#   js/ts    `import x from "./y"`, `require("./y")`, `import("./y")`,
+#            `export * from "./y"` — only RELATIVE specifiers are corpus
+#            citations (a bare specifier names a package); resolved with
+#            the usual extension and `index.*` fallbacks.
+#   go       `import "example.com/m/pkg/util"` and the grouped form —
+#            resolved to a package DIRECTORY, through the `go.mod` module
+#            prefix when one is present.
+#   rust     `mod foo;` (a sibling `foo.rs` / `foo/mod.rs`) and
+#            `use crate::a::b;` / `use self::x;` / `use a::b;` (the first
+#            segment being the crate name, dropped) under the crate root.
+#
+# Every rule is report-only. Nothing here is wired into `plan_rewrites`:
+# the rewrite engine has zero knowledge of imports, and
+# tests/test_p6_imports.py pins that an import line never appears in
+# `would_rewrite`.
+
+
+IMPORT_LANG_BY_EXT: dict[str, str] = {
+    ".py": "python",
+    ".js": "js",
+    ".jsx": "js",
+    ".mjs": "js",
+    ".cjs": "js",
+    ".ts": "js",
+    ".tsx": "js",
+    ".go": "go",
+    ".rs": "rust",
+}
+
+# A statement scan reads a code file under the same per-file cap as every
+# other citation surface (`_scan_bytes`), and one file can carry at most
+# this many import statements before the rest stop being evidence and start
+# being noise (a generated stub is one file, not a dependency graph).
+_MAX_IMPORTS_PER_FILE = 256
+# Gate evidence rows per move, and importer names per move — display
+# bounds, like every other cap in this module; the COUNTS stay exact.
+_MAX_IMPORT_EVIDENCE = 12
+_MAX_IMPORT_IMPORTERS = 20
+
+_PY_COMMENT_RE = re.compile(r"\s+#.*$")
+_PY_FROM_RE = re.compile(
+    r"^[ \t]*from[ \t]+(\.+[A-Za-z_]\w*|\.+|[A-Za-z_]\w*(?:\.\w+)*)"
+    r"[ \t]*import\b[ \t]*(.*)$"
+)
+_PY_IMPORT_RE = re.compile(r"^[ \t]*import[ \t]+(.+)$")
+_PY_DYN_RE = re.compile(r"""import_module\(\s*['"]([^'"]+)['"]""")
+_PY_DOTTED_RE = re.compile(r"^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*$")
+_PY_IDENT_RE = re.compile(r"^[A-Za-z_]\w*$")
+
+_JS_QUOTED_RE = re.compile(
+    r"""(?:\bfrom[ \t]+|(?<!\S)import[ \t]+|\brequire[ \t]*\([ \t]*"""
+    r"""|import[ \t]*\([ \t]*)['"]([^'"\n]+)['"]"""
+)
+_LINE_COMMENT_RE = re.compile(r"(?:^|(?<=\s))//.*$")
+_JS_EXTS = (
+    "",
+    ".ts",
+    ".tsx",
+    ".js",
+    ".jsx",
+    ".mjs",
+    ".cjs",
+    ".json",
+    ".vue",
+    ".svelte",
+    ".css",
+)
+_JS_INDEXES = (
+    "index.ts",
+    "index.tsx",
+    "index.js",
+    "index.jsx",
+    "index.mjs",
+    "index.cjs",
+    "index.vue",
+)
+
+_GO_IMPORT_ONE_RE = re.compile(
+    r"^[ \t]*(?:[\w.][\w.-]*[ \t]+)?import[ \t]+\"([^\"]+)\""
+)
+_GO_BLOCK_OPEN_RE = re.compile(r"^[ \t]*import[ \t]*\(")
+_GO_BLOCK_ITEM_RE = re.compile(r"^[ \t]*(?:[\w.][\w.-]*[ \t]+)?\"([^\"]+)\"")
+_GO_BLOCK_CLOSE_RE = re.compile(r"^[ \t]*\)")
+_GO_MODULE_RE = re.compile(r"^module[ \t]+([^\s/][^\s]*)", re.M)
+
+_RS_MOD_RE = re.compile(
+    r"^[ \t]*(?:(?:pub|unsafe)(?:\([^)]*\))?[ \t]+)*mod[ \t]+(\w+)[ \t]*;"
+)
+_RS_USE_RE = re.compile(
+    r"^[ \t]*(?:pub[ \t]+)?use[ \t]+(?:::)?([A-Za-z_]\w*(?:::[A-Za-z_0-9]\w*)*)"
+)
+
+
+def _tail_matches(dir_path: str, tail: str) -> bool:
+    """True when `dir_path` ends with the multi-segment `tail`."""
+    return dir_path == tail or dir_path.endswith("/" + tail)
+
+
+def _py_name_list(rest: str) -> tuple[str, ...]:
+    """The imported names of a from-import (parenthesized or not).
+
+    `as` aliases and `*` are dropped: an alias renames the binding, not
+    the module, and a star import names every module the package provides,
+    which is no single file.
+    """
+    rest = rest.strip()
+    if rest.startswith("("):
+        rest = rest[1:]
+    if rest.endswith(")"):
+        rest = rest[:-1]
+    out: list[str] = []
+    for part in rest.split(","):
+        name = part.strip().split(" as ")[0].strip()
+        if _PY_IDENT_RE.match(name):
+            out.append(name)
+    return tuple(out)
+
+
+def _python_sites(lines: list[str]) -> list[tuple[int, str, str, tuple[str, ...]]]:
+    """(line, form, spec, names) for every python import statement.
+
+    form is `py_module` (absolute dotted name), `py_relative` (leading
+    dots: the spec keeps them and the resolver reads them as up-levels
+    from the citing file) or `py_dynamic` (importlib.import_module).
+    A from-import carries its names so the resolver can prefer the most
+    SPECIFIC file that exists — `from pkg import mod` is `pkg/mod.py`, not
+    `pkg/__init__.py`, when both do.
+    """
+    out: list[tuple[int, str, str, tuple[str, ...]]] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        no = i + 1
+        code = _PY_COMMENT_RE.sub("", lines[i])
+        m = _PY_FROM_RE.match(code)
+        if m:
+            mod, rest = m.group(1), m.group(2).strip()
+            if rest.startswith("(") and ")" not in rest:
+                # `from a import (` opens a continuation run: read on until
+                # the closing paren, bounded so a torn file cannot swallow
+                # the whole module.
+                j = i
+                while ")" not in rest and j + 1 < n and j - i < 40:
+                    j += 1
+                    rest += " " + _PY_COMMENT_RE.sub("", lines[j])
+            form = "py_relative" if mod.startswith(".") else "py_module"
+            out.append((no, form, mod, _py_name_list(rest)))
+        else:
+            m = _PY_IMPORT_RE.match(code)
+            if m:
+                for part in m.group(1).split(","):
+                    name = part.strip().split(" as ")[0].strip()
+                    if _PY_DOTTED_RE.match(name):
+                        out.append((no, "py_module", name, ()))
+            for dyn in _PY_DYN_RE.finditer(code):
+                if _PY_DOTTED_RE.match(dyn.group(1)):
+                    out.append((no, "py_dynamic", dyn.group(1), ()))
+        i += 1
+    return out
+
+
+def _js_sites(lines: list[str]) -> list[tuple[int, str, str, tuple[str, ...]]]:
+    """(line, form, spec, names) for relative js/ts module specifiers."""
+    out: list[tuple[int, str, str, tuple[str, ...]]] = []
+    seen: set[tuple[int, str]] = set()
+    for i, line in enumerate(lines, 1):
+        code = _LINE_COMMENT_RE.sub("", line)
+        for m in _JS_QUOTED_RE.finditer(code):
+            spec = m.group(1)
+            if not spec.startswith(("./", "../", "/")):
+                continue  # a bare specifier names a package, not the corpus
+            if (i, spec) in seen:
+                continue
+            seen.add((i, spec))
+            out.append((i, "js_relative", spec, ()))
+    return out
+
+
+def _go_sites(lines: list[str]) -> list[tuple[int, str, str, tuple[str, ...]]]:
+    """(line, form, spec, names) for go import paths, both statement forms."""
+    out: list[tuple[int, str, str, tuple[str, ...]]] = []
+    in_block = False
+    for i, line in enumerate(lines, 1):
+        code = _LINE_COMMENT_RE.sub("", line)
+        if in_block:
+            if _GO_BLOCK_CLOSE_RE.match(code):
+                in_block = False
+                continue
+            m = _GO_BLOCK_ITEM_RE.match(code)
+            if m:
+                out.append((i, "go_package", m.group(1), ()))
+            continue
+        if _GO_BLOCK_OPEN_RE.match(code):
+            in_block = True
+            continue
+        m = _GO_IMPORT_ONE_RE.match(code)
+        if m:
+            out.append((i, "go_package", m.group(1), ()))
+    return out
+
+
+def _rust_sites(lines: list[str]) -> list[tuple[int, str, str, tuple[str, ...]]]:
+    """(line, form, spec, names) for rust `mod` and `use` paths."""
+    out: list[tuple[int, str, str, tuple[str, ...]]] = []
+    for i, line in enumerate(lines, 1):
+        code = _LINE_COMMENT_RE.sub("", line)
+        m = _RS_MOD_RE.match(code)
+        if m:
+            out.append((i, "rs_mod", m.group(1), ()))
+            continue
+        m = _RS_USE_RE.match(code)
+        if m and "::" in m.group(1):
+            # A single-segment `use serde;` names a crate, not a module.
+            out.append((i, "rs_use", m.group(1), ()))
+    return out
+
+
+_LANG_SCANNERS = {
+    "python": _python_sites,
+    "js": _js_sites,
+    "go": _go_sites,
+    "rust": _rust_sites,
+}
+
+
+class ImportResolver:
+    """Module-path to tree-path resolution over a CitationIndex.
+
+    Holds the derived tables a scan needs once (corpus directories by
+    their last segment, the go module prefix, the rust crate root) and
+    memoizes every resolution: a package imports the same module from a
+    hundred files, and re-resolving it a hundred times is pure waste. The
+    cache is per instance, which is exactly right — the post-move
+    re-resolution `import_move_risks` does builds a SECOND resolver over
+    the post-move index and must not read through the pre-move answers.
+    """
+
+    def __init__(
+        self,
+        index: CitationIndex,
+        go_module: str | None = None,
+        max_cache: int = 200_000,
+    ):
+        self.index = index
+        self.go_module = go_module
+        self.crate_root = "src" if index.match_dir("src") else ""
+        self._by_last: dict[str, list[str]] = {}
+        for d in index.dirs:
+            self._by_last.setdefault(d.rsplit("/", 1)[-1], []).append(d)
+        self._cache: dict[tuple, str | None] = {}
+        self._max_cache = max_cache
+
+    def _file(self, base: str, rel: str) -> str | None:
+        """A corpus FILE at `base/rel`, or that path as a corpus directory."""
+        joined = "/".join(p for p in (base, rel) if p)
+        if not joined:
+            return None
+        hit = self.index.match_path(joined)
+        if hit is not None:
+            return hit
+        return self.index.match_dir(joined)
+
+    def _module(self, base: str, segs: list[str]) -> str | None:
+        """The corpus file a dotted module names under `base`.
+
+        The two shapes python actually stores a module in — `a/b.py` and
+        the package `a/b/__init__.py` — then the bare directory (an
+        import of a namespace package, or `from pkg import subpackage`).
+        """
+        rel = "/".join(p for p in (base, *segs) if p)
+        if not rel:
+            return None
+        for cand in (f"{rel}.py", f"{rel}/__init__.py", rel):
+            hit = self.index.match_path(cand)
+            if hit is not None:
+                return hit
+            hit = self.index.match_dir(cand)
+            if hit is not None:
+                return hit
+        return None
+
+    def _nearest(self, hits: list[str], citing_dir: str) -> str | None:
+        """The candidate sharing the longest dir prefix with the citer.
+
+        The last-resort leg of python and go resolution finds every corpus
+        directory that could serve as the package root; `a/b` under `x/`
+        and under `y/` is genuinely ambiguous, and the one closest to the
+        citing file is what a tool-chain would reach for. Ties break by
+        path sort, so the answer is deterministic across runs.
+        """
+        if not hits:
+            return None
+        if len(hits) == 1:
+            return hits[0]
+        cur = citing_dir.split("/") if citing_dir else []
+
+        def key(d: str) -> tuple:
+            common = 0
+            for a, b in zip(cur, d.split("/")):
+                if a != b:
+                    break
+                common += 1
+            return (-common, d)
+
+        return sorted(hits, key=key)[0]
+
+    def resolve_python(
+        self, form: str, spec: str, names: tuple[str, ...], citing_dir: str
+    ) -> str | None:
+        """The most SPECIFIC corpus file a python import names.
+
+        `from pkg import mod` prefers `pkg/mod.py` over `pkg/__init__.py`,
+        because that is the file the statement actually loads; a name that
+        turns out to be a function inside the module falls through to the
+        module itself. That ordering is the whole reason the imported
+        NAMES are captured at all.
+        """
+        dotted: list[str] = []
+        base = ""
+        if form == "py_relative":
+            dots = len(spec) - len(spec.lstrip("."))
+            tail = spec.lstrip(".")
+            up = citing_dir.split("/") if citing_dir else []
+            if dots > 1:
+                up = up[: len(up) - (dots - 1)]
+            base = "/".join(up)
+            dotted.extend(f"{tail}.{n}" if tail else n for n in names)
+            if tail:
+                dotted.append(tail)
+            legs: list[str] = [base]
+        else:
+            dotted.extend(f"{spec}.{n}" for n in names)
+            dotted.append(spec)
+            legs = ["", "src", "lib"]
+            if citing_dir:
+                legs.append(citing_dir)
+                parent = _parent(citing_dir)
+                if parent not in legs:
+                    legs.append(parent)
+        for cand in dotted:
+            segs = cand.split(".")
+            for leg in legs:
+                hit = self._module(leg, segs)
+                if hit is not None:
+                    return hit
+            if form == "py_relative":
+                continue
+            # Last resort: any corpus directory that could serve as the
+            # package root — a repo whose package lives under myproj/ has
+            # no sys.path-adjacent answer above.
+            roots = self._by_last.get(segs[0], [])
+            hits = sorted({h for h in (self._module(d, segs[1:]) for d in roots) if h})
+            if hits:
+                near = self._nearest(hits, citing_dir)
+                if near is not None:
+                    return near
+        return None
+
+    def resolve_js(self, spec: str, citing_dir: str) -> str | None:
+        """A relative specifier against the citing file's own directory."""
+        if spec.startswith("/"):
+            rel = spec.lstrip("/")
+        else:
+            rel = posixpath.normpath("/".join([p for p in (citing_dir, spec) if p]))
+        if rel.startswith("..") or rel in (".", ""):
+            return None  # resolves outside the corpus root
+        for ext in _JS_EXTS:
+            hit = self.index.match_path(rel + ext)
+            if hit is not None:
+                return hit
+        for idx in _JS_INDEXES:
+            hit = self.index.match_path(f"{rel}/{idx}")
+            if hit is not None:
+                return hit
+        return self.index.match_dir(rel)
+
+    def resolve_go(self, spec: str, citing_dir: str) -> str | None:
+        """A module-qualified import path as a package DIRECTORY.
+
+        A go import names a directory, not a file (every `.go` file in the
+        package is one import unit), so the target is the dir and moving
+        any single file inside it is free while renaming the dir is not.
+        """
+        s = spec[len("vendor/") :] if spec.startswith("vendor/") else spec
+        cands: list[str] = []
+        if self.go_module and s.startswith(self.go_module + "/"):
+            cands.append(s[len(self.go_module) + 1 :])
+        cands.append(s)
+        for c in cands:
+            if not c:
+                continue
+            hit = self.index.match_dir(c)
+            if hit is not None:
+                return hit
+        tail = "/".join(s.rsplit("/", 2)[-2:]) if s.count("/") >= 1 else s
+        hits = sorted(
+            {
+                d
+                for d in self._by_last.get(tail.rsplit("/", 1)[-1], [])
+                if _tail_matches(d, tail)
+            }
+        )
+        if hits:
+            return self._nearest(hits, citing_dir)
+        return None
+
+    def resolve_rust(self, form: str, spec: str, citing_dir: str) -> str | None:
+        if form == "rs_mod":
+            for base in (citing_dir, self.crate_root, ""):
+                for rel in (f"{spec}.rs", f"{spec}/mod.rs"):
+                    hit = self._file(base, rel)
+                    if hit is not None:
+                        return hit
+            return None
+        segs = spec.split("::")
+        if segs[0] == "crate":
+            base, segs = self.crate_root, segs[1:]
+        elif segs[0] == "self":
+            base, segs = citing_dir, segs[1:]
+        elif segs[0] == "super":
+            base, segs = _parent(citing_dir), segs[1:]
+        else:
+            # The first segment is the crate name: a corpus path only makes
+            # sense underneath the crate root.
+            base, segs = self.crate_root, segs[1:]
+        if not segs:
+            return None
+        rel = "/".join(segs)
+        for cand in (f"{rel}.rs", f"{rel}/mod.rs"):
+            hit = self._file(base, cand)
+            if hit is not None:
+                return hit
+        return self.index.match_dir("/".join([p for p in (base, rel) if p]))
+
+    def resolve(
+        self,
+        lang: str,
+        form: str,
+        spec: str,
+        names: tuple[str, ...],
+        citing_dir: str,
+    ) -> str | None:
+        key = (lang, form, spec, names, citing_dir)
+        if key in self._cache:
+            return self._cache[key]
+        if lang == "python":
+            hit = self.resolve_python(form, spec, names, citing_dir)
+        elif lang == "js":
+            hit = self.resolve_js(spec, citing_dir)
+        elif lang == "go":
+            hit = self.resolve_go(spec, citing_dir)
+        elif lang == "rust":
+            hit = self.resolve_rust(form, spec, citing_dir)
+        else:
+            hit = None
+        if len(self._cache) < self._max_cache:
+            self._cache[key] = hit
+        return hit
+
+
+def _go_module_prefix(root: Path, rel_paths: list[Path]) -> str | None:
+    """The module path from the corpus root's go.mod, when there is one.
+
+    One bounded read, and only when the corpus actually holds go files:
+    without it an import path cannot become a corpus directory, because a
+    go import is module-qualified (`example.com/m/pkg/util` for the
+    corpus-relative `pkg/util`).
+    """
+    if not any(p.suffix.lower() == ".go" for p in rel_paths):
+        return None
+    try:
+        text = (root / "go.mod").read_bytes()[:8192].decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    m = _GO_MODULE_RE.search(text)
+    return m.group(1).strip().rstrip("/") if m else None
+
+
+def import_sites(
+    root: Path,
+    rel_paths: list[Path],
+    truncated: list[str] | None = None,
+    index: CitationIndex | None = None,
+) -> dict:
+    """Every import statement in the corpus's code files, with its target.
+
+    Returns {"sites": [{file, line, text, lang, spec, form, names,
+    target}], "stats": {...}}. `target` is the corpus file or directory the
+    statement names, or None: an import of `os`, `react` or `serde`
+    resolves to nothing in the corpus, and that is normal — it is counted
+    (`stats.unresolved`) and never an error. Self-imports are dropped (a
+    file does not cite itself, and `from . import sibling` inside a
+    package's own `__init__.py` is that case).
+
+    Only the languages this module speaks a grammar for are read
+    (`IMPORT_LANG_BY_EXT`), under the shared per-file read cap; the stats
+    name how many files were scanned, so a zero is never read as a census.
+    """
+    root = Path(root)
+    if index is None:
+        index = CitationIndex(rel_paths)
+    resolver = ImportResolver(index, go_module=_go_module_prefix(root, rel_paths))
+    sites: list[dict] = []
+    files_scanned = 0
+    langs: dict[str, int] = {}
+    resolved = 0
+    over_cap: list[str] = [] if truncated is None else truncated
+    for tp in rel_paths:
+        lang = IMPORT_LANG_BY_EXT.get(tp.suffix.lower())
+        if lang is None:
+            continue
+        raw = _scan_bytes(root, tp, over_cap)
+        if raw is None:
+            continue
+        try:
+            text = raw.decode("utf-8", errors="replace")
+        except Exception:
+            continue
+        files_scanned += 1
+        lines = text.splitlines()
+        rel_str = tp.as_posix()
+        citing_dir = _parent(rel_str)
+        for line_no, form, spec, names in _LANG_SCANNERS[lang](lines)[
+            :_MAX_IMPORTS_PER_FILE
+        ]:
+            target = resolver.resolve(lang, form, spec, names, citing_dir)
+            if target == rel_str:
+                target = None
+            sites.append(
+                {
+                    "file": rel_str,
+                    "line": line_no,
+                    "text": lines[line_no - 1].strip()[:_SNIPPET_CAP],
+                    "lang": lang,
+                    "spec": spec,
+                    "form": form,
+                    "names": list(names),
+                    "target": target,
+                }
+            )
+            if target is not None:
+                resolved += 1
+            langs[lang] = langs.get(lang, 0) + 1
+    return {
+        "sites": sites,
+        "stats": {
+            "files_scanned": files_scanned,
+            "statements": len(sites),
+            "resolved": resolved,
+            "unresolved": len(sites) - resolved,
+            "langs": dict(sorted(langs.items())),
+            "truncated_files": len(set(over_cap)),
+        },
+    }
+
+
+def scan_imports(
+    root: Path,
+    rel_paths: list[Path],
+    truncated: list[str] | None = None,
+) -> dict:
+    """{target: [import rows]} + a "stats" key — the import cross-reference.
+
+    The import sibling of `scan_references`: path-keyed, so an import of
+    anything under a moved DIRECTORY keys the directory (a rename breaks
+    every import of it), in the same map shape an agent already reads for
+    prose citations.
+    """
+    scanned = import_sites(root, rel_paths, truncated)
+    edges: dict[str, list[dict]] = {}
+    for row in scanned["sites"]:
+        target = row["target"]
+        if target is None:
+            continue
+        bucket = edges.setdefault(target, [])
+        if len(bucket) < _MAX_MENTIONS_PER_TARGET:
+            bucket.append(row)
+    out = {k: v for k, v in edges.items() if v}
+    out["stats"] = scanned["stats"]
+    return out
+
+
+def import_citation_lines(
+    root: Path,
+    name: str,
+    rel_paths: list[Path],
+    per_file_cap: int = 5,
+    truncated: list[str] | None = None,
+    sites: list[dict] | None = None,
+) -> list[dict]:
+    """Import sites naming `name`: {file, line, text, kind: "import"}.
+
+    `name` resolves through the SAME `_resolve` the citation scan uses
+    (corpus path, suffix, directory or unambiguous basename), and a
+    DIRECTORY name matches imports of anything under it — the same
+    aggregation `citation_lines` applies, so `refs` names the same files
+    for an import edge as for a prose one. `sites` lets a caller that
+    already ran the scan hand its rows over instead of reading the corpus
+    a second time.
+    """
+    index = CitationIndex(rel_paths)
+    resolved = _resolve(name, index)
+    if resolved is None or resolved[0] == "ambiguous":
+        return []
+    target = resolved[1]
+    is_dir = resolved[0] == "dir"
+    child_prefix = target.rstrip("/") + "/"
+    if sites is None:
+        sites = import_sites(root, rel_paths, truncated)["sites"]
+    out: list[dict] = []
+    per_file: dict[str, int] = {}
+    for row in sites:
+        t = row["target"]
+        if t is None or row["file"] == target:
+            continue
+        if not (t == target or (is_dir and t.startswith(child_prefix))):
+            continue
+        n = per_file.get(row["file"], 0)
+        if n >= per_file_cap:
+            continue
+        per_file[row["file"]] = n + 1
+        out.append(
+            {
+                "file": row["file"],
+                "line": row["line"],
+                "text": row["text"],
+                "kind": "import",
+                "import_lang": row["lang"],
+                "spec": row["spec"],
+            }
+        )
+    return out
+
+
+def _move_covering(target: str, srcs: set[str]) -> str | None:
+    """The plan move that relocates `target` — its own entry or an ancestor.
+
+    Deepest first: a plan that moves both `pkg/` and `pkg/internal/`
+    governs `pkg/internal/x.py` through the more specific entry, which is
+    the one the executor orders last and the one the human should see.
+    """
+    parts = target.split("/")
+    for i in range(len(parts), 0, -1):
+        cand = "/".join(parts[:i])
+        if cand in srcs:
+            return cand
+    return None
+
+
+def import_move_risks(
+    root: Path,
+    plan: dict,
+    rel_paths: list[Path] | None = None,
+) -> list[dict]:
+    """Informational `import_risk` rows for validate and the human gate.
+
+    The question is not "does the path move" but "does the statement still
+    RESOLVE after it does": every import whose target a move touches is
+    re-resolved against the POST-move index, from the importer's post-move
+    directory.
+
+      - still names exactly the moved file — the move costs nothing here
+        (a directory renamed around its importers keeps their relative and
+        package-internal statements resolving), so the row is dropped;
+      - `stale` — resolves to nothing: the code will not import it any
+        more, and the rewrite pass will never fix it;
+      - `retargeted` — resolves to a DIFFERENT file: the statement still
+        runs and now means something else, the worse failure and the one
+        nobody notices.
+
+    Never blocks, never rewrites: these are rows for the gate to show and
+    the human to weigh. A plan whose moves are malformed is validate's
+    problem, not this function's — it reports no rows and moves on.
+    """
+    moves = [m for m in (plan.get("moves") or []) if isinstance(m, dict)]
+    if not moves:
+        return []
+    try:
+        chains = resolve_chains(moves)
+    except SlopKeeperError:
+        return []
+    root = Path(root)
+    if rel_paths is None:
+        rel_paths = list(scan.iter_rel_paths(root))
+    sites = import_sites(root, rel_paths)["sites"]
+    if not sites:
+        return []
+    srcs = set(chains)
+    touched = [
+        (s, _move_covering(s["target"], srcs))
+        for s in sites
+        if s["target"] and _move_covering(s["target"], srcs)
+    ]
+    if not touched:
+        return []
+    post = CitationIndex(
+        [Path(_post_move_path(p.as_posix(), chains)) for p in rel_paths]
+    )
+    post_resolver = ImportResolver(post, go_module=_go_module_prefix(root, rel_paths))
+    rows: dict[str, dict] = {}
+    for s, src in touched:
+        want = _post_move_path(s["target"], chains)
+        importer_post = _post_move_path(s["file"], chains)
+        got = post_resolver.resolve(
+            s["lang"], s["form"], s["spec"], tuple(s["names"]), _parent(importer_post)
+        )
+        if got == want:
+            continue  # the statement still names exactly the moved file
+        status = "stale" if got is None else "retargeted"
+        row = rows.setdefault(
+            src,
+            {
+                "from": src,
+                "to": chains[src],
+                "targets": set(),
+                "importers": set(),
+                "langs": set(),
+                "stale": 0,
+                "retargeted": 0,
+                "evidence": [],
+            },
+        )
+        row["targets"].add(s["target"])
+        row["importers"].add(s["file"])
+        row["langs"].add(s["lang"])
+        row[status] += 1
+        if len(row["evidence"]) < _MAX_IMPORT_EVIDENCE:
+            row["evidence"].append(
+                {
+                    "file": s["file"],
+                    "line": s["line"],
+                    "text": s["text"],
+                    "spec": s["spec"],
+                    "lang": s["lang"],
+                    "status": status,
+                }
+            )
+    out: list[dict] = []
+    for row in rows.values():
+        importers = sorted(row["importers"])
+        row["sites"] = row["stale"] + row["retargeted"]
+        row["importer_count"] = len(importers)
+        row["targets"] = sorted(row["targets"])
+        row["langs"] = sorted(row["langs"])
+        row["importers"] = importers[:_MAX_IMPORT_IMPORTERS]
+        out.append(row)
+    return sorted(out, key=lambda r: (-r["sites"], r["from"]))

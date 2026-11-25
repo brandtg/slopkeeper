@@ -78,6 +78,12 @@ class SlopKeeperError(Exception):
     command (re-inventory after a stale fingerprint, `strategies list`
     after an unknown id); an absent key means "no command fixes this",
     which is a fact worth having too, so it never carries a guess.
+
+    `data` (P6) is the structured payload an error NEEDS the agent to see,
+    where a sentence will not do: a failed `verify` command carries its
+    exit code and the tail of stdout/stderr, the same shape the success
+    path's `data` has. Absent unless set, so every existing error envelope
+    is byte-unchanged.
     """
 
     def __init__(
@@ -86,12 +92,14 @@ class SlopKeeperError(Exception):
         message: str,
         recovery: str = "",
         suggested_command: str = "",
+        data: dict | None = None,
     ):
         super().__init__(message)
         self.code = code
         self.message = message
         self.recovery = recovery
         self.suggested_command = suggested_command
+        self.data = data
 
     def as_dict(self) -> dict:
         out = {"code": self.code, "message": self.message, "recovery": self.recovery}
