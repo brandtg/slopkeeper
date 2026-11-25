@@ -98,11 +98,15 @@ The commands:
   clusters, scrape pairs, byte-identical copies, hub files. Hints, never
   a plan. `--out` lands the full payload in a file, counts on stdout.
 - **refs** — every site that cites a given filename; the
-  grep-before-move check behind reference integrity.
+  grep-before-move check behind reference integrity. The payload is
+  honest about the query (`exists`, `ambiguous`, `ambiguous_paths`) and
+  about its own limits (`truncated_files` + the `citation_scan_truncated`
+  warning when a file was read only as far as the 512 KiB cap).
+  `--dangling` lists path-ish citations that resolve to nothing.
 - **propose** — the layout fork as data: mechanical candidate partitions
-  (by-project, by-kind, hybrid), each priced with move counts,
-  citation-break counts, and unresolved estimates. Read-only; the agent
-  compares, then authors the real plan.
+  (by-project, by-role, by-topic, by-kind, hybrid), each priced with move
+  counts, citation-break counts, unresolved and orphaned estimates.
+  Read-only; the agent compares, then authors the real plan.
 - **status** — diff since the last tend (manifest in `.slopkeeper/`):
   new/modified/removed files, folder health, still-unresolved items.
   `--all` returns one count-level digest over every registered root.
@@ -130,7 +134,9 @@ The commands:
   mid-run is refused, not clobbered); journals every move with a
   content hash, one journal per tend, and undo VERIFIES those hashes
   (a file edited after the tend comes back flagged `content_changed`);
-  flags every move cited from stay-put files.
+  flags every move cited from stay-put files. `data.path_map` gives the
+  `{old: new}` dict for the moves that happened, so a caller's cached
+  paths survive a tend.
 - **move** — one bulk move (src dst root): builds the one-move plan,
   runs it through the same validate → gate → journal machinery, and
   renders the human gate. Dry-run by default; `--execute` runs it.
@@ -141,11 +147,18 @@ The commands:
   One journal per tend — same-second tends get `-2`, `-3` siblings, so
   undo never reverts a neighbor tend. The journaled sha256s are verified
   on restore: a file edited after the tend still comes back, flagged
-  `content_changed`. Takes one journal; name it (see
+  `content_changed`. `data.path_map` is the inverse of apply's
+  `{post-tend: restored}`. Takes one journal; name it (see
   `.slopkeeper/journal-*.jsonl`).
 - **strategies** — partitioning rubric packs the agent reads: `role-bots`
   (folder-as-bot), `topics`, `projects`, `by-kind` (mechanical baseline),
-  `hybrid` (default).
+  `hybrid` (default). Your own pack is a file, not a release: drop
+  `<id>.json` in `$XDG_CONFIG_HOME/slopkeeper/strategies`,
+  `$SLOPKEEPER_HOME/strategies`, or `<root>/.slopkeeper/strategies` and
+  it overrides the shipped pack by id. `strategies list` shows every pack
+  with its `origin`, `strategies dirs` names the search path, and a
+  malformed pack fails loudly at load (`strategy_bad_pack`) instead of
+  inside scaffold.
 - **guide** — prints the full agent protocol (also readable via the
   installed skill and AGENT_GUIDE.md, shipped in the wheel).
 - **skill** — `skill install <agent|dir>` copies the packaged SKILL.md
@@ -159,7 +172,12 @@ Run `slopkeeper` with no subcommand and you get an interactive
 `/command` prompt — the human front door for exploring a corpus and
 tending it by hand. It drives the exact same functions as the JSON
 subcommands (no new write path); every `--execute` stops for an explicit
-y/N, and the default is no.
+y/N, and the default is no. Since 0.2.10 that claim is tested, not
+aspirational: `/render` calls the same `build_gate_report` the CLI's
+`plan render` does (rewrite summary, stragglers, anchor risks), `/refs`
+answers the honest query questions and takes `--dangling`, and `/apply`
+takes `--force`, `--strict-references` and `--allow-partial`. A human and
+an agent looking at the same corpus see the same thing.
 
 ```text
 $ slopkeeper
@@ -169,8 +187,10 @@ $ slopkeeper
 > /draft                     # auto-draft a delta plan
 > /moves  /show 1  /no 1  /defer 1  /dest 1 api/   # decide per move
 > /plan                      # compile decisions, validate, save
-> /render                    # read the human gate
-> /apply                     # dry-run → [y/N] → execute
+> /render                    # read the human gate (same as plan render)
+> /apply --force             # dry-run → [y/N] → execute
+> /refs acme.md              # citations: exists? ambiguous? capped?
+> /refs --dangling           # path-ish references that resolve to nothing
 > /scaffold                  # [y/N] → write the AGENTS.md layer
 > /undo                      # list journals, dry-run, execute
 ```

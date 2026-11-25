@@ -85,6 +85,12 @@ RENDER_WARNING = (
     "the render, re-render or get explicit sign-off."
 )
 
+# How many over-cap files `reference_scan.truncated_paths` names (P5). The
+# COUNT is the contract — the envelope warning fires on it — and the names
+# are there to make "which file did the scan not finish reading" answerable
+# without a second command. Same shape as B6's `skipped_unstatable`.
+_TRUNCATED_NAMED = 10
+
 
 def _default_journal(root: Path) -> Path:
     """A journal path per TEND — never a shared file (A4).
@@ -128,7 +134,7 @@ def _journal_write(jf, doc: dict) -> None:
     os.fsync(jf.fileno())
 
 
-def _refuse_corpus_churn(health: dict, force: bool) -> int:
+def _refuse_corpus_churn(health: dict, force: bool, root: Path | None = None) -> int:
     """B6: a corpus that churned under the fingerprint walk is not tended.
 
     Returns the count of files the walk could not stat (0 = a clean
@@ -156,6 +162,10 @@ def _refuse_corpus_churn(health: dict, force: bool) -> int:
         "client, a build) — a fingerprint cannot bind a moving target, so "
         "nothing was moved. Stop the writer and re-run; --force proceeds "
         "anyway and records the count on the envelope.",
+        # P5: the command that SHOWS the churn is doctor — it names the
+        # unstatable paths — while re-inventorying a corpus that is being
+        # written to just walks into the same refusal again.
+        f"slopkeeper doctor {root}" if root is not None else "",
     )
 
 
@@ -347,6 +357,7 @@ def build_gate_report(
     plan: dict,
     root: Path,
     exclude: set[str] | frozenset[str] = frozenset(),
+    truncated: list[str] | None = None,
 ) -> tuple[dict, dict]:
     """(reference_risks, rewrite_summary) for the human gate — one pass.
 
@@ -354,7 +365,9 @@ def build_gate_report(
     rows (B2): a citing file the pass will rewrite is marked as such,
     and only moves with UNCOVERED citations land in the report — a
     covered file is not a risk. Callers that only need the summary can
-    ignore the first element.
+    ignore the first element. `truncated` (P5) collects the files the
+    scan's 512 KiB per-file cap cut short, so the gate says when its
+    clean bill of health has a blind spot.
     """
     mode = (plan.get("rewrites") or {}).get("mode", "auto")
     chains = resolve_chains(plan["moves"])
@@ -364,7 +377,7 @@ def build_gate_report(
     # edit_covered vs edit_owned_uncovered precisely). Citations the
     # pass records no row for still read edit_covered via the
     # edit_skip join in enriched_risk.
-    refs_full = scan_references_stream(root)
+    refs_full = scan_references_stream(root, truncated)
     refs_full.pop("stats", None)
     # A "rewrite": false subtree MOVES but its citations are not
     # rewritten — its outbound citations to moving paths are breakage,
@@ -415,12 +428,18 @@ def build_gate_report(
 
 
 def build_ref_report(plan: dict, root: Path) -> dict:
-    """Per-source reference risks for the human gate (render + REPL).
+    """Per-source reference risks ONLY — the risks half of the gate.
 
     The same un-capped stream scan `apply` will run (Phase 3): a move
     whose path (or any path under it, for a directory move) is cited
     from a stay-put file — and not covered by a chain or an in-plan
     edit — lands in the report so the human sees it before approving.
+
+    For a human gate call `build_gate_report` instead (it returns the risk
+    rows AND the rewrite summary, in one pass, with the per-citation status
+    that makes a row mean something); this wrapper exists for callers that
+    genuinely want the risks alone. The REPL stopped using it in 0.2.10
+    (audit B12: the gate must not be weaker than the CLI's).
     """
     ref_report, _summary = build_gate_report(plan, root)
     return ref_report
@@ -973,7 +992,7 @@ def _apply_plan(
     # different corpora and still "pass". The count refuses the tend
     # before the comparison is even meaningful.
     current, fp_health = corpus_fingerprint_detail(root, scope=scope)
-    unstatable = _refuse_corpus_churn(fp_health, force)
+    unstatable = _refuse_corpus_churn(fp_health, force, root)
     recorded = based_on_binding(plan)
     if not recorded:
         raise SlopKeeperError(
@@ -984,6 +1003,7 @@ def _apply_plan(
             "what makes the plan safe to apply. Run `slopkeeper inventory "
             "<root> --fast --summary` and record its fingerprint as "
             "based_on.corpus_fingerprint (see `slopkeeper plan schema`).",
+            f"slopkeeper inventory {root} --fast --summary",
         )
     if recorded != current and not force:
         raise SlopKeeperError(
@@ -992,6 +1012,10 @@ def _apply_plan(
             f"(plan: {recorded[:16]}, now: {current[:16]})",
             "Re-inventory and regenerate the plan, or pass --force if the "
             "changes are yours and expected.",
+            # P5: the recovery prose says "re-inventory"; the agent should
+            # not have to parse that to know what to run. --force is
+            # deliberately NOT suggested — it is the operator's call.
+            f"slopkeeper inventory {root} --fast --summary",
         )
 
     chains = resolve_chains(plan["moves"])
@@ -1032,7 +1056,8 @@ def _apply_plan(
     # (owned-line branch); rows the pass records none of still read
     # edit_covered via the edit_skip join in enriched_risk.
     scan_t0 = time.monotonic()
-    refs_full = scan_references_stream(root)
+    truncated: list[str] = []
+    refs_full = scan_references_stream(root, truncated)
     scan_stats = refs_full.pop("stats", {"files_scanned": 0, "hits": 0})
     rel_paths = _all_rel_paths(root)
     # Dir moves exclude their descendants: a citing file under the
@@ -1048,6 +1073,17 @@ def _apply_plan(
         "files_scanned": scan_stats["files_scanned"],
         "elapsed_ms": int((time.monotonic() - scan_t0) * 1000),
     }
+    if truncated:
+        # P5: the per-file read cap is 512 KiB, and a citation past that
+        # point in a huge file is invisible to the RISK scan (the rewrite
+        # pass reads whole files, so it can still change a line the scan
+        # never saw — the two surfaces disagreeing in silence was the
+        # complaint). Now it is a count on reference_scan and a warning
+        # token on the envelope.
+        names = sorted(set(truncated))
+        reference_scan["truncated_files"] = len(names)
+        if len(names) <= _TRUNCATED_NAMED:
+            reference_scan["truncated_paths"] = names
 
     # Citation rewrite pass (Phase 4): default-on; "off" is the
     # explicit opt-out (validated). Computed once against the PRE-move
@@ -1193,6 +1229,10 @@ def _apply_plan(
             # knowing about before the human approves the render.
             dry["skipped_unstatable"] = unstatable
             add_warning(dry, "skipped_unstatable")
+        if truncated:
+            # P5: the risk scan read some files only as far as the cap, so
+            # its "no risks" is a partial guarantee — say which is which.
+            add_warning(dry, "citation_scan_truncated")
         if rewrite_mode != "off":
             summary = _rewrite_summary()
             # Per-file would-be counts; zero writes happen in a dry run.
@@ -1227,7 +1267,7 @@ def _apply_plan(
     # extra walk free; until then the audit trail costs one more hashing
     # pass over the corpus.
     at_execute, exec_health = corpus_fingerprint_detail(root, scope=scope)
-    unstatable = max(unstatable, _refuse_corpus_churn(exec_health, force))
+    unstatable = max(unstatable, _refuse_corpus_churn(exec_health, force, root))
     journal = journal_path or _default_journal(root)
     journal.parent.mkdir(parents=True, exist_ok=True)
     moved, edits_applied, errors, rewrote = [], [], [], []
@@ -1548,6 +1588,19 @@ def _apply_plan(
         # B6 under --force: the count survives; silence was the bug.
         executed["skipped_unstatable"] = unstatable
         add_warning(executed, "skipped_unstatable")
+    if truncated:
+        # P5: `reference_scan.truncated_files` is the count; the token is
+        # the grep-able signal that the risk scan was capped somewhere.
+        add_warning(executed, "citation_scan_truncated")
+    # P5: the canonical old→new map (the audit's "every path an agent
+    # cached is stale" problem). `moved` is the ordered record — it carries
+    # the per-move content hash and the journal's order is meaningful —
+    # while path_map is the same fact as a dict, which is what a caller
+    # holding a path cache actually wants: new = data["path_map"][old].
+    # It covers dedup archives too (a dedup IS a journaled move), and a
+    # move that failed mid-run is absent: the map is what actually
+    # happened, not what the plan intended.
+    executed["path_map"] = {m["from"]: m["to"] for m in moved}
     if removal_ran:
         executed["removed_dirs"] = removed_dirs
     if rewrite_mode != "off":
@@ -1648,10 +1701,20 @@ def _undo_journal(
             "truncated. Inspect the file, fix or drop the bad line, then "
             "undo again — or pass --force to undo the ops that did parse "
             "(the rest stay applied). Nothing was restored.",
+            # The safe next command: the dry-run that prints exactly which
+            # ops would reverse and how many rows are malformed. --force is
+            # the human's call, so it is not the suggestion.
+            f"slopkeeper undo {journal_path} {root}",
         )
 
     ops = []
     content_changed_rows = 0
+    # P5: the inverse of apply's `path_map`. The journal records (src, dst)
+    # per move; undo puts every file BACK, so the map an agent needs after
+    # an undo is {path it had after the tend: path it has now} — the same
+    # "old → new" reading direction as apply, never a map the caller has to
+    # invert itself. Only rows that actually restore (or would) are in it.
+    path_map: dict[str, str] = {}
     for e in reversed(entries):
         if e.get("op") == "rewrite":
             # Reverse replay: per journaled line, `new` must be present
@@ -1818,7 +1881,15 @@ def _undo_journal(
             row["sha256_journaled"] = expected
             row["sha256_now"] = actual
         ops.append(row)
-    result = {"mode": "executed" if execute else "dry-run", "operations": ops}
+        # The inverse map: where the file WAS (post-tend) → where it IS
+        # after this undo. Blocked/failed rows above `continue`d, so a
+        # path that did not actually move back is not claimed here.
+        path_map[e["dst"]] = e["src"]
+    result = {
+        "mode": "executed" if execute else "dry-run",
+        "operations": ops,
+        "path_map": path_map,
+    }
     if tend_id:
         # A4: one journal per tend, and the tend names itself — the
         # "undo exactly one tend" model the guide promises.

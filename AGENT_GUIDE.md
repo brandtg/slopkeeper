@@ -71,14 +71,27 @@ the JSON subcommands documented here; they are scriptable and stable.)
    sweep the directories that cite your corpus with `refs --scan-path`
    (see "Reference rewrites"). Recall limits: a bare word is never a
    citation (path context is required); a bare basename mention
-   matches only names of 3+ characters containing a dot, and an
-   ambiguous basename (several corpus files share it) is never
-   attributed; a file the shared type table calls binary is never read.
+   matches only names of 3+ characters containing a dot — with ONE
+   exception (0.2.10): a name the shared type table vouches for
+   (`Makefile`, `Dockerfile`, `LICENSE`, `README`, `CHANGELOG`, `.env`,
+   `.gitignore`, …) is citable WITHOUT a dot, because it is a file name
+   and not prose. An ambiguous basename (several corpus files share it)
+   is never attributed; a file the shared type table calls binary is
+   never read.
    "Text" is one answer for the whole tool (0.2.8): the extension table
-   where it speaks, a NUL sniff where it does not, so a file
+   where it speaks, the NAME table where the extension is silent
+   (0.2.10), a NUL sniff where both are silent — so a file
    `inventory` reports as `kind: text` is scannable for citations even
-   when its extension appears in no list — and an extensionless file
-   can hold a citation, it just cannot be named by a bare basename.
+   when its extension appears in no list, and an extensionless classic
+   can now both hold a citation and be named by one.
+   Matching folds Unicode, storage does not (0.2.10): a corpus file
+   stored decomposed (`e` + U+0301, what macOS writes) is found when
+   text cites it composed (`é`) — in `refs`, in the risk scan, and in
+   the rewrite pass. A byte-exact hit always wins, and the path/dir
+   lookup never folds CASE (`API.md` does not resolve to `api.md` on a
+   case-sensitive filesystem: rewriting onto the wrong file is worse
+   than missing one). The fingerprint still treats the two spellings as
+   the two different files they are — matching folds, identity does not.
 5. **Unresolved is honest.** Files you can't classify go in
    `unresolved` with a reason — never guess. `keep` is for top-level
    entries that stay (a watchlist, a folder that is already right);
@@ -244,6 +257,20 @@ intentional name. When you add a fixture or an example, invent an
      → the partitioning rubric. Apply it. Strategies:
        role-bots | topics | projects | by-kind | hybrid (default for mixed
        corpora)
+     Your OWN rubric is a file, not a release (0.2.10, B10):
+     `slopkeeper strategies list` shows every visible pack with its
+     `origin` (packaged | user | corpus) and `source` path, and
+     `slopkeeper strategies dirs [--root <dir>]` names the search path.
+     Drop <id>.json in `$XDG_CONFIG_HOME/slopkeeper/strategies`,
+     `$SLOPKEEPER_HOME/strategies`, or `<root>/.slopkeeper/strategies`
+     (that last one travels with the corpus it describes and is never
+     walked or fingerprinted), and LATER WINS — the same `id` overrides
+     the shipped pack everywhere the pack is read (propose's comparison,
+     scaffold's rendering, `strategies show`). A pack must carry `id`,
+     `name`, `summary`, a non-empty `partitioning_rubric`, and a
+     `folder_template` with `kind` + `agents_md_skeleton`; a broken one
+     says so at load (`strategy_bad_pack`, naming the file and the key)
+     instead of dying later inside scaffold as an `internal`.
 
 4b. slopkeeper propose <root> [--scan-path <dir>] [--external-root <dir>]
      → the layout fork as data: five candidate partitions (by-project,
@@ -337,11 +364,18 @@ intentional name. When you add a fixture or an example, invent an
 8. slopkeeper scaffold <plan.json> <root> --execute
      → writes AGENTS.md roster + per-folder AGENTS.md/STATE.md.
        Existing files are never overwritten; you get *.slopkeeper-suggested
-       to merge by hand.
+       to merge by hand — and `data.path_map` names each {intended:
+       actual} pair, so you open the file that really holds the content
+       (see "The envelope contract").
 
 9. Report: moved counts, risk resolutions, suggested-file merges needed,
    journal path (for undo). Offer: slopkeeper undo <journal> <root>
-   (dry-run is the default; add --execute to actually restore)
+   (dry-run is the default; add --execute to actually restore).
+   Report `data.path_map` too (0.2.10): after any apply, scaffold or
+   undo, every path the caller cached is stale, and the map — not a
+   re-walk — is how a cache gets fixed. `apply --execute` maps
+   {old: new} for the moves that happened; `undo` maps the inverse
+   {post-tend: restored}, same old→new reading direction.
 
    ONE TEND, ONE JOURNAL (0.2.7 A4): every execute writes its own
    `.slopkeeper/journal-<UTC-stamp>.jsonl`, and same-second tends get
@@ -376,6 +410,64 @@ intentional name. When you add a fixture or an example, invent an
    run exits non-zero — never silent. Earlier hops stay journaled and
    undoable throughout.
 ```
+
+### The envelope contract (0.2.10)
+
+Every JSON command answers the same two shapes, and the fields an agent
+keys off are pinned by `tests/test_protocol.py`:
+
+```text
+success  {tool, version, command, ok: true, data, next}          [+ warnings]
+failure  {tool, version, command, ok: false, error}              exit 1 (2 for plan_*)
+error    {code, message, recovery}                                [+ suggested_command]
+next     {action, command, hint}
+```
+
+`warnings` — the soft conditions no check may refuse. Present only when
+something fired, a list of deduped snake_case tokens, and it is the
+CANONICAL read: the same list also stays inside `data` (the library
+contract, so a caller that never builds an envelope — the REPL, another
+module — still sees it). Check `out["warnings"]`, not a per-command guess.
+
+| token | fires when | what to do |
+|---|---|---|
+| `fingerprint_moved_during_apply` | the corpus changed between the gate's digest and the first write (B5) | re-run `status` and decide: the tend ran against a moving disk |
+| `skipped_unstatable` | files vanished or denied stat mid-walk, under `--force` (B6) | stop the writer; the count is on the payload |
+| `no_locking_available` | the platform has no flock, so the tend was not serialized (B7) | assume no other agent was tending this corpus |
+| `citation_scan_truncated` | a file was read only as far as the 512 KiB citation cap (P5) — the counts beside it (`reference_scan.truncated_files`, `truncated_files`) say how many | treat "no citations here" as a floor for those files; split or shrink the outlier |
+| `case_collision` | two destinations differ only by case (P4) | rename before the corpus ever lands on a case-insensitive mount |
+| `content_changed` | an undo found a file edited after the tend (B1) | read `operations[]` rows: post-tend work came back with the file |
+| `journal_corrupt_needs_force` | a journal's MIDDLE lines are malformed (B2) | inspect the journal; `--force` reverses only what parsed |
+
+`error.suggested_command` is the failure-path twin of `next`: the exact
+command that gets you unstuck, present only when the tool genuinely knows
+one (re-inventory after `corpus_changed`, `strategies list` after an
+unknown id, `doctor` after `corpus_unstable`). Absent means no command
+fixes this — read `recovery`. Never regex the prose to decide what to
+run; that is what the field is for.
+
+`next` is set on EVERY success path (0.2.10 closed the last gap: `undo`
+had none — it now chains to `status` after an execute, and to the
+`--execute` re-run after a dry one). One exception to the token rule
+above: `skill install` puts a human sentence ("skill already present at
+<path>; pass --force") in `warnings`, because the thing worth reading is
+the path. Its `installed[]` records carry `action` (`installed` |
+`overwritten` | `skipped`) for the machine-readable read.
+
+`path_map` — every path you cached is stale after a write, so the three
+write commands return the map:
+
+* `apply --execute` → `data.path_map` = `{old: new}` for every move that
+  actually happened (dedup archives included; failed moves are absent —
+  the map is what occurred, not what the plan intended). `data.moved`
+  stays as the ordered, hashed record; they always agree.
+* `undo` → `data.path_map` = the INVERSE, `{post-tend path: restored
+  path}`, same reading direction (old → new), built only from rows that
+  restored or would restore.
+* `scaffold` → `data.path_map` = `{intended path: path the content
+  actually landed at}` — present only for the never-clobber writes that
+  went to a `*.slopkeeper-suggested` sibling. If a path you expected is
+  a KEY in that map, open the VALUE.
 
 Classification signals: work from the inventory's fields before opening
 anything — `title` and `head` (what the file says it is), `mtime` (how
@@ -931,7 +1023,8 @@ unexplained silence.
 | `plan_bad_remove_emptied` | `plan.remove_emptied` is present but not a boolean | set `"remove_emptied": true` to have apply remove directories the plan emptied (journaled, undoable), or drop the field |
 | `merge_collision` | a directory move's destination is created by another move of the same plan, and a child name collides with an existing path or another move's destination (E1) | rename one destination or drop one of the two moves — the merge refuses a name collision instead of nesting the directory |
 | `target_unwritable` | a rewrite or edit target denies writes (sandbox deny-list, read-only mount) — refused before ANY move | run apply outside the sandbox or grant write access; nothing was moved |
-| `unknown_strategy` | no strategy with that id | `slopkeeper strategies` for the available ids |
+| `unknown_strategy` | no strategy with that id | `slopkeeper strategies` for the available ids; a pack may also be your own file — `slopkeeper strategies dirs` names the directories it searches |
+| `strategy_bad_pack` | a strategy pack (shipped, `$XDG_CONFIG_HOME/slopkeeper/strategies`, `$SLOPKEEPER_HOME/strategies`, or `<root>/.slopkeeper/strategies`) is unparseable or missing a required key — `id`, `name`, `summary`, a non-empty `partitioning_rubric`, and a `folder_template` carrying `kind` and `agents_md_skeleton` (P5 B10: caught at load, not as a late `internal` from scaffold) | fix the named file or delete it (the shipped pack is the fallback); `slopkeeper strategies list` shows what did load and `origin` says where each pack came from |
 | `propose_unknown_candidate` | `candidate_moves(root, "<id>")` (or an internal call) named a candidate that does not exist | known candidates: by-project, by-role, by-topic, by-kind, hybrid — see `slopkeeper propose` |
 | `skill_unknown_agent` | `skill install` target is neither a known agent nor a path-like string | use a known agent (claude, opencode, hermes) or pass a skills directory path — the skill lands in `<dir>/slopkeeper/` |
 | `skill_target_not_dir` | `skill install` destination exists as a file | remove it or pass a different skills directory |
@@ -948,16 +1041,35 @@ unexplained silence.
   without opening anything; it shapes `--out` too. Past 8000 files
   the inventory is truncated (`stats.truncated`) — per-top-dir counts
   are still taken, and doctor names the directory that ate the cap.
-- Binary heads: PDF/DOCX/PPTX (and any ext with a registered
-  extractor) carry extracted first lines when the system has the
-  extractor (`pdftotext`, `docx2txt`/`pandoc`, `unzip` — probed from
-  PATH, never installed by us). Without one the head is the literal
-  marker `signal: none (binary, no extractor)` — loud, never silent.
+- Binary heads: ODT/ODS/ODP and EPUB are read in-process with stdlib
+  `zipfile` (0.2.10) — the ODF text parts and the OPF's `<dc:title>`
+  become the title, with no external binary to be absent. PDF, DOCX and
+  PPTX (and any ext with a registered extractor) carry extracted first
+  lines when the system has the extractor (`pdftotext`,
+  `docx2txt`/`pandoc`, `unzip` — probed from PATH, never installed by
+  us); the legacy `DOC`/`XLS` join that list needing `antiword`/`catdoc`
+  or `xls2csv`. Without one the head is the literal marker
+  `signal: none (binary, no extractor)` — loud, never silent.
+- Notebooks and name-only files (0.2.10): an `.ipynb` title comes from
+  its first markdown cell and its head from the markdown cells plus
+  code-cell definitions — not from the raw JSON (the title used to be
+  `{` for every notebook, and `clusters` tokenized `cell_type` and
+  `metadata` instead of the content). The file is still ONE JSON
+  document for hashing and dedup. Files with no extension that the type
+  table names (`Makefile`, `Dockerfile`, `Justfile`, `Gemfile`, `LICENSE*`,
+  `README`, `CHANGELOG`, `.env*`, `.gitignore`, …) get a real kind, a
+  title, and — new — can be CITED by that bare name; `propose` routes
+  them to `scripts/`, `docs/` or `data/` instead of `misc/`. `SVG` is
+  text by table (it cites things), not by sniff.
 - Reference scanning: un-capped and streaming — apply and `refs` scan
   corpora of any size linearly (the 2000-file cap is gone); apply's
   `reference_scan` reports `files_scanned`/`elapsed_ms`, never a
-  silent skip. Per-file read cap 512 KiB. (The inventory's embedded
-  cross-reference scan only runs at ≤ 800 files.)
+  silent skip. The per-file read cap is 512 KiB, and a file it cut
+  short is now COUNTED, not swallowed: `reference_scan.truncated_files`
+  (apply), `truncated_files` (refs) and the envelope warning
+  `citation_scan_truncated` (0.2.10) — so "no citations" from a
+  half-read file reads as a floor, not a proof. (The inventory's
+  embedded cross-reference scan only runs at ≤ 800 files.)
 - Clusters and draft: no cliff. Up to 3000 files the matcher is exact
   all-pairs; past it it switches to candidate blocking (inverted
   rare-token index, O(Σ rare-token²) instead of O(n²)), so 5k and 50k
@@ -971,7 +1083,7 @@ unexplained silence.
 - The plan render paginates: a plan past 200 moves prints the per-
   folder table as one summary row per destination (the whole approval
   picture, ~n_destinations lines) plus the reference risk section on
-  stdout, with `"truncated": true` on the envelope. `plan render
+  stdout, with `"paginated": true` on the payload. `plan render
   --out <file>` always writes the FULL detail markdown and its
   envelope names it in `payload.written_to` — read that file when the
   summary is not enough. `plan validate --out` already carried the

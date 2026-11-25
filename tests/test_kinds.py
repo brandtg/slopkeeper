@@ -110,11 +110,12 @@ class TestTableShape(unittest.TestCase):
         self.assertEqual(inventory._kind(Path("a.sql")), "code")
 
     # The routing buckets name a few formats the KIND table does not:
-    # they are zip/XML containers the NUL sniff decides, and they are
-    # listed here so a new one is a decision, not an oversight. (`.svg`
-    # is the interesting case — XML that cites things, which is why P5
-    # promotes it to a table entry rather than leaving it to the sniff.)
-    ROUTING_ONLY_EXTS = {".docx", ".pptx", ".svg"}
+    # they are zip containers the NUL sniff decides, and they are listed
+    # here so a new one is a decision, not an oversight. (`.svg` used to be
+    # the interesting case here — XML that cites things — which is exactly
+    # why P5's filetype batch promoted it into TEXT_EXTS instead of leaving
+    # it to the sniff.)
+    ROUTING_ONLY_EXTS = {".docx", ".pptx"}
 
     def test_only_documented_extensions_live_outside_the_kind_table(self):
         bucketed = set().union(*kinds.KIND_EXTS.values())
@@ -152,6 +153,194 @@ class TestTableShape(unittest.TestCase):
             },
             "the router and the kind table disagree about what exists",
         )
+
+
+class TestNameTable(unittest.TestCase):
+    """P5 filetype batch: the files with no extension, answered once.
+
+    `Makefile`, `Dockerfile`, `LICENSE`, `README`, `.env` — no extension
+    means the extension tables are silent, and the OLD `is_text_file` was
+    extension-gated alone, so the reference scan could not see them while
+    inventory's NUL sniff called them text. One name table answers both
+    questions, and the ordering rule (extension first, name only when the
+    extension said nothing) is what keeps every existing answer intact.
+    """
+
+    CODE_NAMES = [
+        "Makefile",
+        "makefile",
+        "Dockerfile",
+        "Justfile",
+        "Gemfile",
+        "Rakefile",
+        "Vagrantfile",
+        "Jenkinsfile",
+        "Procfile",
+        "Brewfile",
+    ]
+    TEXT_NAMES = [
+        ".gitignore",
+        ".dockerignore",
+        ".npmignore",
+        ".gitattributes",
+        ".editorconfig",
+        ".shellcheckrc",
+        ".env",
+        ".env.local",
+        ".env.production",
+        "LICENSE",
+        "LICENSE-MIT",
+        "LICENCE",
+    ]
+    DOC_NAMES = [
+        "README",
+        "CHANGELOG",
+        "CONTRIBUTING",
+        "code_of_conduct.md".replace(".md", ""),
+    ]
+
+    def test_build_files_are_code(self):
+        for name in self.CODE_NAMES:
+            with self.subTest(name=name):
+                self.assertEqual(kinds.kind_of(name), "code")
+                self.assertTrue(kinds.is_code(name))
+
+    def test_config_and_license_files_are_text(self):
+        for name in self.TEXT_NAMES:
+            with self.subTest(name=name):
+                self.assertEqual(kinds.kind_of(name), "text")
+
+    def test_prose_classics_are_doc(self):
+        for name in self.DOC_NAMES:
+            with self.subTest(name=name):
+                self.assertEqual(kinds.kind_of(name), "doc")
+
+    def test_all_name_table_entries_are_scannable_and_citable(self):
+        names = self.CODE_NAMES + self.TEXT_NAMES + self.DOC_NAMES
+        for name in names:
+            with self.subTest(name=name):
+                # The two answers the audit needed: readable as text (so it
+                # can HOLD a citation) and vouched-for as a name (so it can
+                # BE one) — no file on disk required for either.
+                self.assertTrue(kinds.is_scannable(name))
+                self.assertTrue(kinds.is_citable_name(name))
+
+    def test_the_extension_still_wins_when_it_speaks(self):
+        # The ordering rule, pinned: `README.txt` is text because .txt says
+        # so, not because the name does; nothing that already had an answer
+        # changed when the name table landed.
+        self.assertEqual(kinds.kind_of("README.txt"), "text")
+        self.assertEqual(kinds.kind_of("Makefile.md"), "doc")
+        self.assertEqual(kinds.kind_of("LICENSE.png"), "binary")
+
+    def test_prose_words_are_not_name_table_members(self):
+        # `NOTICE` / `AUTHORS` / `NEWS` are deliberately OUT of the table:
+        # basenames match case-INsensitively, so admitting them would make
+        # the ordinary word in a sentence a citation of the file.
+        for name in (
+            "NOTICE",
+            "AUTHORS",
+            "NEWS",
+            "readmelater",
+            "licenses",
+            "environment",
+            "coding",
+        ):
+            with self.subTest(name=name):
+                self.assertIsNone(kinds.name_kind(name))
+                self.assertFalse(kinds.is_citable_name(name))
+
+    def test_prefix_families_use_a_boundary(self):
+        # The boundary is what keeps `.environment` from being a `.env`
+        # while `.env.production` is one, and `LICENSEMIT` out while
+        # `LICENSE-MIT` is in.
+        self.assertEqual(kinds.kind_of(".env.production"), "text")
+        self.assertIsNone(kinds.name_kind(".environment"))
+        self.assertEqual(kinds.kind_of("LICENSE-MIT"), "text")
+        self.assertIsNone(kinds.name_kind("LICENSEMIT"))
+
+    def test_route_of_sends_the_classics_to_a_real_folder(self):
+        # Before P5 every one of these fell through the extension buckets
+        # and landed in `misc/` beside the unidentified pile.
+        expected = {
+            "Makefile": "code",
+            "Dockerfile": "code",
+            "Gemfile": "code",
+            ".gitignore": "data",
+            ".env": "data",
+            "LICENSE": "docs",
+            "README": "docs",
+            "CHANGELOG": "docs",
+        }
+        for name, bucket in expected.items():
+            with self.subTest(name=name):
+                self.assertEqual(kinds.route_of(name), bucket)
+
+    def test_route_of_agrees_with_the_buckets_for_real_extensions(self):
+        # The router is one table whichever way it is asked: an extension in
+        # a bucket routes to that bucket, and nothing routes twice.
+        for bucket, exts in kinds.KIND_EXTS.items():
+            for ext in sorted(exts):
+                with self.subTest(bucket=bucket, ext=ext):
+                    self.assertEqual(kinds.route_of(f"a{ext}"), bucket)
+        self.assertIsNone(kinds.route_of("a.qqq"))
+
+    def test_the_name_axis_has_one_owner_too(self):
+        # R7's rule applied to the new axis: a NAME is not an extension, and
+        # a name that WOULD be read as an extension means someone added an
+        # extension to the wrong table.
+        exts = kinds.BINARY_EXTS | kinds.CODE_EXTS | kinds.DOC_EXTS | kinds.TEXT_EXTS
+        self.assertEqual(set(kinds.NAME_KINDS) & exts, set())
+        self.assertEqual({p for p, _ in kinds.NAME_PREFIXES} & exts, set())
+
+    def test_every_routed_name_is_a_known_name(self):
+        # Routing and kinding share the name list: a routed name the kind
+        # table does not vouch for would be routed but never scannable,
+        # which is the same drift in a new costume.
+        for name in kinds.NAME_ROUTING:
+            with self.subTest(name=name):
+                self.assertIsNotNone(
+                    kinds.name_kind(name),
+                    f"{name} routes but no kind table knows it",
+                )
+
+    def test_no_name_is_a_prose_word_the_matcher_would_confuse(self):
+        # Defense against growing the table into prose: every entry must be
+        # something nobody writes in a sentence mid-stream.
+        for name in list(kinds.NAME_KINDS) + [p for p, _ in kinds.NAME_PREFIXES]:
+            with self.subTest(name=name):
+                self.assertGreaterEqual(len(name), 4)
+                self.assertEqual(name, name.lower())
+
+
+class TestOfficeContainers(unittest.TestCase):
+    """P5 filetype batch: containers named in the table, not sniffed."""
+
+    def test_office_and_epub_are_binary_by_table(self):
+        for ext in (".odt", ".ods", ".odp", ".epub", ".doc", ".xls"):
+            with self.subTest(ext=ext):
+                self.assertEqual(kinds.kind_of(f"a{ext}"), "binary")
+                # Table answer, no open: the path does not have to exist.
+                self.assertEqual(
+                    kinds.classify(Path("/nonexistent") / f"a{ext}"), "binary"
+                )
+                self.assertFalse(kinds.is_scannable(f"a{ext}"))
+
+    def test_office_formats_route_to_docs(self):
+        for ext in (".odt", ".ods", ".odp", ".epub", ".doc", ".xls"):
+            with self.subTest(ext=ext):
+                self.assertIn(ext, kinds.DOCS_EXTS)
+                self.assertEqual(kinds.route_of(f"a{ext}"), "docs")
+
+    def test_svg_is_text_by_table(self):
+        # "SVG explicitly text (XML, cites things)": it used to be a
+        # routing-only entry the NUL sniff decided, which made its
+        # `xlink:href` paths invisible to the citation scan whenever the
+        # sniff was skipped.
+        self.assertIn(".svg", kinds.TEXT_EXTS)
+        self.assertEqual(kinds.kind_of("diagram.svg"), "text")
+        self.assertTrue(kinds.is_scannable("diagram.svg"))
+        self.assertEqual(kinds.route_of("diagram.svg"), "media")
 
 
 class TestClassify(TempCase):

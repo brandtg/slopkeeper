@@ -15,10 +15,18 @@ the corpus path (or directory) it names — an exact path, a suffix after
 `./`/`../`/a longer prefix, a directory prefix (including convention
 strings like `reports/_org/<date>_<topic>.md`), a wikilink target, or a
 basename. A bare word is never a citation; a basename with an extension
-is, with word-ish boundaries. An ambiguous basename (several corpus
+is, with word-ish boundaries — so is a name the kinds table vouches for
+(`Makefile`, `LICENSE`, `README`), which has no extension and is not
+prose either (P5 filetype batch). An ambiguous basename (several corpus
 files share it) is NEVER attributed — the old first-seen hack attributed
 a mention to whichever same-named file the scan saw first, which could
 rewrite a citation onto the wrong file.
+
+Matching is case- and composition-insensitive where it always was
+(basenames) and now also for paths and directories (P5: an NFD-named Mac
+file cited by NFC text is the same file); storage, hashing and the
+fingerprint stay byte-exact, and no folded lookup ever overrides a
+byte-exact one.
 
 Bounded and quiet: text files only, per-file read cap. Un-capped since
 Phase 3 (reference-rewrites PRD): no file-count ceiling anywhere — the
@@ -31,6 +39,7 @@ import fnmatch
 import os
 import posixpath
 import re
+import unicodedata
 from pathlib import Path
 
 from . import kinds, scan
@@ -83,6 +92,100 @@ def _name_pattern(name: str) -> re.Pattern[str]:
     )
 
 
+def _name_searcher(name: str):
+    """A `line -> bool` test for one queried name (P5 normalize-on-match).
+
+    `refs <name>` and `refs --scan-path` take the name from the caller, and
+    the caller's normal form need not be the filesystem's: an agent asking
+    about `café.md` (NFC) means the file the Mac stored as `café.md`
+    (NFD). An ASCII query — every ASCII corpus, and every query an agent
+    types without accents — gets the historical pattern untouched; only a
+    non-ASCII query adds the folded leg, so no existing answer changes.
+    """
+    raw = _name_pattern(name)
+    if name.isascii():
+        return raw.search
+    folded = re.compile(
+        r"(?<![\w.-])" + re.escape(_fold(name)) + r"(?![\w-]|\.[A-Za-z0-9])"
+    )
+
+    def search(line: str) -> bool:
+        return bool(raw.search(line)) or bool(folded.search(_fold(line)))
+
+    return search
+
+
+# --- normalization (P5: normalize on MATCH, never on store) -----------------
+#
+# A corpus that has lived on a Mac holds both normal forms of the same
+# name: the Finder writes `café.md` decomposed (NFD: `e` + U+0301) while
+# the text that cites it — typed on Linux, copied out of a terminal,
+# written by an agent — composes it (NFC: `é`). Byte-compared, those are
+# two different names, so the citation was invisible: `refs` found no
+# sites and the rewrite pass left it pointing at nothing. The audit's
+# test-coverage gap names it (the fingerprint treats them as unrelated
+# files, "byte-correct but agent-surprising").
+#
+# The fix is deliberately ONE-SIDED. Filenames, hashes, plans and the
+# journal stay byte-exact — a rename that quietly normalized the corpus
+# would be its own data bug, and `fingerprint` promises byte identity.
+# Only MATCHING folds, at the moment a token is compared against the
+# index. Two flavors, because the two jobs differ:
+#
+#   `_nfd`  composition-only, case-preserving — for path/dir/stem
+#           resolution, where folding CASE too would start resolving
+#           `API.md` to `api.md` on a case-sensitive filesystem (a
+#           rewrite onto the wrong file, which is worse than the miss);
+#   `_fold` composition + casefold — for basename matching, which has
+#           always been case-INsensitive (`re.IGNORECASE`, and
+#           `canonical_basename`'s casefold map), so folding further only
+#           extends the rule that already exists.
+#
+# No cache on either: query strings come out of corpus text and are
+# unbounded, and an lru_cache over them is a leak on a big corpus. Both
+# short-circuit on `isascii()`, which is every ASCII corpus.
+
+
+def _nfd(text: str) -> str:
+    """Composition-insensitive key, case preserved."""
+    return text if text.isascii() else unicodedata.normalize("NFD", text)
+
+
+def _fold(text: str) -> str:
+    """Case- and composition-insensitive key (the basename matcher's)."""
+    if text.isascii():
+        return text.casefold()
+    return unicodedata.normalize("NFD", text).casefold()
+
+
+def _fold_spans(text: str) -> tuple[str, list[int]]:
+    """`(_fold(text), index_map)` with the map back to `text`'s positions.
+
+    Folding is not length-preserving (NFD splits `é` into two characters,
+    casefold expands `ß` into `ss`), so a match computed on the folded
+    string cannot report where it landed in the ORIGINAL line — and the
+    rewrite pass needs those spans to decide containment and to write.
+    Each character of `text` contributes its own folded run to the output,
+    so `index_map[j]` is the position in `text` of the character that
+    produced folded position `j`, and a folded span `[a, b)` maps back to
+    `[index_map[a], index_map[b])`. A character that folds away entirely
+    (none in practice for path-ish text) keeps its own character so the
+    map never misaligns.
+    """
+    if text.isascii():
+        return text.casefold(), list(range(len(text) + 1))
+    parts: list[str] = []
+    positions: list[int] = []
+    for i, ch in enumerate(text):
+        folded = unicodedata.normalize("NFD", ch).casefold()
+        if not folded:
+            folded = ch
+        parts.append(folded)
+        positions.extend([i] * len(folded))
+    positions.append(len(text))
+    return "".join(parts), positions
+
+
 # --- the citation index ------------------------------------------------------
 
 
@@ -91,9 +194,18 @@ class CitationIndex:
 
     Built once per scan from the corpus rel paths. `by_basename` keeps
     the legacy candidate rules (>= 3 chars, contains a dot) — a bare
-    word is never a basename. `ambiguous_basenames` is the honest
-    replacement for first-seen attribution: several files share the
-    basename, so a bare mention cannot be resolved.
+    word is never a basename — with ONE exception (P5 filetype batch): a
+    name the kinds table vouches for (`Makefile`, `Dockerfile`, `LICENSE`,
+    `README`...) is citable without a dot, because it is a file name and
+    not prose. `ambiguous_basenames` is the honest replacement for
+    first-seen attribution: several files share the basename, so a bare
+    mention cannot be resolved.
+
+    Every set/dict here holds the RAW corpus strings — the values that
+    come out of the tool. The `norm_*` maps are lookup indexes over the
+    same values (see the normalization block above); a fold collision
+    keeps the first path the walk reached, which is deterministic because
+    the walk is sorted.
     """
 
     def __init__(self, rel_paths: list[Path]):
@@ -101,27 +213,75 @@ class CitationIndex:
         self.dirs: set[str] = set()
         self.by_basename: dict[str, list[str]] = {}
         self.by_stem: dict[str, list[str]] = {}
+        self.norm_paths: dict[str, str] = {}
+        self.norm_dirs: dict[str, str] = {}
+        self.norm_stems: dict[str, str] = {}
         for p in rel_paths:
             rel = p.as_posix()
             self.paths.add(rel)
+            self.norm_paths.setdefault(_nfd(rel), rel)
             parts = p.parts[:-1]
             for i in range(1, len(parts) + 1):
-                self.dirs.add("/".join(parts[:i]))
+                d = "/".join(parts[:i])
+                self.dirs.add(d)
+                self.norm_dirs.setdefault(_nfd(d), d)
             base = p.name
-            if len(base) >= 3 and "." in base:
+            if (len(base) >= 3 and "." in base) or kinds.is_citable_name(base):
                 self.by_basename.setdefault(base, []).append(rel)
             # Obsidian-style extensionless wikilink targets resolve
             # against stem paths (the rel path minus its extension).
-            self.by_stem.setdefault(p.with_suffix("").as_posix(), []).append(rel)
+            stem = p.with_suffix("").as_posix()
+            self.by_stem.setdefault(stem, []).append(rel)
+            self.norm_stems.setdefault(_nfd(stem), stem)
         self.ambiguous_basenames = {
             b for b, ps in self.by_basename.items() if len(ps) > 1
         }
-        # Case-insensitive lookup: the matchers are IGNORECASE, so a hit's
-        # text ("Api.md") must map back to the canonical corpus key.
-        self._by_basename_lower = {b.casefold(): b for b in self.by_basename}
+        # The basename matcher is case- AND composition-insensitive, so a
+        # hit's text ("Api.md", or the other normal form of the name) must
+        # map back to the canonical corpus key.
+        self._by_basename_fold: dict[str, str] = {}
+        for b in self.by_basename:
+            self._by_basename_fold.setdefault(_fold(b), b)
 
     def canonical_basename(self, matched: str) -> str | None:
-        return self._by_basename_lower.get(matched.casefold())
+        """The corpus basename a matcher hit names, folded both sides."""
+        return self._by_basename_fold.get(_fold(matched))
+
+    # --- normalize-on-match lookups -------------------------------------
+    #
+    # Exact first, always: the byte-exact answer is the truth and the
+    # common case, and trying it first means an ASCII corpus never pays
+    # for a fold. The folded leg is what finds the NFD/NFC twin.
+
+    def match_path(self, cand: str) -> str | None:
+        """The corpus path `cand` names (byte-exact or compositionally equal)."""
+        if cand in self.paths:
+            return cand
+        return self.norm_paths.get(_nfd(cand))
+
+    def match_dir(self, cand: str) -> str | None:
+        """The corpus directory `cand` names, same rule."""
+        if cand in self.dirs:
+            return cand
+        return self.norm_dirs.get(_nfd(cand))
+
+    def stem_paths(self, cand: str) -> list[str] | None:
+        """The files whose stem-path `cand` names (a wikilink target)."""
+        paths = self.by_stem.get(cand)
+        if paths is None:
+            key = self.norm_stems.get(_nfd(cand))
+            if key is not None:
+                paths = self.by_stem.get(key)
+        return paths
+
+    def basename_paths(self, base: str) -> list[str] | None:
+        """The files a bare basename `base` names, folded both sides."""
+        paths = self.by_basename.get(base)
+        if paths is None:
+            canonical = self.canonical_basename(base)
+            if canonical is not None:
+                paths = self.by_basename.get(canonical)
+        return paths
 
 
 # --- tokenization ------------------------------------------------------------
@@ -147,7 +307,15 @@ _BACKTICK_SHAPE_RE = re.compile(r"/|\.[A-Za-z0-9]+$")
 # in corpus text (`docs/api.md?x=1` in HTML/anchors), and gluing it
 # would un-resolve real citations. `<`/`>` stay outside too, so
 # `<placeholder>` convention strings still truncate at the angle bracket.
-_PATH_SEGMENT_ATOM = r"(?:[A-Za-z0-9_.\-]|\*|\{[^{}\s/]*\})"
+#
+# P5: the class is `\w` (Unicode), not `[A-Za-z0-9_]`, plus the combining
+# marks `re`'s `\w` leaves out (a mark is not alphanumeric, so `é` stored
+# decomposed — `e` + U+0301, the form macOS writes — used to SHATTER the
+# token into `caf` and the citation was invisible to every leg of the
+# scan, not just the folded one). An ASCII corpus is unaffected: the
+# classes agree there.
+_PATH_MARKS = "\u0300-\u036f\u1ab0-\u1aff\u1dc0-\u1dff\u20d0-\u20ff"
+_PATH_SEGMENT_ATOM = rf"(?:[\w.\-{_PATH_MARKS}]|\*|\{{[^{{}}\s/]*\}})"
 _PATH_TOKEN_RE = re.compile(
     # Not preceded by a name-ish char (rejects xapi.md)...
     r"(?<![\w.\-])"
@@ -159,7 +327,11 @@ _PATH_TOKEN_RE = re.compile(
     # `reports/_org/<date>_...` scans as `reports/_org/` — a directory
     # citation. Commas live only inside brace groups, so prose
     # ("docs/api.md, and …") still stops at the comma.
-    r"[A-Za-z0-9_]" + _PATH_SEGMENT_ATOM + r"*"
+    #
+    # The mark class is excluded from the FIRST character: a token that
+    # begins with a combining mark is not a path, and refusing it keeps
+    # the lookbehind's job of rejecting mid-word fragments.
+    r"\w" + _PATH_SEGMENT_ATOM + r"*"
     r"(?:/" + _PATH_SEGMENT_ATOM + r"*)+"
 )
 
@@ -183,15 +355,15 @@ def _resolves_in_corpus(
     when the corpus has a root index.md) stays a host — the
     suffix/basename fallbacks belong to _resolve, not to this question.
     """
-    if rest in index.paths:
+    if index.match_path(rest):
         return True
     stripped = rest.rstrip("/")
-    if stripped and stripped in index.dirs:
+    if stripped and index.match_dir(stripped):
         return True
     cur = ""
     for seg in rest.split("/")[:-1]:
         cur = f"{cur}/{seg}" if cur else seg
-        if cur in index.dirs:
+        if index.match_dir(cur):
             return True
     if citing_dir is not None and _citing_dir_hit(
         _resolve_from(citing_dir, rest), index
@@ -312,11 +484,20 @@ def _token_spans(
 
 
 def _citing_dir_hit(cand: str, index: CitationIndex) -> tuple[str, str] | None:
-    """The resolution when a citing-dir candidate names a corpus entry."""
-    if cand in index.paths:
-        return ("rel_path", cand)
-    if cand.rstrip("/") in index.dirs:
-        return ("rel_path", cand.rstrip("/"))
+    """The resolution when a citing-dir candidate names a corpus entry.
+
+    The target is the CANONICAL corpus spelling, not the candidate's (P5):
+    a citing file beside an NFD-named neighbor writes `café.md` composed,
+    and the rewrite pass must move the citation onto the path that exists
+    on disk, not the one the prose used.
+    """
+    hit = index.match_path(cand)
+    if hit is not None:
+        return ("rel_path", hit)
+    stripped = cand.rstrip("/")
+    hit = index.match_dir(stripped)
+    if hit is not None:
+        return ("rel_path", hit)
     return None
 
 
@@ -361,25 +542,28 @@ def _resolve(
         cand = "/".join(parts[i:]).rstrip("/")
         if not cand or cand in (".", ".."):
             continue
-        if cand in index.paths:
-            return ("path", cand)
-        if cand in index.dirs:
-            return ("dir", cand)
-        if is_wikilink and cand in index.by_stem:
-            paths = index.by_stem[cand]
-            if len(paths) > 1:
-                return ("ambiguous", cand)
-            return ("path", paths[0])
+        hit = index.match_path(cand)
+        if hit is not None:
+            return ("path", hit)
+        hit = index.match_dir(cand)
+        if hit is not None:
+            return ("dir", hit)
+        if is_wikilink:
+            paths = index.stem_paths(cand)
+            if paths is not None:
+                if len(paths) > 1:
+                    return ("ambiguous", cand)
+                return ("path", paths[0])
     if citing_dir is not None and "/" in token and not token.startswith("/"):
         hit = _citing_dir_hit(_resolve_from(citing_dir, token), index)
         if hit is not None:
             return hit
     base = parts[-1]
-    paths = index.by_basename.get(base)
+    paths = index.basename_paths(base)
     if paths is None:
         return None
     if len(paths) > 1:
-        return ("ambiguous", base)
+        return ("ambiguous", index.canonical_basename(base) or base)
     return ("basename", paths[0])
 
 
@@ -469,7 +653,15 @@ class BasenameMatcher:
     that boundary honest rather than convenient.
     """
 
-    __slots__ = ("_names", "_root", "_first", "_run_mode", "_ascii", "_slow")
+    __slots__ = (
+        "_names",
+        "_root",
+        "_first",
+        "_run_mode",
+        "_ascii",
+        "_slow",
+        "_slow_folded",
+    )
 
     def __init__(self, basenames: list[str]):
         self._names = list(basenames)
@@ -487,6 +679,7 @@ class BasenameMatcher:
         # sides are ASCII; see the class docstring.
         self._ascii = all(b.isascii() for b in self._names)
         self._slow: re.Pattern[str] | None = None
+        self._slow_folded: re.Pattern[str] | None = None
 
     def _fallback(self) -> re.Pattern[str]:
         """The compiled alternation, for the rare line the trie cannot
@@ -506,6 +699,25 @@ class BasenameMatcher:
             )
         return self._slow
 
+    def _folded(self) -> re.Pattern[str]:
+        """The alternation over FOLDED names, for a corpus whose names are
+        not pure ASCII (P5 normalize-on-match).
+
+        `café.md` stored decomposed is cited as `café.md` composed: the raw
+        alternation cannot see across that difference, this one can — both
+        sides fold before they are compared. Built lazily like `_fallback`,
+        and used only when a candidate name actually carries non-ASCII, so
+        an ASCII corpus never pays for it and no ASCII answer changes.
+        """
+        if self._slow_folded is None:
+            alternation = "|".join(
+                re.escape(_fold(b)) for b in sorted(self._names, key=len, reverse=True)
+            )
+            self._slow_folded = re.compile(
+                r"(?<![\w.-])(" + alternation + r")(?![\w-]|\.[A-Za-z0-9])"
+            )
+        return self._slow_folded
+
     def _starts(self, line: str):
         """Candidate match positions, left to right."""
         if self._run_mode:
@@ -523,9 +735,49 @@ class BasenameMatcher:
         """Whether the compiled alternation was ever needed (tests)."""
         return self._slow is not None
 
+    def _folded_hits(self, line: str) -> list[_Hit]:
+        """Folded matches, mapped back into `line`'s own coordinates.
+
+        The pattern runs on the folded text, so its spans are folded
+        positions; `_fold_spans`' map turns them into positions in the
+        ORIGINAL line (which is what the rewrite pass writes against) and
+        the text is re-sliced from the original so a hit never carries
+        bytes the file does not contain.
+        """
+        folded, positions = _fold_spans(line)
+        out: list[_Hit] = []
+        for m in self._folded().finditer(folded):
+            lo, hi = m.start(1), m.end(1)
+            if lo >= len(positions) or hi - 1 >= len(positions):
+                continue
+            start, end = positions[lo], positions[hi - 1] + 1
+            out.append(_Hit(line[start:end], start, end))
+        return out
+
     def finditer(self, line: str):
         if not (self._ascii and line.isascii()):
-            return self._fallback().finditer(line)
+            raw = [
+                _Hit(m.group(1), m.start(1), m.end(1))
+                for m in self._fallback().finditer(line)
+            ]
+            if self._ascii or line.isascii():
+                # Either side being ASCII puts composition out of reach:
+                # an ASCII line cannot hold a non-ASCII name, and an
+                # ASCII name needs no folding to match. Historical
+                # behavior, byte for byte.
+                return iter(raw)
+            hits = list(raw)
+            taken = [(h.lo, h.hi) for h in hits]
+            for hit in self._folded_hits(line):
+                # An exact/IGNORECASE hit already owns that span; the
+                # folded leg adds the OTHER normal form, never a second
+                # reading of the same one (finditer never overlaps).
+                if any(lo < hit.hi and hit.lo < hi for lo, hi in taken):
+                    continue
+                hits.append(hit)
+                taken.append((hit.lo, hit.hi))
+            hits.sort(key=lambda h: h.lo)
+            return iter(hits)
         hits: list[_Hit] = []
         end_of_last = 0
         root = self._root
@@ -600,7 +852,9 @@ def _line_targets(
 # --- the scans ---------------------------------------------------------------
 
 
-def scan_references(root: Path, rel_paths: list[Path]) -> dict[str, list[str]]:
+def scan_references(
+    root: Path, rel_paths: list[Path], truncated: list[str] | None = None
+) -> dict[str, list[str]]:
     """Return {corpus_path_or_dir: [relpaths of files citing it]}.
 
     Path-keyed: a citation of `docs/api.md` keys the file `docs/api.md`;
@@ -610,6 +864,10 @@ def scan_references(root: Path, rel_paths: list[Path]) -> dict[str, list[str]]:
     text file's mentions count, including files the plan moves.
     Exclusion of moved/rewritten files happens later in reference_risk,
     which knows the plan's full moved set.
+
+    `truncated` collects the paths of files read only as far as the
+    512 KiB per-file cap (P5: the one soft condition that used to be
+    invisible — see `_scan_bytes`).
     """
     index = CitationIndex(rel_paths)
     if not index.paths:
@@ -618,7 +876,7 @@ def scan_references(root: Path, rel_paths: list[Path]) -> dict[str, list[str]]:
     refs: dict[str, list[str]] = {}
     for tp in rel_paths:
         rel_str = tp.as_posix()
-        raw = _scan_bytes(root, tp)
+        raw = _scan_bytes(root, tp, truncated)
         if raw is None:
             continue
         try:
@@ -639,7 +897,9 @@ def scan_references(root: Path, rel_paths: list[Path]) -> dict[str, list[str]]:
     return {k: v for k, v in refs.items() if v}
 
 
-def _scan_bytes(root: Path, tp: Path) -> bytes | None:
+def _scan_bytes(
+    root: Path, tp: Path, truncated: list[str] | None = None
+) -> bytes | None:
     """The bytes to scan a file for citations, or None (not text, gone).
 
     One place for the read policy every scan shares: the extension table
@@ -650,6 +910,13 @@ def _scan_bytes(root: Path, tp: Path) -> bytes | None:
     the same decision without the bytes; callers that then read the file
     go through here so the decision costs no extra open for the
     extensions the table already speaks.
+
+    `truncated` (P5) is the loudness channel for the one thing this policy
+    used to lose in silence: a file bigger than `_PER_FILE_CAP` is read
+    only as far as the cap, so a citation in its tail is invisible to the
+    scan (while the rewrite pass, which reads whole files, could still
+    change it — the two surfaces disagreeing with no signal anywhere).
+    Callers that report pass a list; every over-cap file appends its path.
     """
     known = kinds.kind_of(tp)
     if known == "binary":
@@ -663,9 +930,12 @@ def _scan_bytes(root: Path, tp: Path) -> bytes | None:
         if kinds.classify(tp, head=head) == "binary":
             return None
     try:
-        return (root / tp).read_bytes()[:_PER_FILE_CAP]
+        raw = (root / tp).read_bytes()
     except OSError:
         return None
+    if truncated is not None and len(raw) > _PER_FILE_CAP:
+        truncated.append(tp.as_posix())
+    return raw[:_PER_FILE_CAP]
 
 
 def _walk_rel_paths(root: Path):
@@ -679,7 +949,7 @@ def _walk_rel_paths(root: Path):
     return scan.iter_rel_paths(root)
 
 
-def scan_references_stream(root: Path) -> dict:
+def scan_references_stream(root: Path, truncated: list[str] | None = None) -> dict:
     """Un-capped linear scan: {path_or_dir: [citing]} + a "stats" key.
 
     Phase 3 (reference-rewrites PRD): the 2000-file scan ceiling is
@@ -697,6 +967,9 @@ def scan_references_stream(root: Path) -> dict:
     "hits" counts every resolved citation edge found, even past the
     per-target mentions cap (that cap is a display bound, not a scan
     bound). Callers pop "stats" to recover the plain refs mapping.
+    `stats.truncated_files` counts the files read only to the 512 KiB cap
+    (P5: the audit's "a citation beyond the cap in one file is dropped in
+    total silence"), and `truncated` names them for the caller's envelope.
     """
     root = Path(root)
     rel_paths = list(scan.iter_rel_paths(root))
@@ -705,9 +978,10 @@ def scan_references_stream(root: Path) -> dict:
     refs: dict[str, list[str]] = {}
     files_scanned = 0
     hits = 0
+    over_cap: list[str] = [] if truncated is None else truncated
     for tp in rel_paths:
         rel_str = tp.as_posix()
-        raw = _scan_bytes(root, tp)
+        raw = _scan_bytes(root, tp, over_cap)
         if raw is None:
             continue
         try:
@@ -728,7 +1002,11 @@ def scan_references_stream(root: Path) -> dict:
             if len(bucket) < _MAX_MENTIONS_PER_TARGET:
                 bucket.append(rel_str)
     out = {k: v for k, v in refs.items() if v}
-    out["stats"] = {"files_scanned": files_scanned, "hits": hits}
+    out["stats"] = {
+        "files_scanned": files_scanned,
+        "hits": hits,
+        "truncated_files": len(set(over_cap)),
+    }
     return out
 
 
@@ -858,7 +1136,13 @@ def _expand_token(
         for v in variants:
             matches.update(fnmatch.filter(index.paths, _wild_pattern(v)))
     else:
-        matches = {v for v in variants if v in index.paths}
+        # A brace expansion with no glob: folded lookup, so the variant
+        # that names an NFD-named corpus file in the other normal form is
+        # still "a corpus file" and not a convention string. The glob
+        # branch above stays byte-exact on purpose — `fnmatch` runs over
+        # the raw path set, and a folded variant would have to come back
+        # through a fold-keyed index to be usable as a move target.
+        matches = {index.match_path(v) or v for v in variants if index.match_path(v)}
     if not matches:
         return ("convention", None)
     dests = {}
@@ -894,20 +1178,28 @@ def _rewrite_token(text: str, kind: str, old: str, new: str) -> str | None:
     reported, never guessed.) Relative links whose CITING file also
     moves need recomputation, not replacement — `_rel_link` at the call
     site; the literal swap is for external files and root-path forms.
+
+    Compared folded, sliced by character count (P5): the token may spell
+    the target in the other Unicode normal form, and folding is
+    per-character, so the last `len(old)` characters of `text` are
+    exactly the characters that produced `old`'s folded tail. The
+    ARITHMETIC stays byte-exact; only the EQUALITY tests fold.
     """
-    if text == old:
+    fold_text = _fold(text)
+    fold_old = _fold(old)
+    if fold_text == fold_old:
         return new
-    if text.endswith("/" + old):
+    if fold_text.endswith("/" + fold_old):
         return text[: len(text) - len(old)] + new
-    if kind == "dir" and text.startswith(old.rstrip("/") + "/"):
+    if kind == "dir" and fold_text.startswith(fold_old.rstrip("/") + "/"):
         return new + text[len(old) :]
     if kind == "basename":
         new_base = new.rstrip("/").rsplit("/", 1)[-1]
         if "/" in text:
             # Multi-segment token resolved via its final segment: the
             # same form out — the full new path, not a bare basename.
-            return new if new_base != text else None
-        if new_base != text:
+            return new if _fold(new_base) != fold_text else None
+        if _fold(new_base) != fold_text:
             return new_base
         return None
     return None
@@ -951,7 +1243,10 @@ def _reads_as_relative(text: str, citing_pre: str, index: CitationIndex) -> bool
     if "/" not in text:
         return True
     pre = _resolve_from(_parent(citing_pre), text)
-    return pre in index.paths or pre.rstrip("/") in index.dirs
+    return (
+        index.match_path(pre) is not None
+        or index.match_dir(pre.rstrip("/")) is not None
+    )
 
 
 def _rewritable_link_target(text: str) -> bool:
@@ -1195,7 +1490,7 @@ def _line_rewrite(
             # C5: skip THIS token, not the line. One cite per moving
             # member so the risk rows can say why (B2).
             skips.append(("ambiguous_basename", text, start, end))
-            for p in index.by_basename.get(text.rsplit("/", 1)[-1], []):
+            for p in index.basename_paths(text.rsplit("/", 1)[-1]) or []:
                 if _moved_target(chains, p, prefixes):
                     cites.append((start, end, text, kind, p))
             continue
@@ -1215,7 +1510,7 @@ def _line_rewrite(
             # recompute the relative link. A stay-put citer takes the
             # literal swap below, which preserves `../` prefixes
             # exactly (C2: same form in, same form out).
-            if _resolve_from(_parent(citing_post), text) == new_target:
+            if _fold(_resolve_from(_parent(citing_post), text)) == _fold(new_target):
                 continue
             new_text = _rel_link(_parent(citing_post), new_target, rkind == "dir")
             if text.endswith("/") and not new_text.endswith("/"):
@@ -1227,7 +1522,10 @@ def _line_rewrite(
         if (
             rkind == "basename"
             and "/" in text
-            and not (text == target or target.endswith("/" + text))
+            and not (
+                _fold(text) == _fold(target)
+                or _fold(target).endswith("/" + _fold(text))
+            )
         ):
             # A multi-segment token resolved via its final segment, but
             # the token is neither the corpus path nor a suffix of it:
@@ -1604,7 +1902,11 @@ def plan_rewrites(
 
 
 def citation_lines(
-    root: Path, name: str, rel_paths: list[Path], per_file_cap: int = 5
+    root: Path,
+    name: str,
+    rel_paths: list[Path],
+    per_file_cap: int = 5,
+    truncated: list[str] | None = None,
 ) -> list[dict]:
     """Exact citation sites for `name`: {file, line, text, kind}.
 
@@ -1618,6 +1920,10 @@ def citation_lines(
     disagree — refs missed exact-file citations inside the directory).
     Input for authoring plan `edits`: the agent sees the precise line
     and its surrounding text, writes find/replace against it, done.
+
+    `truncated` names the files read only to the per-file cap (P5); a
+    zero-hit answer from a corpus with one of those in the list is a
+    "the cap may have hidden it" answer, and `refs` says so.
     """
     index = CitationIndex(rel_paths)
     resolved = _resolve(name, index)
@@ -1643,7 +1949,7 @@ def citation_lines(
     for tp in rel_paths:
         if tp.as_posix() == target:
             continue  # a file doesn't cite itself
-        raw = _scan_bytes(root, tp)
+        raw = _scan_bytes(root, tp, truncated)
         if raw is None:
             continue
         try:
@@ -1672,7 +1978,11 @@ def citation_lines(
 
 
 def refs_lookup(
-    root: Path, name: str, rel_paths: list[Path], per_file_cap: int = 5
+    root: Path,
+    name: str,
+    rel_paths: list[Path],
+    per_file_cap: int = 5,
+    truncated: list[str] | None = None,
 ) -> dict:
     """refs' resolution layer (D7), with the honest query state (A5).
 
@@ -1695,6 +2005,10 @@ def refs_lookup(
     basename), `ambiguous` (several files share it — never attributed),
     and `ambiguous_paths` (the candidates). Still ok: true — these are
     valid query results, not errors.
+
+    `truncated` (P5) collects the files the 512 KiB per-file cap cut
+    short, so the caller can say "zero citations, and one file was only
+    read halfway" instead of letting 0 read as proof.
     """
     index = CitationIndex(rel_paths)
     resolved = _resolve(name, index)
@@ -1706,14 +2020,18 @@ def refs_lookup(
         # by_basename candidates first; the stem form comes from the
         # wikilink-only resolution but is worth naming if present.
         ambiguous_paths = sorted(
-            index.by_basename.get(resolved[1]) or index.by_stem.get(resolved[1]) or []
+            index.basename_paths(resolved[1]) or index.stem_paths(resolved[1]) or []
         )
     if nonexistent:
+        # The exact-token comparison folds too: a name the caller spells in
+        # the other normal form is the same query, and this branch is
+        # already the "match the string, nothing else" one.
+        wanted = _fold(name)
         exact: list[dict] = []
         for tp in rel_paths:
-            if tp.as_posix() == name:
+            if _fold(tp.as_posix()) == wanted:
                 continue
-            raw = _scan_bytes(root, tp)
+            raw = _scan_bytes(root, tp, truncated)
             if raw is None:
                 continue
             try:
@@ -1723,7 +2041,7 @@ def refs_lookup(
             hits = 0
             for i, line in enumerate(text.splitlines(), 1):
                 if any(
-                    t == name
+                    _fold(t) == wanted
                     for t, _k, _s, _e in _token_spans(
                         line, index=index, citing_dir=_parent(tp.as_posix())
                     )
@@ -1747,7 +2065,9 @@ def refs_lookup(
             "ambiguous_paths": [],
         }
     return {
-        "citations": citation_lines(root, name, rel_paths, per_file_cap),
+        "citations": citation_lines(
+            root, name, rel_paths, per_file_cap, truncated=truncated
+        ),
         "nonexistent_path": False,
         "exists": exists,
         "ambiguous": ambiguous,
@@ -1761,6 +2081,7 @@ def dangling_citations(
     per_file_cap: int = 5,
     max_total: int = 0,
     prefix: str | None = None,
+    truncated: list[str] | None = None,
 ) -> list[dict]:
     """Path-ish citation sites that resolve to nothing (Phase 11).
 
@@ -1799,7 +2120,7 @@ def dangling_citations(
     out: list[dict] = []
     for tp in rel_paths:
         rel_str = tp.as_posix()
-        raw = _scan_bytes(root, tp)
+        raw = _scan_bytes(root, tp, truncated)
         if raw is None:
             continue
         try:
@@ -1877,7 +2198,10 @@ def _text_files_under(scan_dir: Path) -> list[Path]:
 
 
 def external_citation_lines(
-    scan_dirs: list[Path], name: str, per_file_cap: int = 5
+    scan_dirs: list[Path],
+    name: str,
+    per_file_cap: int = 5,
+    truncated: list[str] | None = None,
 ) -> list[dict]:
     """Citation sites for `name` under directories OUTSIDE the corpus.
 
@@ -1892,23 +2216,28 @@ def external_citation_lines(
     merged citation list. A file does not cite itself by its own
     basename. The per-file read cap is the same _PER_FILE_CAP as
     in-tree; there is no directory-size ceiling (Phase 3 — the old
-    SCAN_FILE_LIMIT gate died with it).
+    SCAN_FILE_LIMIT gate died with it). `truncated` names the files the
+    cap cut short (P5), absolute paths included.
     """
-    pat = _name_pattern(name)
+    search = _name_searcher(name)
     kind = "path" if "/" in name else "basename"
     out: list[dict] = []
+    wanted = _fold(name)
     for scan_dir in scan_dirs:
         for tp in _text_files_under(scan_dir):
-            if tp.name == name:
+            if _fold(tp.name) == wanted:
                 continue  # a file doesn't cite itself by its own basename
             try:
-                raw = tp.read_bytes()[:_PER_FILE_CAP]
+                whole = tp.read_bytes()
+                if truncated is not None and len(whole) > _PER_FILE_CAP:
+                    truncated.append(str(tp))
+                raw = whole[:_PER_FILE_CAP]
                 text = raw.decode("utf-8", errors="replace")
             except Exception:
                 continue
             hits = 0
             for i, line in enumerate(text.splitlines(), 1):
-                if pat.search(line):
+                if search(line):
                     out.append(
                         {
                             "file": str(tp),

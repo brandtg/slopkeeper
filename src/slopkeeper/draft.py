@@ -93,6 +93,10 @@ def draft(
             "against. Run a first tend first.",
             "Run `slopkeeper status <root>` to confirm, then do a full "
             "first tend (AGENT_GUIDE.md).",
+            # P5: status is the read-only confirmation the recovery asks
+            # for; the first tend itself is agent work the guide owns, so
+            # the suggestion stops at the command that says what is true.
+            f"slopkeeper status {root}",
         )
 
     st = status(root)
@@ -187,6 +191,10 @@ def draft(
             "Partition per-directory instead, or pass --force to run the "
             "blocked nearest-neighbour scan anyway (candidate pairs only, "
             "not the full O(n²) sweep).",
+            # P4 (1) made blocking the default, so --force here runs the
+            # same blocked matcher that already handles 5k corpora; the
+            # bound is memory, not correctness.
+            f"slopkeeper draft {root} --force",
         )
 
     # Vector cache: reuse cached per-doc tf whose sha256 matches

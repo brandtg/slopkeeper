@@ -412,7 +412,9 @@ class TestStreamScan(unittest.TestCase):
             {k: sorted(v) for k, v in full.items()},
             {k: sorted(v) for k, v in eager.items()},
         )
-        self.assertEqual(stats, {"files_scanned": 500, "hits": 499})
+        self.assertEqual(
+            stats, {"files_scanned": 500, "hits": 499, "truncated_files": 0}
+        )
 
     def test_stream_ignores_skip_list_and_counts_zero(self):
         # The skip-list is invisible to the stream scan like every walk;
@@ -423,7 +425,9 @@ class TestStreamScan(unittest.TestCase):
         write(tmp / "node_modules/x.js", "docs/api.md\n")
         full = scan_references_stream(tmp)
         self.assertEqual(set(full), {"stats"})
-        self.assertEqual(full["stats"], {"files_scanned": 0, "hits": 0})
+        self.assertEqual(
+            full["stats"], {"files_scanned": 0, "hits": 0, "truncated_files": 0}
+        )
 
 
 class TestHostHeuristicPrefersCorpus(unittest.TestCase):
