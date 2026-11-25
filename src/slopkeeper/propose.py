@@ -193,11 +193,15 @@ def _corpus_rel_paths(root: Path) -> list[Path]:
 
 
 def _kind_of(rel: Path) -> str | None:
-    ext = rel.suffix.lower()
-    for kind, exts in KIND_EXTS.items():
-        if ext in exts:
-            return kind
-    return None
+    """`propose`'s ROUTING bucket (docs|data|code|media) — not the content
+    kind, despite the name it has always had.
+
+    It asks `kinds.route_of` (P5 filetype batch) so the by-name classics
+    finally route too: a Makefile used to fall through every extension
+    bucket and land in `misc/` beside the unidentified pile, and a second
+    routing table here is the drift R7 exists to prevent.
+    """
+    return kinds.route_of(rel)
 
 
 def _project_roots(rel_paths: list[Path]) -> set[str]:
@@ -260,6 +264,7 @@ def _dest_map(root: Path, cand_id: str) -> dict[str, str | None]:
                 "Known candidates: "
                 + ", ".join(cid for cid, _ in CANDIDATES)
                 + " (see `slopkeeper propose`).",
+                f"slopkeeper propose {root}",
             )
         dest[rel_str] = d
     return dest
@@ -386,7 +391,9 @@ def build_candidates(root: Path, extra_scan_dirs: list[Path] | None = None) -> d
     for cand_id, strategy_id in CANDIDATES:
         dest = _dest_map(root, cand_id)
         counts = _counts_for(dest, refs, anchors, root, rel_paths, index)
-        pack = get_strategy(strategy_id)
+        # `root` so a corpus-local or user pack (B10) is the rubric this
+        # candidate is described by, not only the shipped one.
+        pack = get_strategy(strategy_id, root)
         candidates.append(
             {
                 "id": cand_id,

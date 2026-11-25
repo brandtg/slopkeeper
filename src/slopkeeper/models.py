@@ -69,22 +69,57 @@ MANIFEST_SCHEMA = "slopkeeper/manifest@2"
 
 
 class SlopKeeperError(Exception):
-    """An error with a machine-readable code and a recovery hint for the agent."""
+    """An error with a machine-readable code and a recovery hint for the agent.
 
-    def __init__(self, code: str, message: str, recovery: str = ""):
+    `suggested_command` (P5) is the same idea as the success path's `next`,
+    on the failure path: `recovery` is prose a human reads, and an agent
+    should not have to regex a sentence to find the command that gets it
+    unstuck. It is set ONLY where the tool genuinely knows the next
+    command (re-inventory after a stale fingerprint, `strategies list`
+    after an unknown id); an absent key means "no command fixes this",
+    which is a fact worth having too, so it never carries a guess.
+    """
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        recovery: str = "",
+        suggested_command: str = "",
+    ):
         super().__init__(message)
         self.code = code
         self.message = message
         self.recovery = recovery
+        self.suggested_command = suggested_command
 
     def as_dict(self) -> dict:
-        return {"code": self.code, "message": self.message, "recovery": self.recovery}
+        out = {"code": self.code, "message": self.message, "recovery": self.recovery}
+        if self.suggested_command:
+            out["suggested_command"] = self.suggested_command
+        return out
 
 
 # --- envelope ---------------------------------------------------------------
 
 
-def envelope(command: str, data=None, next_action: dict | None = None) -> dict:
+def envelope(
+    command: str,
+    data=None,
+    next_action: dict | None = None,
+    warnings: list[str] | None = None,
+) -> dict:
+    """The one success envelope every JSON command emits.
+
+    `warnings` (P5) is the envelope-level soft-condition list: the
+    machine-greppable tokens `add_warning` collects in the payload are
+    mirrored here, so an agent has ONE place to look — the same level as
+    `ok`, `error` and `next` — instead of knowing that apply carries its
+    warnings inside `data` while skill.install carries free prose there.
+    The payload keeps its own `warnings` key (it is the producer's
+    contract and pinned by tests); this is the canonical read. Absent when
+    there is nothing to say, so a clean run's envelope is unchanged.
+    """
     out = {
         "tool": TOOL,
         "version": VERSION,
@@ -94,11 +129,24 @@ def envelope(command: str, data=None, next_action: dict | None = None) -> dict:
     }
     if next_action:
         out["next"] = next_action
+    merged: list[str] = []
+    if isinstance(data, dict):
+        merged.extend(data.get("warnings") or [])
+    for w in warnings or []:
+        if w not in merged:
+            merged.append(w)
+    if merged:
+        out["warnings"] = merged
     return out
 
 
 def next_step(action: str, command: str, hint: str) -> dict:
-    """Tell the calling agent what to do next. Every success path sets this."""
+    """Tell the calling agent what to do next. Every success path sets this.
+
+    Pinned by tests/test_protocol.py across the command surface. The two
+    exemptions are the markdown-artifact commands (`plan schema`, `guide`),
+    whose stdout IS the artifact and which emit no envelope at all.
+    """
     return {"action": action, "command": command, "hint": hint}
 
 
@@ -465,8 +513,14 @@ def add_warning(data: dict, warning: str) -> dict:
     corpus that moved between the gate and the first write) are facts
     the agent must see, not reasons to stop. Absent-vs-present is the
     whole signal: no warnings means no key, so existing payloads are
-    unchanged. (P5 promotes warnings[] to every envelope; this is the
-    one helper every producer goes through.)
+    unchanged.
+
+    Producers write into the payload they return (this helper); `envelope`
+    mirrors the list up to the envelope itself (P5), which is what an
+    agent should read: `out["warnings"]`, the same level as `ok` and
+    `next`. The payload copy stays because it is the library contract and
+    because a caller that never builds an envelope (the tests, the REPL,
+    another module) still sees what happened.
     """
     warnings = data.setdefault("warnings", [])
     if warning not in warnings:

@@ -30,7 +30,7 @@ from .models import (
     state_dir,
     tend_lock,
 )
-from .inventory import HEAD_BYTES, HEAD_CHARS, _kind  # noqa: F401 (kind reuse)
+from .inventory import HEAD_BYTES, HEAD_CHARS, _kind, _notebook_head  # noqa: F401
 from .scan import scan_corpus
 
 CHARS_PER_TOKEN = 4
@@ -196,6 +196,12 @@ def _head_for(root: Path, rel: str) -> dict:
     kind = _kind(fp)
     if kind == "binary":
         return {"kind": kind, "title": None, "head": None}
+    # The same notebook read inventory does (P5 filetype batch): `status`'s
+    # new-file list used to show `{` as a notebook's title too. One helper,
+    # so the two surfaces cannot drift on what a notebook's text is.
+    notebook = _notebook_head(fp)
+    if notebook is not None:
+        return {"kind": kind, **notebook}
     try:
         with fp.open("rb") as f:
             text = f.read(HEAD_BYTES).decode("utf-8", errors="replace")

@@ -26,7 +26,7 @@ from pathlib import Path
 from .anchors import anchored_dirs
 from .ignore import IGNORE_NAME, load_ignore
 from .inventory import collect
-from .models import SlopKeeperError
+from .models import SlopKeeperError, add_warning
 from .references import CitationIndex, dangling_citations
 from .scan import prepare
 
@@ -333,7 +333,8 @@ def doctor(root: Path) -> dict:
             "churner and re-run. The paths ride along in "
             "`stats.skipped_unstatable_paths`."
         )
-    dangling = dangling_citations(root, walk_files)
+    dangling_truncated: list[str] = []
+    dangling = dangling_citations(root, walk_files, truncated=dangling_truncated)
     if dangling:
         advice.append(
             f"{len(dangling)}+ dangling citation(s) — path-ish references "
@@ -359,7 +360,7 @@ def doctor(root: Path) -> dict:
             "evidence before planning moves."
         )
 
-    return {
+    report = {
         "root": str(root),
         "stats": s,
         "ignore": {"active": ig.active(), "rules": ig.rule_count},
@@ -395,3 +396,10 @@ def doctor(root: Path) -> dict:
             "write the plan JSON, and validate it.",
         },
     }
+    if dangling_truncated:
+        # P5: the dangling count is a FLOOR when some file was read only to
+        # the 512 KiB cap — the survey stopped early, and "0 dangling" and
+        # "not fully looked" must not be the same payload.
+        report["dangling_citations"]["truncated_files"] = len(set(dangling_truncated))
+        add_warning(report, "citation_scan_truncated")
+    return report

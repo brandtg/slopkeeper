@@ -390,6 +390,7 @@ def validate_plan(
             "plan_bad_schema",
             f"plan.schema must be {PLAN_SCHEMA!r}, got {plan.get('schema')!r}",
             "Regenerate the plan from the current schema: slopkeeper plan schema",
+            "slopkeeper plan schema",
         )
 
     # Phase 4: the citation rewrite pass is default-on ("auto" when the
@@ -459,6 +460,10 @@ def validate_plan(
             "what makes the plan safe to apply. Run `slopkeeper inventory "
             "<root> --fast --summary` and record its fingerprint as "
             "based_on.corpus_fingerprint (see `slopkeeper plan schema`).",
+            # P5: the same command on both faces of the refusal (validate
+            # here, apply's gate in apply.py) — an agent auto-recovers by
+            # running it, not by parsing the sentence.
+            f"slopkeeper inventory {root} --fast --summary",
         )
 
     moves = _req(plan, "moves")
@@ -1017,6 +1022,8 @@ def validate_plan(
                 f"source does not exist: {m['from']}",
                 "The corpus changed since the plan was written. "
                 "Re-inventory and regenerate the plan.",
+                # P5: the command the sentence describes.
+                f"slopkeeper inventory {root} --fast --summary",
             )
         if src.is_dir():
             prefix = m["from"].rstrip("/") + "/"

@@ -417,5 +417,227 @@ class TestCompletion(TempCase):
         self.assertEqual(_compute_matches("/us", "/us", s), ["/use"])
 
 
+class TestGateParity(TempCase):
+    """P5 (audit B12): the human at the prompt sees what the agent gets.
+
+    The REPL's docstring promised "the SAME functions the JSON CLI
+    exposes", and at the one place that matters — the gate a person reads
+    before approving a tend — it did not: `/render` built the pre-0.2.6
+    reference report, so the rewrite summary, the straggler rows and the
+    anchor risks were missing. These tests pin the parity claim, command by
+    command, on the output a human actually reads.
+    """
+
+    def setUp(self):
+        super().setUp()
+        seed_manifest(self.root)
+        self.plan_path = write_plan(self.root)
+
+    def test_render_shows_the_rewrite_summary_header(self):
+        # WATCHLIST.md cites two of the four moved files; the pass fixes
+        # both, and the gate must show that to the human BEFORE /apply.
+        code, out = run_repl(
+            [
+                f"/use {self.root}",
+                f"/load {self.plan_path}",
+                "/plan",
+                "/render",
+                "/quit",
+            ]
+        )
+        self.assertEqual(code, 0, out)
+        self.assertIn("Citation rewrites (automatic): 2 across 1 file(s)", out)
+        self.assertIn("`WATCHLIST.md`", out)
+        # …and the rest of the CLI gate: the per-site table and the
+        # folder section.
+        self.assertIn("Every rewrite, site by site", out)
+        self.assertIn("Folders to scaffold", out)
+
+    def test_render_matches_the_cli_gate_section_for_section(self):
+        # Same plan, two surfaces: every heading the CLI renders is in the
+        # REPL's output. (Parity as a test, not as a claim in a docstring.)
+        # `plan render` prints the markdown itself — the artifact exception
+        # — so this captures raw stdout, not an envelope.
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = cli.main(["plan", "render", str(self.plan_path), str(self.root)])
+        self.assertEqual(code, 0)
+        cli_out = buf.getvalue()
+        self.assertIn("## Summary", cli_out)  # the CLI rendered a real gate
+        _, repl_out = run_repl(
+            [
+                f"/use {self.root}",
+                f"/load {self.plan_path}",
+                "/plan",
+                "/render",
+                "/quit",
+            ]
+        )
+        for heading in ("## Summary", "## Folders to scaffold", "Citation rewrites"):
+            with self.subTest(heading=heading):
+                self.assertIn(heading, repl_out)
+
+    def test_refs_names_a_nonexistent_query(self):
+        code, out = run_repl([f"/use {self.root}", "/refs no_such_file.md", "/quit"])
+        self.assertEqual(code, 0, out)
+        self.assertIn("no such corpus path", out)
+
+    def test_refs_reports_ambiguity_instead_of_silence(self):
+        write(self.root / "alpha" / "note.md", "# one\n")
+        write(self.root / "beta" / "note.md", "# two\n")
+        code, out = run_repl([f"/use {self.root}", "/refs note.md", "/quit"])
+        self.assertEqual(code, 0, out)
+        self.assertIn("AMBIGUOUS", out)
+        self.assertIn("alpha/note.md", out)
+        self.assertIn("beta/note.md", out)
+
+    def test_refs_dangling_mode(self):
+        write(self.root / "loose.md", "See gone/missing-report.md for the old data.\n")
+        code, out = run_repl([f"/use {self.root}", "/refs --dangling", "/quit"])
+        self.assertEqual(code, 0, out)
+        self.assertIn("dangling citation", out)
+        self.assertIn("missing-report.md", out)
+
+    def test_refs_without_arguments_explains_both_forms(self):
+        code, out = run_repl([f"/use {self.root}", "/refs", "/quit"])
+        self.assertEqual(code, 0, out)
+        self.assertIn("no_basename", out)
+        self.assertIn("--dangling", out)
+
+    def test_apply_force_gets_past_a_moved_corpus(self):
+        # Without --force the same tend refuses (and the refusal is the
+        # error code, not a stack trace); with it, the moves run.
+        write(
+            self.root / "docs" / "canonical.md",
+            "# Canonical\n\nedited after authoring\n",
+        )
+        code, out = run_repl(
+            [
+                f"/use {self.root}",
+                f"/load {self.plan_path}",
+                "/plan",
+                "/apply",
+                "y",
+                "/quit",
+            ]
+        )
+        self.assertEqual(code, 0, out)
+        self.assertIn("corpus_changed", out)
+        self.assertTrue((self.root / "acme_dossier.md").exists())  # nothing moved
+
+        code, out = run_repl(
+            [
+                f"/use {self.root}",
+                f"/load {self.plan_path}",
+                "/plan",
+                "/apply --force",
+                "y",
+                "/quit",
+            ]
+        )
+        self.assertEqual(code, 0, out)
+        self.assertIn("--force", out)
+        self.assertIn("Executed:", out)
+        self.assertTrue(
+            (self.root / "research" / "dossiers" / "acme_dossier.md").exists()
+        )
+
+    def test_apply_strict_references_flag_reaches_apply(self):
+        # The flag is only real if it changes behavior: a plan whose risks
+        # are NOT covered must refuse under --strict-references and run
+        # without it.
+        plan_path = write_plan(
+            self.root,
+            moves=[
+                {
+                    "from": "acme_dossier.md",
+                    "to": "research/acme_dossier.md",
+                    "reason": "pile",
+                }
+            ],
+            keep=[
+                "globex_dossier.md",
+                "handoff-tp2.md",
+                "ledger_wb.html",
+                "WATCHLIST.md",
+                "docs",
+                "lead-gen",
+                "spark-1.2.3",
+            ],
+            # The rewrite pass is off, so WATCHLIST.md's citation of the
+            # moved file is an uncovered risk.
+            rewrites={"mode": "off"},
+        )
+        code, out = run_repl(
+            [
+                f"/use {self.root}",
+                f"/load {plan_path}",
+                "/plan",
+                "/apply --strict-references",
+                "y",
+                "/quit",
+            ]
+        )
+        self.assertEqual(code, 0, out)
+        self.assertIn("referenced_moves", out)
+        self.assertTrue((self.root / "acme_dossier.md").exists())
+
+    def test_apply_rejects_unknown_arguments(self):
+        code, out = run_repl(
+            [
+                f"/use {self.root}",
+                f"/load {self.plan_path}",
+                "/plan",
+                "/apply --oops",
+                "/quit",
+            ]
+        )
+        self.assertEqual(code, 0, out)
+        self.assertIn("unknown argument", out)
+        self.assertIn("--force", out)  # the usage line names what IS allowed
+
+    def test_undo_reports_the_path_map(self):
+        code, out = run_cli(["apply", str(self.plan_path), str(self.root), "--execute"])
+        self.assertEqual(code, 0, out)
+        code, out = run_repl([f"/use {self.root}", "/undo 1", "/quit"])
+        self.assertEqual(code, 0, out)
+        self.assertIn("4 path(s) return to their pre-tend location", out)
+
+    def test_strategies_tag_local_packs(self):
+        # B10 legibility at the prompt: an override is visible as one.
+        import os
+
+        config = self.tmp / "cfg"
+        pack_dir = config / "slopkeeper" / "strategies"
+        pack_dir.mkdir(parents=True)
+        (pack_dir / "acme.json").write_text(
+            json.dumps(
+                {
+                    "id": "acme",
+                    "name": "Acme",
+                    "summary": "years only",
+                    "partitioning_rubric": ["one folder per year"],
+                    "folder_template": {
+                        "kind": "case",
+                        "agents_md_skeleton": "# <Name>",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        saved = os.environ.get("XDG_CONFIG_HOME")
+        os.environ["XDG_CONFIG_HOME"] = str(config)
+        try:
+            code, out = run_repl([f"/use {self.root}", "/strategies", "/quit"])
+        finally:
+            if saved is None:
+                os.environ.pop("XDG_CONFIG_HOME", None)
+            else:
+                os.environ["XDG_CONFIG_HOME"] = saved
+        self.assertEqual(code, 0, out)
+        self.assertIn("acme: years only [user]", out)
+        self.assertIn("hybrid:", out)
+
+
 if __name__ == "__main__":
     unittest.main()

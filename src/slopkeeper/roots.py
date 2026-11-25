@@ -105,6 +105,7 @@ def remove_root(path: str | Path) -> list[str]:
             "root_not_registered",
             f"{target} is not in the roots registry",
             "Check `slopkeeper roots list` for the registered paths.",
+            "slopkeeper roots list",
         )
     roots = [r for r in roots if r != target]
     save_roots(roots)

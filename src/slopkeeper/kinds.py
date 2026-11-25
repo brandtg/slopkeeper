@@ -52,6 +52,13 @@ SNIFF_BYTES = 8192
 # comparison of a JPEG is a waste of a hash, and the same rule now
 # covers the extensions identical_groups used to miss (audit: the
 # narrower inline list hashed .webp/.tar/.mp3/.db anyway).
+#
+# P5's filetype batch named the office containers explicitly rather than
+# leaving them to the sniff: `.odt`/`.ods`/`.odp`/`.epub` are zips and
+# `.doc`/`.xls` are OLE containers, so a table answer costs no open and no
+# 8 KiB read per file. Their TITLES still come from extraction
+# (inventory's `_extract_head`, where the ODF/EPUB parts are read with
+# stdlib `zipfile` — no external binary to be absent).
 BINARY_EXTS = frozenset(
     {
         ".png",
@@ -80,6 +87,12 @@ BINARY_EXTS = frozenset(
         ".woff",
         ".woff2",
         ".ttf",
+        ".odt",
+        ".ods",
+        ".odp",
+        ".epub",
+        ".doc",
+        ".xls",
     }
 )
 
@@ -147,11 +160,90 @@ TEXT_EXTS = frozenset(
         ".ipynb",
         ".log",
         ".jsonl",
+        # SVG is XML that cites things (audit P5 filetype batch: "SVG
+        # explicitly text"): it carries `xlink:href` and `<image
+        # src="diagram-data.csv">` style paths, so it must be scannable
+        # for citations and citable by name, not left to the NUL sniff.
+        ".svg",
         # code, repeated so the set is readable standalone; frozenset
         # unions make the duplication harmless.
         *CODE_EXTS,
     }
 )
+
+# --- files known by NAME, not by extension (P5 filetype batch) --------------
+#
+# `Makefile`, `Dockerfile`, `LICENSE`, `.env` — the classics that carry no
+# extension at all, and constantly cite filenames. The extension tables
+# cannot answer for them, so the old `is_text_file` (extension-gated, the
+# audit's line) made them invisible to the reference scan while inventory's
+# sniff called them text. One name table now answers both questions — the
+# kind, and whether the bare name is citable — and it is consulted only
+# AFTER the extension tables have had their say, so no extension that
+# already has an answer changes: `README.txt` is text (the extension
+# speaks), `README` is doc (the name does).
+#
+# Exact lowercase names whose kind the table vouches for.
+NAME_KINDS: dict[str, str] = {
+    "makefile": "code",
+    "dockerfile": "code",
+    "justfile": "code",
+    "gemfile": "code",
+    "rakefile": "code",
+    "vagrantfile": "code",
+    "jenkinsfile": "code",
+    "procfile": "code",
+    "brewfile": "code",
+    ".gitignore": "text",
+    ".dockerignore": "text",
+    ".npmignore": "text",
+    ".gitattributes": "text",
+    ".editorconfig": "text",
+    ".shellcheckrc": "text",
+}
+# Name families: a documented prefix plus a separator (or nothing). The
+# separator requirement is what keeps `readmelater` from being a README —
+# `LICENSE-MIT` and `.env.production` are the shapes that matter.
+#
+# Deliberately NOT here: `NOTICE`, `AUTHORS`, `NEWS`. They are real
+# classics, but they are also ordinary prose words, and a basename is
+# matched case-INsensitively — filing `NEWS` would make the word "news"
+# in a sentence a citation of it, and the rewrite pass would happily
+# rewrite that word when the file moved. The name table is for files whose
+# names no sentence uses.
+NAME_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("readme", "doc"),
+    ("changelog", "doc"),
+    ("contributing", "doc"),
+    ("code_of_conduct", "doc"),
+    ("license", "text"),
+    ("licence", "text"),
+    (".env", "text"),
+)
+_NAME_BOUNDARY = ("", ".", "-", "_", " ")
+
+
+def name_kind(name: str) -> str | None:
+    """The table's answer for a NAME (no extension needed), or None.
+
+    Lowercased, and only reached when no extension answered: see
+    `NAME_KINDS` for why the ordering matters. This is also the one
+    predicate `CitationIndex` asks when it decides whether a dotless name
+    is a citable basename — `Makefile` has no dot, and the old rule
+    ("a bare word is never a basename") made every file in this table
+    uncitable.
+    """
+    low = name.lower()
+    if low in NAME_KINDS:
+        return NAME_KINDS[low]
+    for prefix, kind in NAME_PREFIXES:
+        if not low.startswith(prefix):
+            continue
+        rest = low[len(prefix) :]
+        if rest == "" or rest[0] in _NAME_BOUNDARY:
+            return kind
+    return None
+
 
 # --- propose's destination buckets (a different axis, one owner) -------
 #
@@ -172,6 +264,12 @@ DOCS_EXTS = frozenset(
         ".pdf",
         ".docx",
         ".pptx",
+        ".odt",
+        ".ods",
+        ".odp",
+        ".epub",
+        ".doc",
+        ".xls",
         ".tex",
         ".html",
         ".htm",
@@ -217,14 +315,79 @@ KIND_EXTS: dict[str, frozenset[str]] = {
     "media": MEDIA_EXTS,
 }
 
+# Where the by-NAME classics get filed (P5 filetype batch). The extension
+# buckets cannot answer for a file with no extension, and `propose` used to
+# drop every one of them into `misc/` — a corpus's Makefile, Dockerfile and
+# LICENSE sorted with the unidentified pile. Same discipline as the
+# buckets: one owner, and a prefix key matches on the same boundary rule
+# `name_kind` uses.
+NAME_ROUTING: dict[str, str] = {
+    "makefile": "code",
+    "dockerfile": "code",
+    "justfile": "code",
+    "gemfile": "code",
+    "rakefile": "code",
+    "vagrantfile": "code",
+    "jenkinsfile": "code",
+    "procfile": "code",
+    "brewfile": "code",
+    ".gitignore": "data",
+    ".dockerignore": "data",
+    ".npmignore": "data",
+    ".gitattributes": "data",
+    ".editorconfig": "data",
+    ".shellcheckrc": "data",
+    ".env": "data",
+    "readme": "docs",
+    "changelog": "docs",
+    "contributing": "docs",
+    "code_of_conduct": "docs",
+    "license": "docs",
+    "licence": "docs",
+}
+
+
+def _name_prefix_hit(name_low: str, table: dict[str, str]) -> str | None:
+    """Exact name match, else a documented prefix + boundary in `table`."""
+    if name_low in table:
+        return table[name_low]
+    for key, value in table.items():
+        if not name_low.startswith(key):
+            continue
+        rest = name_low[len(key) :]
+        if rest == "" or rest[0] in _NAME_BOUNDARY:
+            return value
+    return None
+
+
+def route_of(path: Path | str) -> str | None:
+    """`propose`'s destination bucket for `path`: docs|data|code|media|None.
+
+    The extension buckets answer when the extension speaks; the name table
+    answers when it does not (Makefile, LICENSE, .env). One owner for the
+    routing answer, exactly as `kind_of` is the one owner for the content
+    answer — `propose._kind_of` is this function.
+    """
+    p = Path(path)
+    ext = p.suffix.lower()
+    for bucket, exts in KIND_EXTS.items():
+        if ext in exts:
+            return bucket
+    return _name_prefix_hit(p.name.lower(), NAME_ROUTING)
+
 
 def kind_of(path: Path | str) -> str | None:
     """The table's answer for `path`: binary|code|doc|text, or None.
 
-    None means the extension is silent — the caller either sniffs
-    (`classify`) or treats the file as unknown. No I/O.
+    None means the table is silent — the caller either sniffs (`classify`)
+    or treats the file as unknown. No I/O.
+
+    The extension speaks first; a name answers only when no extension did
+    (so `README.txt` stays "text" by extension and `README` is "doc" by
+    name — nothing that already had an answer changes).
     """
-    ext = Path(path).suffix.lower()
+    p = Path(path)
+    ext = p.suffix.lower()
     if ext in BINARY_EXTS:
         return "binary"
     if ext in CODE_EXTS:
@@ -233,7 +396,7 @@ def kind_of(path: Path | str) -> str | None:
         return "doc"
     if ext in TEXT_EXTS:
         return "text"
-    return None
+    return name_kind(p.name)
 
 
 def sniff_binary(path: Path, budget: int = SNIFF_BYTES) -> bool:
@@ -276,8 +439,25 @@ def is_binary(path: Path | str) -> bool:
 
 
 def is_code(path: Path | str) -> bool:
-    """`path`'s extension is a known code extension (table only, no I/O)."""
-    return Path(path).suffix.lower() in CODE_EXTS
+    """`path` is one of the table's code files (no I/O).
+
+    The name table counts, not just the extension: a Makefile or Dockerfile
+    builds paths out of literals exactly like a `.sh` does, and the anchor
+    scan reads those (`anchors.scan_code_anchors` gates on this).
+    """
+    return kind_of(path) == "code"
+
+
+def is_citable_name(name: str) -> bool:
+    """Can a dotless `name` be a citation target?
+
+    `CitationIndex.by_basename` requires a dot (the "a bare word is never a
+    basename" rule that keeps prose out of the citation index) — which also
+    kept every extensionless classic out of it. A name the table vouches
+    for is not prose: `Makefile`, `Dockerfile`, `LICENSE`, `README` are
+    file names people cite, so the index admits them.
+    """
+    return name_kind(name) is not None
 
 
 def is_scannable(path: Path | str, head: bytes | None = None) -> bool:

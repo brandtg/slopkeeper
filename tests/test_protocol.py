@@ -6,16 +6,139 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import unittest
 from pathlib import Path
 
 from helpers import TempCase, write, write_plan
+from slopkeeper import cli
 from slopkeeper.apply import apply_plan, undo_journal
 from slopkeeper.doctor import doctor
 from slopkeeper.inventory import collect
 from slopkeeper.plan import load_plan, render_markdown, validate_plan
 from slopkeeper.scaffold import scaffold_from_plan
+
+
+def run_cli(argv) -> tuple[int, dict]:
+    """Run cli.main in-process; return (exit code, parsed envelope)."""
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code = cli.main(argv)
+    return code, json.loads(buf.getvalue())
+
+
+class TestEnvelopeShape(TempCase):
+    """P5: the envelope is API, so its shape is asserted, not assumed.
+
+    Every JSON command answers the same question the same way:
+    `{tool, version, command, ok, data}` plus `next` on the success path,
+    `error` on the failure path, and `warnings` on either when something
+    soft happened. The audit's protocol promise is only worth what a test
+    makes it worth — an agent parses these keys, so they are pinned here
+    across the breadth of the command set rather than per command.
+    """
+
+    # (argv builder, command name) for the read-only surface.
+    def _cases(self):
+        root = str(self.root)
+        plan = write_plan(self.root)
+        return [
+            (["doctor", root], "doctor"),
+            (["inventory", root, "--fast"], "inventory"),
+            (["clusters", root], "clusters"),
+            (["status", root], "status"),
+            (["refs", root, "acme_dossier.md"], "refs"),
+            (["propose", root], "propose"),
+            (["strategies"], "strategies.list"),
+            (["strategies", "show", "hybrid"], "strategies.show"),
+            (["strategies", "dirs"], "strategies.dirs"),
+            (["roots", "list"], "roots.list"),
+            (["plan", "validate", str(plan), root], "plan.validate"),
+            (["apply", str(plan), root], "apply"),
+            (["scaffold", str(plan), root], "scaffold"),
+        ]
+
+    def test_every_success_envelope_has_the_contract_keys(self):
+        for argv, command in self._cases():
+            with self.subTest(command=command):
+                code, env = run_cli(argv)
+                self.assertEqual(code, 0, env)
+                self.assertEqual(env["tool"], "slopkeeper")
+                self.assertTrue(env["version"])
+                self.assertEqual(env["command"], command)
+                self.assertTrue(env["ok"])
+                self.assertIn("data", env)
+                self.assertNotIn("error", env)
+                # Every success path chains (the two exceptions are the
+                # bare artifact commands: `plan schema` and `guide`).
+                self.assertIn("next", env)
+                for key in ("action", "command", "hint"):
+                    self.assertIn(key, env["next"])
+
+    def test_error_envelope_shape_and_exit_code(self):
+        # Failure is the same envelope with ok false and an error object;
+        # `plan_*` codes exit 2 (fixable by the caller), the rest 1.
+        code, env = run_cli(["doctor", str(self.tmp / "not-a-corpus")])
+        self.assertEqual(code, 1)
+        self.assertFalse(env["ok"])
+        self.assertNotIn("data", env)
+        self.assertEqual(env["error"]["code"], "no_corpus")
+        self.assertTrue(env["error"]["recovery"])
+        self.assertNotIn("warnings", env)
+
+    def test_plan_family_errors_exit_two(self):
+        code, env = run_cli(
+            ["plan", "validate", str(self.tmp / "x.json"), str(self.root)]
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(env["error"]["code"], "plan_unreadable")
+
+    def test_undo_chains_too(self):
+        # `next_step`'s docstring promises every success path chains, and
+        # `undo` was the last command that did not (P5). A dry-run chains
+        # to the execute; an execute chains to the status that shows the
+        # corpus it just put back.
+        plan_path = write_plan(self.root)
+        applied = apply_plan(plan_path, self.root, execute=True)
+        code, dry = run_cli(["undo", applied["journal"], str(self.root)])
+        self.assertEqual(code, 0, dry)
+        self.assertEqual(dry["next"]["action"], "undo")
+        self.assertIn("--execute", dry["next"]["command"])
+        code, done = run_cli(["undo", applied["journal"], str(self.root), "--execute"])
+        self.assertEqual(code, 0, done)
+        self.assertEqual(done["next"]["action"], "status")
+        self.assertIn(f"slopkeeper status {self.root}", done["next"]["command"])
+
+    def test_warnings_are_a_list_of_tokens_when_present(self):
+        # A casefold-colliding pair of destinations is the deterministic
+        # soft condition: `plan validate` reports it as a warning (P4) and
+        # P5 mirrors it onto the envelope. The token list must be strings,
+        # deduped, and identical at both levels.
+        plan_path = write_plan(
+            self.root,
+            moves=[
+                {"from": "acme_dossier.md", "to": "docs/Note.md", "reason": "x"},
+                {"from": "globex_dossier.md", "to": "docs/note.md", "reason": "y"},
+            ],
+            keep=[
+                "WATCHLIST.md",
+                "handoff-tp2.md",
+                "ledger_wb.html",
+                "docs",
+                "lead-gen",
+                "spark-1.2.3",
+            ],
+            partial=True,
+        )
+        code, env = run_cli(["plan", "validate", str(plan_path), str(self.root)])
+        self.assertEqual(code, 0, env)
+        self.assertIsInstance(env["warnings"], list)
+        self.assertTrue(all(isinstance(w, str) for w in env["warnings"]))
+        self.assertEqual(len(env["warnings"]), len(set(env["warnings"])))
+        self.assertIn("case_collision", env["warnings"])
+        self.assertEqual(env["warnings"], env["data"]["warnings"])
 
 
 class TestStrictReferencesCoveredByRewrites(TempCase):

@@ -9,6 +9,16 @@ the SAME functions the JSON CLI exposes — no new write path, no new
 error codes. What the REPL adds is a human rendering and an explicit
 interactive confirm (default NO) in front of every `--execute`.
 
+"Same functions" is a contract, and it used to be false where it mattered
+(audit B12): `/render` built the pre-0.2.6 reference report, so the human
+approving a tend at the prompt saw no rewrite summary, no straggler rows
+and no anchor risks — a strictly weaker gate than an agent gets from
+`plan render`. It now calls `build_gate_report` with the same sections the
+CLI passes, `/refs` answers the honest query questions (`exists`,
+`ambiguous`, `--dangling`, the 512 KiB read-cap caveat), and `/apply`
+takes `--force` / `--strict-references` / `--allow-partial`. A human and an
+agent reading the same corpus see the same thing.
+
 The intended loop is the re-tend review: `/draft` (or `/load` a plan
 your agent wrote), walk the proposed moves with `/show`, decide each
 one with `/no` `/defer` `/dest`, compile with `/plan`, read the rendered
@@ -34,7 +44,7 @@ import sys
 from pathlib import Path
 
 from . import VERSION
-from .apply import apply_plan, build_ref_report, undo_journal
+from .apply import apply_plan, undo_journal
 from .doctor import doctor
 from .draft import draft as draft_plan
 from .inventory import collect
@@ -232,21 +242,82 @@ def _render_clusters(s: _Session, out) -> None:
 
 
 def _render_refs(s: _Session, arg: str, out) -> None:
-    if not arg:
-        raise SlopKeeperError(
-            "no_basename", "usage: /refs <basename>", "e.g. /refs acme_dossier.md"
-        )
+    """/refs <basename> — and /refs --dangling — with the honest query state.
+
+    P5 (B12) parity with `slopkeeper refs`: the REPL used to call
+    `citation_lines` directly, which cannot answer the three questions the
+    CLI payload answers — does this name exist in the corpus at all, is it
+    ambiguous (several files share the basename, never guessed), and are
+    there already-broken citations anywhere (`--dangling`). "No citations"
+    used to mean all three to a human at the prompt, exactly the trap the
+    CLI fixed in 0.2.6.
+    """
     from .apply import _all_rel_paths
-    from .references import citation_lines
+    from .references import dangling_citations, refs_lookup
 
     root = s.require_root()
-    hits = citation_lines(root, arg, _all_rel_paths(root))
-    if not hits:
-        _p(out, f"No citations of {arg} found inside the corpus.")
+    parts = arg.split()
+    dangling = False
+    name = ""
+    for p in parts:
+        if p in ("--dangling", "-d"):
+            dangling = True
+        elif not name:
+            name = p
+    if dangling:
+        sites = dangling_citations(root, _all_rel_paths(root))
+        if not sites:
+            _p(out, "No dangling citations — every path-ish reference resolves.")
+            return
+        _p(out, f"{len(sites)} dangling citation(s) (path-shaped, resolve to nothing):")
+        for site in sites[:20]:
+            text = _trunc(site["text"].strip(), WIDTH - 24)
+            _p(out, f"  {site['file']}:{site['line']}: {text}")
+        if len(sites) > 20:
+            _p(out, f"  … and {len(sites) - 20} more (CLI: refs --dangling lists all)")
+        _p(out, "  Informational: the rewrite pass never touches these; fix by hand.")
         return
-    _p(out, f"{len(hits)} citation(s) of {arg}:")
+    if not name:
+        raise SlopKeeperError(
+            "no_basename",
+            "usage: /refs <basename> | /refs --dangling",
+            "e.g. /refs acme_dossier.md — or /refs --dangling for broken links",
+        )
+    truncated: list[str] = []
+    lookup = refs_lookup(root, name, _all_rel_paths(root), truncated=truncated)
+    hits = lookup["citations"]
+    if not lookup["exists"]:
+        # The A5 signal, in the human's face: a name that resolves to
+        # nothing is a typo or a stale path, not an uncited file.
+        _p(out, f"{name}: no such corpus path, directory or unique basename.")
+        if lookup["nonexistent_path"]:
+            _p(out, "  (a slashed name that exists nowhere: only exact mentions count)")
+    elif lookup["ambiguous"]:
+        _p(
+            out,
+            f"{name}: AMBIGUOUS — several files share this basename, never guessed:",
+        )
+        for cand in lookup["ambiguous_paths"][:10]:
+            _p(out, f"    {cand}")
+    if not hits:
+        if lookup["exists"] and not lookup["ambiguous"]:
+            _p(out, f"No citations of {name} found inside the corpus.")
+        if truncated:
+            _p(
+                out,
+                f"  (caveat: {len(set(truncated))} file(s) were read only as far as"
+                " the 512 KiB scan cap)",
+            )
+        return
+    _p(out, f"{len(hits)} citation(s) of {name}:")
     for h in hits[:20]:
         _p(out, f"  {h['file']}:{h['line']}: {_trunc(h['text'].strip(), WIDTH - 20)}")
+    if truncated:
+        _p(
+            out,
+            f"  (caveat: {len(set(truncated))} file(s) were read only as far as the"
+            " 512 KiB scan cap — a citation deeper in one of them is not listed)",
+        )
 
 
 def _cat(s: _Session, arg: str, out) -> None:
@@ -397,11 +468,15 @@ def _cmd_cat(s, arg, lines, out) -> None:
 
 
 def _cmd_strategies(s, arg, lines, out) -> None:
+    """`/strategies` lists what is visible INCLUDING your own packs; the
+    origin tag (B10) is how you tell that your override took effect."""
+    root = s.root
     if arg:
-        _p(out, json.dumps(get_strategy(arg), indent=2))
+        _p(out, json.dumps(get_strategy(arg, root), indent=2))
     else:
-        for st in list_strategies():
-            _p(out, f"  {st['id']}: {st.get('summary', st.get('name', ''))}")
+        for st in list_strategies(root):
+            tag = "" if st.get("origin") == "packaged" else f" [{st.get('origin')}]"
+            _p(out, f"  {st['id']}: {st.get('summary', st.get('name', ''))}{tag}")
 
 
 def _cmd_draft(s, arg, lines, out) -> None:
@@ -566,39 +641,121 @@ def _cmd_plan(s, arg, lines, out) -> None:
 
 
 def _cmd_render(s, arg, lines, out) -> None:
+    """The human gate — the SAME render the CLI prints (P5, audit B12).
+
+    This used to call `build_ref_report`, the pre-0.2.6 reference report:
+    no rewrite summary (what the citation pass will actually do), no
+    straggler rows, no anchor risks, no emptied-dir breakdown. The module
+    docstring claimed the REPL drives "the SAME functions the JSON CLI
+    exposes"; at the one place a human decides whether a tend is safe, it
+    did not — a person at `/render` approved a strictly weaker picture than
+    an agent driving `plan render`. Now both go through
+    `build_gate_report` + `render_markdown` with every section the CLI
+    passes.
+    """
+    from .anchors import anchored_move_risks
+    from .apply import _run_artifacts, build_gate_report
+    from .plan import straggler_report
+
     if s.plan_path is None or s.dirty:
         _p(out, "Decisions changed — /plan first (it validates and saves).")
         return
+    root = s.require_root()
     plan = load_plan(s.plan_path)
-    _p(out, render_markdown(plan, build_ref_report(plan, s.require_root())))
+    # This run's artifacts (the plan file itself, when it sits inside the
+    # corpus) are excluded from the scan exactly as the CLI excludes its
+    # own, so the tool never rewrites its own inputs.
+    exclude = _run_artifacts(root, str(s.plan_path))
+    truncated: list[str] = []
+    ref_report, rewrite_summary = build_gate_report(plan, root, exclude, truncated)
+    md = render_markdown(
+        plan,
+        ref_report,
+        rewrite_summary,
+        stragglers=straggler_report(root, plan),
+        code_anchor_risks=anchored_move_risks(root, plan),
+        emptied_dirs=plan.get("emptied_dir_suggestions") or [],
+    )
+    _p(out, md)
+    if truncated:
+        _p(
+            out,
+            f"\n(note: {len(set(truncated))} file(s) were read only as far as the"
+            " 512 KiB citation cap — the CLI's envelope carries this as"
+            ' "citation_scan_truncated")',
+        )
 
 
 def _cmd_apply(s, arg, lines, out) -> None:
+    """Dry-run, confirm, execute — with the CLI's --force / --strict-references.
+
+    P5 (B12): the REPL used to have no way to say either. `--force` (the
+    corpus moved since the plan was authored) and `--strict-references`
+    (refuse unless every at-risk citation is covered) are the two flags an
+    operator actually needs mid-review, and lacking them the REPL could not
+    complete a tend the CLI would complete.
+    """
     if s.plan_path is None or s.dirty:
         raise SlopKeeperError(
             "no_plan",
             "no compiled plan — /plan first (or /load + /plan)",
             "/moves and /no /defer /dest decide; /plan compiles.",
         )
+    flags = arg.split()
+    allowed = {"--force", "--strict-references", "--allow-partial"}
+    unknown = [f for f in flags if f not in allowed]
+    if unknown:
+        # A typo'd flag must not read as "the flag was accepted": /apply
+        # --strict-reference silently losing strictness is the exact class
+        # of surprise the audit's agent-ergonomics section is about.
+        _p(out, f"  unknown argument(s): {', '.join(unknown)}")
+        _p(out, "  usage: /apply [--force] [--strict-references] [--allow-partial]")
+        return
+    force = "--force" in flags
+    strict = "--strict-references" in flags
+    allow_partial = "--allow-partial" in flags
     root = s.require_root()
-    dry = apply_plan(s.plan_path, root, execute=False)
+    dry = apply_plan(
+        s.plan_path,
+        root,
+        execute=False,
+        force=force,
+        strict_references=strict,
+        allow_partial=allow_partial,
+    )
     would = len(dry.get("would_move", []))
     risks = len(dry.get("reference_risks", {}) or {})
     _p(
         out,
         f"Dry run: {would} move(s)"
         + (f", {risks} file(s) with reference risks" if risks else "")
+        + (", --force" if force else "")
+        + (", --strict-references" if strict else "")
         + ".",
     )
     for src, risk in (dry.get("reference_risks") or {}).items():
         _p(out, f"  ⚠ {src}: cited by {risk['external_references']} stay-put file(s)")
+    for warn in dry.get("warnings") or []:
+        # P5: the same soft conditions the CLI envelope carries — a human
+        # at the prompt deserves the "the scan was capped somewhere" note
+        # too, not just the agent parsing JSON.
+        _p(out, f"  ! {warn}")
     if not _confirm(lines, out, f"Execute {would} move(s) with --execute?"):
         _p(out, "Aborted — nothing moved.")
         return
-    data = apply_plan(s.plan_path, root, execute=True)
+    data = apply_plan(
+        s.plan_path,
+        root,
+        execute=True,
+        force=force,
+        strict_references=strict,
+        allow_partial=allow_partial,
+    )
     _p(out, f"Executed: {data['moved_count']} moved, journal {data.get('journal')}")
     for err in data.get("errors", []):
         _p(out, f"  ✗ {err}")
+    for warn in data.get("warnings") or []:
+        _p(out, f"  ! {warn}")
     if data.get("partial"):
         _p(out, f"  PARTIAL — undo with: slopkeeper undo {data.get('journal')} {root}")
     _p(out, "  /scaffold writes the AGENTS.md layer.")
@@ -674,6 +831,13 @@ def _cmd_undo(s, arg, lines, out) -> None:
         if op.get("content_changed"):
             line += "  (content changed since the tend)"
         _p(out, line)
+    if data.get("path_map"):
+        # P5: the inverse of apply's path_map — every file that comes back
+        # is one the agent (or you) has a stale path for.
+        _p(
+            out,
+            f"  {len(data['path_map'])} path(s) return to their pre-tend location.",
+        )
     if data.get("journal_corrupt_lines"):
         _p(
             out,
@@ -741,9 +905,10 @@ HELP_LINES = [
     "/doctor            preflight summary",
     "/inventory         corpus stats and fingerprint",
     "/clusters          similarity hints",
-    "/refs <basename>   citation sites for a filename",
+    "/refs <name>       citation sites (exists / ambiguous / capped)",
+    "/refs --dangling   path-ish references that resolve to nothing",
     "/cat <file>        show a corpus file",
-    "/strategies [id]   list rubrics / show one",
+    "/strategies [id]   list rubrics (your own tagged) / show one",
     "/draft             auto-draft a delta plan for new slop (any depth)",
     "/load <plan.json>  load a plan (e.g. one your agent wrote) to review",
     "/moves             list the working plan's moves",
@@ -753,8 +918,9 @@ HELP_LINES = [
     "/defer <n> [why]   send move n to the unresolved backlog",
     "/dest <n> <to>     re-destination move n",
     "/plan              compile decisions, validate, save",
-    "/render            show the rendered human-gate markdown",
-    "/apply             dry-run, confirm, execute the plan",
+    "/render            the human gate — same markdown as plan render",
+    "/apply [--force] [--strict-references] [--allow-partial]",
+    "                   dry-run, confirm, execute the plan",
     "/scaffold          write the AGENTS.md layer (confirm)",
     "/undo [n] [!]      list journals / dry-run / execute one",
     "/quit              leave (Ctrl-D also works)",

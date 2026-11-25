@@ -55,7 +55,7 @@ from .similar import collect_similarity, hubs
 from .skill import install as install_skills
 from .status import status as corpus_status
 from .status import status_all
-from .strategies import get_strategy, list_strategies
+from .strategies import get_strategy, list_strategies, pack_dirs
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -91,7 +91,7 @@ def cmd_doctor(args) -> int:
 INVENTORY_FIELD_KEYS = {"path", "bytes", "mtime", "ext", "kind", "title", "head"}
 
 
-def _shape_inventory_files(inv: dict, fields: list[str]) -> dict:
+def _shape_inventory_files(inv: dict, fields: list[str], root: Path) -> dict:
     """A per-file field projection (B11): the lean view the gate work
     actually reads. C7: the projection shapes the WHOLE document — dirs,
     clusters and references are dropped (the tree lives in the file
@@ -105,6 +105,8 @@ def _shape_inventory_files(inv: dict, fields: list[str]) -> dict:
                 "inventory_bad_fields",
                 f"unknown inventory field: {f}",
                 f"fields are: {', '.join(sorted(INVENTORY_FIELD_KEYS))}.",
+                # P5: the lean view the guide recommends, ready to run.
+                f"slopkeeper inventory {root} --fields path,title,kind",
             )
     files = [{k: f[k] for k in fields if k in f} for f in inv["files"]]
     out = {k: v for k, v in inv.items() if k not in ("dirs", "clusters", "references")}
@@ -123,7 +125,7 @@ def cmd_inventory(args) -> int:
         scope=getattr(args, "scope", None),
     )
     if fields:
-        inv = _shape_inventory_files(inv, fields)
+        inv = _shape_inventory_files(inv, fields, root)
     payload = inv
     if args.summary:
         payload = {
@@ -238,6 +240,7 @@ def cmd_status(args) -> int:
                 "the roots registry is empty",
                 "Add corpora with `slopkeeper roots add <path>`, or run "
                 "`slopkeeper status <root>` directly.",
+                "slopkeeper roots add <path>",
             )
         data = status_all(roots, record=args.record)
         pending = sum(
@@ -411,6 +414,7 @@ def cmd_refs(args) -> int:
 
     root = _resolve_dir(args.root)
     ignore = load_ignore(root)
+    truncated: list[str] = []
     if getattr(args, "dangling", False):
         # Phase 11: already-broken citations, as data. Informational —
         # never a rewrite candidate; the pass fixes citations of MOVED
@@ -421,15 +425,22 @@ def cmd_refs(args) -> int:
             per_file_cap=args.per_file,
             max_total=getattr(args, "limit", 0) or 0,
             prefix=getattr(args, "prefix", None),
+            truncated=truncated,
         )
+        payload = {
+            "mode": "dangling",
+            "count": len(sites),
+            "sites": sites,
+        }
+        if truncated:
+            # P5: "no dangling citations" from a scan that stopped reading
+            # some file at 512 KiB is not the same claim.
+            payload["truncated_files"] = len(set(truncated))
+            add_warning(payload, "citation_scan_truncated")
         emit_json(
             envelope(
                 "refs",
-                {
-                    "mode": "dangling",
-                    "count": len(sites),
-                    "sites": sites,
-                },
+                payload,
                 next_step(
                     "plan.edit",
                     "fix the listed file:line by hand with plan edits",
@@ -445,6 +456,7 @@ def cmd_refs(args) -> int:
             "no_basename",
             "refs needs a basename (or --dangling)",
             "Call `refs <root> <basename>` or `refs <root> --dangling`.",
+            f"slopkeeper refs {root} --dangling",
         )
     scan_dirs = []
     scan_rows = []
@@ -476,32 +488,40 @@ def cmd_refs(args) -> int:
                 row["ignored"] = True
         scan_rows.append(row)
     ext_hits = external_citation_lines(
-        scan_dirs, args.basename, per_file_cap=args.per_file
+        scan_dirs, args.basename, per_file_cap=args.per_file, truncated=truncated
     )
     lookup = refs_lookup(
-        root, args.basename, _all_rel_paths(root), per_file_cap=args.per_file
+        root,
+        args.basename,
+        _all_rel_paths(root),
+        per_file_cap=args.per_file,
+        truncated=truncated,
     )
     hits = lookup["citations"]
     if lookup["nonexistent_path"]:
         # D7: the name names no corpus path — say so instead of letting
         # the basename fallback return a different file's citations.
         hits = hits + ext_hits
+        payload = {
+            "basename": args.basename,
+            "nonexistent_path": True,
+            # A5: the honest query state — a slashed name that
+            # only basename-matches names NO corpus path.
+            "exists": False,
+            "ambiguous": False,
+            "ambiguous_paths": [],
+            "citation_count": len(hits),
+            "citations": hits,
+            "scan_paths": [str(d) for d in scan_dirs],
+            "scan_path_results": scan_rows,
+        }
+        if truncated:
+            payload["truncated_files"] = len(set(truncated))
+            add_warning(payload, "citation_scan_truncated")
         emit_json(
             envelope(
                 "refs",
-                {
-                    "basename": args.basename,
-                    "nonexistent_path": True,
-                    # A5: the honest query state — a slashed name that
-                    # only basename-matches names NO corpus path.
-                    "exists": False,
-                    "ambiguous": False,
-                    "ambiguous_paths": [],
-                    "citation_count": len(hits),
-                    "citations": hits,
-                    "scan_paths": [str(d) for d in scan_dirs],
-                    "scan_path_results": scan_rows,
-                },
+                payload,
                 next_step(
                     "plan.edit",
                     "the path does not exist in the corpus; only exact "
@@ -525,23 +545,29 @@ def cmd_refs(args) -> int:
         if row["status"] == "scanned":
             row["hits"] = prefix_counts.get(row["path"], 0)
     hits += ext_hits
+    payload = {
+        "basename": args.basename,
+        # A5: citation_count 0 is three different facts — "safe
+        # to move", "you typoed", "ambiguous, never guessed".
+        # The index knows which; the payload now says so (still
+        # ok: true — every one is a valid query result).
+        "exists": lookup["exists"],
+        "ambiguous": lookup["ambiguous"],
+        "ambiguous_paths": lookup["ambiguous_paths"],
+        "citation_count": len(hits),
+        "citations": hits,
+        "scan_paths": [str(d) for d in scan_dirs],
+        "scan_path_results": scan_rows,
+    }
+    if truncated:
+        # P5: the read cap is the one reason a 0 could be a lie this
+        # payload does not otherwise explain — name the count.
+        payload["truncated_files"] = len(set(truncated))
+        add_warning(payload, "citation_scan_truncated")
     emit_json(
         envelope(
             "refs",
-            {
-                "basename": args.basename,
-                # A5: citation_count 0 is three different facts — "safe
-                # to move", "you typoed", "ambiguous, never guessed".
-                # The index knows which; the payload now says so (still
-                # ok: true — every one is a valid query result).
-                "exists": lookup["exists"],
-                "ambiguous": lookup["ambiguous"],
-                "ambiguous_paths": lookup["ambiguous_paths"],
-                "citation_count": len(hits),
-                "citations": hits,
-                "scan_paths": [str(d) for d in scan_dirs],
-                "scan_path_results": scan_rows,
-            },
+            payload,
             next_step(
                 "plan",
                 "(declare edits: [{file, find, replace}] using these lines, "
@@ -731,22 +757,84 @@ def cmd_propose(args) -> int:
 
 def cmd_strategies(args) -> int:
     tokens = list(args.tokens)
+    root = _resolve_dir(args.root) if getattr(args, "root", None) else None
+    if tokens and tokens[0] == "dirs":
+        # B10 discoverability: the four search dirs, in load order, with
+        # whether each exists — the answer to "where do I put my rubric?"
+        # and to "why did my pack not show up?".
+        emit_json(
+            envelope(
+                "strategies.dirs",
+                {
+                    "dirs": [
+                        {"origin": origin, "path": str(d), "exists": d.is_dir()}
+                        for origin, d in pack_dirs(root)
+                    ],
+                    "root": str(root) if root else None,
+                },
+                next_step(
+                    "strategies.list",
+                    "slopkeeper strategies list" + (f" --root {root}" if root else ""),
+                    "Add a rubric as <id>.json in one of these directories;"
+                    " a pack whose id matches a shipped one overrides it.",
+                ),
+            )
+        )
+        return EXIT_OK
     if tokens and tokens[0] == "show":
         # `strategies show <id>` (documented form); a bare `<id>` still works.
         # With nothing after it, "show" is treated as the id (unknown_strategy).
         tokens = tokens[1:] or tokens
+    elif tokens and tokens[0] == "list":
+        # The verb form of the bare command (roots has `roots list`; agents
+        # write `strategies list` by analogy). A pack actually named `list`
+        # stays reachable as `strategies show list`.
+        tokens = tokens[1:]
     if tokens:
-        s = get_strategy(tokens[0])
-        emit_json(envelope("strategies.show", s))
+        s = get_strategy(tokens[0], root)
+        if root is None:
+            # No corpus named, so the only honest next step is the one
+            # that does not need one: where packs live, and how to get a
+            # corpus-scoped view (which then chains to validate).
+            emit_json(
+                envelope(
+                    "strategies.show",
+                    s,
+                    next_step(
+                        "strategies.dirs",
+                        "slopkeeper strategies dirs --root <corpus>",
+                        "Read the rubric, apply it to the inventory, then"
+                        " validate the plan you wrote. Pass --root to see"
+                        " the packs that travel with a corpus.",
+                    ),
+                )
+            )
+        else:
+            emit_json(
+                envelope(
+                    "strategies.show",
+                    s,
+                    next_step(
+                        "plan.validate",
+                        f"slopkeeper plan validate <plan> {root}",
+                        "Apply the rubric to the inventory, author the plan,"
+                        " then validate it. This pack came from"
+                        f" {s['source']} ({s['origin']}).",
+                    ),
+                )
+            )
     else:
         emit_json(
             envelope(
                 "strategies.list",
-                list_strategies(),
+                list_strategies(root),
                 next_step(
                     "strategies.show",
                     "slopkeeper strategies show <id>",
-                    "Read the full rubric before planning.",
+                    "Read the full rubric before planning. `origin: user` or"
+                    " `corpus` means a local pack overrides the shipped one"
+                    " by id (B10); `strategies dirs` names the search"
+                    " directories.",
                 ),
             )
         )
@@ -860,7 +948,8 @@ def cmd_plan_render(args) -> int:
     # (plan file, gate, rewrites JSON) are excluded from the scan when
     # they sit inside the corpus.
     exclude = _run_artifacts(root, args.plan, args.out, args.rewrites_out)
-    ref_report, rewrite_summary = build_gate_report(plan, root, exclude)
+    gate_truncated: list[str] = []
+    ref_report, rewrite_summary = build_gate_report(plan, root, exclude, gate_truncated)
     # Phase 8: files left behind in folders the plan empties — visible
     # at the gate, capped in the render, full list in validate --out.
     stragglers = straggler_report(root, plan)
@@ -928,6 +1017,12 @@ def cmd_plan_render(args) -> int:
         if plan.get("case_collisions"):
             payload["case_collisions"] = plan["case_collisions"]
             add_warning(payload, "case_collision")
+    if gate_truncated:
+        # P5: the gate's own numbers came from a scan that hit the per-file
+        # cap somewhere — the human approving this render deserves to know
+        # the rewrite summary is a floor, not a census.
+        payload["truncated_files"] = len(set(gate_truncated))
+        add_warning(payload, "citation_scan_truncated")
     if args.rewrites_out:
         # B1: the full line-level rewrite detail as JSON — the render
         # shows it capped, the file carries everything.
@@ -1030,13 +1125,31 @@ def cmd_apply(args) -> int:
 
 
 def cmd_undo(args) -> int:
+    root = _resolve_dir(args.root)
     data = undo_journal(
         Path(args.journal),
-        _resolve_dir(args.root),
+        root,
         execute=args.execute,
         force=args.force,
     )
-    emit_json(envelope("undo", data))
+    # `next` on every success path (the models.next_step promise, and
+    # undo was the last command without it): after a restore, the corpus
+    # and its manifest were rewritten, so the agent's next act is to look.
+    if data["mode"] == "executed":
+        nxt = next_step(
+            "status",
+            f"slopkeeper status {root}",
+            f"Restored {len(data['operations'])} op(s); read data.path_map for the"
+            " {post-tend: restored} pairs and re-check the corpus before"
+            " re-applying.",
+        )
+    else:
+        nxt = next_step(
+            "undo",
+            f"slopkeeper undo {args.journal} {root} --execute",
+            "Dry-run looked right; re-run with --execute to restore.",
+        )
+    emit_json(envelope("undo", data, nxt))
     return EXIT_OK
 
 
@@ -1360,8 +1473,15 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument(
         "tokens",
         nargs="*",
-        metavar="[show] <id>",
-        help="strategy id, optionally preceded by 'show'",
+        metavar="[show|dirs] <id>",
+        help="strategy id, optionally preceded by 'show'; or 'dirs' for the"
+        " pack search directories",
+    )
+    sp.add_argument(
+        "--root",
+        default=None,
+        help="corpus root whose .slopkeeper/strategies pack dir also counts"
+        " (B10: per-corpus rubrics override the shipped pack by id)",
     )
     sp.set_defaults(func=cmd_strategies)
 

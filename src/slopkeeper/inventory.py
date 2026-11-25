@@ -22,14 +22,17 @@ in with `scan=` and the whole command costs one traversal, which is what
 from __future__ import annotations
 
 import html
+import json
 import re
 import shutil
 import subprocess
+import zipfile
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 
 from . import kinds
+from .models import add_warning
 from .references import scan_references
 
 # HEAD_BYTES is re-exported: status.py imports the head budget from
@@ -57,11 +60,157 @@ EXTRACTORS: dict[str, list[tuple[str, list[str]]]] = {
         ("pandoc", ["pandoc", "-t", "plain", "{file}"]),
     ],
     ".pptx": [("unzip", ["unzip", "-p", "{file}", "ppt/slides/slide1.xml"])],
+    # P5 filetype batch: the legacy binary MS formats are the ONLY new ones
+    # that need an external binary at all (the ODF and EPUB containers are
+    # zips, and stdlib `zipfile` reads those in-process below). Absent
+    # tool → NO_SIGNAL, the same loud-not-silent rule as pdftotext.
+    ".doc": [
+        ("antiword", ["antiword", "-m", "UTF-8.txt", "{file}"]),
+        ("catdoc", ["catdoc", "{file}"]),
+    ],
+    ".xls": [
+        ("catdoc", ["catdoc", "{file}"]),
+        ("xls2csv", ["xls2csv", "{file}"]),
+    ],
 }
 NO_SIGNAL = "signal: none (binary, no extractor)"
 
 _XML_TAG_RE = re.compile(r"<[^>]+>")
 _XML_SPACE_RE = re.compile(r"\s+")
+
+# --- containers stdlib reads itself (P5 filetype batch) --------------------
+#
+# The OOXML sibling trick: `.pptx` has always had its slide1 text pulled by
+# shelling out to `unzip`. The OpenDocument formats are the same shape —
+# a zip with one XML part holding the text — and `zipfile` is stdlib, so
+# there is no binary to be absent and no PATH probe to miss. `.epub` is a
+# zip too; its title lives in the OPF that `container.xml` points at.
+_ZIP_TEXT_PARTS: dict[str, tuple[str, ...]] = {
+    ".odt": ("content.xml",),
+    ".ods": ("content.xml",),
+    ".odp": ("content.xml",),
+}
+# ODF paragraphs and headings, in document order. Pulling the elements
+# (rather than tag-stripping the whole part) keeps `<office:automatic-styles>`
+# and spreadsheet formulas out of what becomes the file's TITLE.
+_ODF_TEXT_RE = re.compile(r"<text:(h|p)\b[^>]*>(.*?)</text:\1>", re.S)
+# How much of a container member or notebook is read: a title is a hint,
+# and a 1 MiB budget is generous for one while bounding a pathological
+# (or hostile) part to a bounded read.
+_CONTAINER_CAP = 1024 * 1024
+
+
+def _zip_text(fp: Path, members: tuple[str, ...]) -> str | None:
+    """The text of the first present member of a zip container."""
+    try:
+        with zipfile.ZipFile(fp) as z:
+            names = set(z.namelist())
+            for member in members:
+                if member not in names:
+                    continue
+                raw = z.read(member)[:_CONTAINER_CAP]
+                text = _odf_paragraphs(raw.decode("utf-8", errors="replace"))
+                if text:
+                    return text
+    except (OSError, zipfile.BadZipFile, KeyError, EOFError, ValueError):
+        return None
+    return None
+
+
+def _odf_paragraphs(xml: str) -> str:
+    """ODF text as lines: each `<text:h>`/`<text:p>` becomes one line."""
+    lines: list[str] = []
+    for _kind, inner in _ODF_TEXT_RE.findall(xml):
+        flat = _XML_TAG_RE.sub(" ", inner)
+        line = _XML_SPACE_RE.sub(" ", html.unescape(flat)).strip()
+        if line:
+            lines.append(line)
+    if lines:
+        return "\n".join(lines)
+    # No paragraphs at all (a hand-written or unusual part): the pptx
+    # fallback, tag-strip the whole thing, still beats no signal.
+    stripped = _XML_SPACE_RE.sub(" ", html.unescape(_XML_TAG_RE.sub(" ", xml))).strip()
+    return stripped or None
+
+
+def _epub_title(fp: Path) -> str | None:
+    """An EPUB's title: container.xml → the OPF it names → <dc:title>."""
+    try:
+        with zipfile.ZipFile(fp) as z:
+            names = set(z.namelist())
+            if "META-INF/container.xml" not in names:
+                return None
+            container = z.read("META-INF/container.xml").decode(
+                "utf-8", errors="replace"
+            )
+            match = re.search(r'full-path="([^"]+\.opf)"', container, re.I)
+            if not match:
+                return None
+            opf_name = html.unescape(match.group(1))
+            if opf_name.lstrip("/") not in names:
+                # The OPF path is container-relative; accept the plain and
+                # leading-slash spellings, and fall back to the only .opf
+                # in the archive when neither matches (some packagers write
+                # a path the container does not).
+                candidates = [n for n in names if n.lower().endswith(".opf")]
+                if len(candidates) != 1:
+                    return None
+                opf_name = candidates[0]
+            opf = z.read(opf_name)[:_CONTAINER_CAP].decode("utf-8", errors="replace")
+    except (OSError, zipfile.BadZipFile, KeyError, EOFError, ValueError):
+        return None
+    title = re.search(r"<dc:title\b[^>]*>(.*?)</dc:title>", opf, re.S | re.I)
+    if not title:
+        return None
+    text = _XML_SPACE_RE.sub(" ", html.unescape(_XML_TAG_RE.sub(" ", title.group(1))))
+    return text.strip() or None
+
+
+def _notebook_text(fp: Path) -> str | None:
+    """A Jupyter notebook as text: markdown cells, then code signatures.
+
+    The audit's `.ipynb` row: the title used to be the first line of raw
+    JSON, which is `{` for every notebook ever written. Cell-aware text
+    fixes the title AND what the similarity layer tokenizes (inventory's
+    `head` is what `similar._doc_tokens` reads), while the file stays ONE
+    JSON document for hashing, dedup and `identical_groups` — nothing here
+    rewrites or re-serializes it. None means "not a notebook we can read",
+    and the caller falls back to the plain text path.
+    """
+    try:
+        raw = fp.read_bytes()[:_CONTAINER_CAP]
+    except OSError:
+        return None
+    try:
+        doc = json.loads(raw.decode("utf-8", errors="replace"))
+    except ValueError:
+        return None
+    cells = doc.get("cells") if isinstance(doc, dict) else None
+    if not isinstance(cells, list):
+        return None
+    lines: list[str] = []
+    for cell in cells:
+        if not isinstance(cell, dict):
+            continue
+        source = cell.get("source")
+        if isinstance(source, list):
+            source = "".join(str(s) for s in source)
+        if not isinstance(source, str) or not source.strip():
+            continue
+        ctype = cell.get("cell_type")
+        if ctype == "markdown":
+            lines.append(source.strip())
+        else:
+            # Code cells contribute their DEFINITION lines only: a whole
+            # body of `import`s and boilerplate would otherwise dominate
+            # the vector of every notebook in the corpus (the audit's
+            # code-tokenization note, kept to the one shape that is
+            # notebook-specific).
+            for line in source.splitlines():
+                s = line.strip()
+                if s.startswith(("def ", "class ", "async def ", "#")):
+                    lines.append(s)
+    return "\n".join(lines) if lines else None
 
 
 @lru_cache(maxsize=None)
@@ -70,12 +219,23 @@ def _which(binary: str) -> str | None:
 
 
 def _extract_head(fp: Path, ext: str) -> str | None:
-    """First lines via an optional system extractor; None = none/failure.
+    """First lines via a container reader or an optional system extractor;
+    None = none/failure.
 
     Every failure mode (no extractor, non-zero exit, timeout, empty
     output) returns None so the caller emits the loud no-signal marker —
     a head is a hint, never a crash, and never silence.
     """
+    # stdlib readers first: no binary to be absent, no PATH probe, no
+    # subprocess (P5 filetype batch).
+    if ext in _ZIP_TEXT_PARTS:
+        text = _zip_text(fp, _ZIP_TEXT_PARTS[ext])
+        if text:
+            return text
+    elif ext == ".epub":
+        text = _epub_title(fp)
+        if text:
+            return text
     for binary, template in EXTRACTORS.get(ext, []):
         if _which(binary) is None:
             continue
@@ -106,6 +266,24 @@ def _kind(path: Path) -> str:
     return kinds.classify(path)
 
 
+def _notebook_head(fp: Path) -> dict | None:
+    """{title, head} for a notebook, or None when it is not a notebook.
+
+    The `.ipynb` row of the audit's filetype batch: the title used to be
+    the first line of the JSON (`{`), and the head was 400 characters of
+    cell metadata, so `clusters` tokenized boilerplate and every notebook
+    in a corpus looked alike. The cell-aware text replaces BOTH — the
+    title extraction and what the similarity layer reads — while the file
+    itself stays one JSON document for hashing and dedup.
+    """
+    if fp.suffix.lower() != ".ipynb":
+        return None
+    text = _notebook_text(fp)
+    if text is None:
+        return None
+    return {"title": _title_from_text(text, "doc"), "head": text[:HEAD_CHARS]}
+
+
 def _head(entry) -> dict:
     """{title, head} for one inventoried file.
 
@@ -131,6 +309,9 @@ def _head(entry) -> dict:
         # graceful-degradation path the audit checked — title null, no
         # crash, the file still listed.
         return {"title": None, "head": None}
+    notebook = _notebook_head(entry.path)
+    if notebook is not None:
+        return notebook
     text = entry.head.decode("utf-8", errors="replace")
     return {"title": _title_from_text(text, kind), "head": text[:HEAD_CHARS]}
 
@@ -400,7 +581,16 @@ def collect(
         inventory["scope"] = scope
 
     if not fast and len(files) <= 800:
-        inventory["references"] = scan_references(root, rel_paths)
+        scan_truncated: list[str] = []
+        inventory["references"] = scan_references(root, rel_paths, scan_truncated)
+        if scan_truncated:
+            # P5: the embedded cross-reference map has a read cap per file,
+            # and "nothing cites it" from a half-read file is not the same
+            # claim as from a whole one. Counted, like every other cap here.
+            inventory["stats"]["reference_scan_truncated_files"] = len(
+                set(scan_truncated)
+            )
+            add_warning(inventory, "citation_scan_truncated")
 
     return inventory
 

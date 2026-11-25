@@ -70,7 +70,10 @@ def _scaffold_from_plan(
 ) -> dict:
     root = corpus_root.resolve()
     plan = load_plan(plan_path)
-    strategy = get_strategy(strategy_id or plan.get("strategy", "hybrid"))
+    # The corpus root is passed (B10) so a pack under
+    # `<root>/.slopkeeper/strategies` — the rubric that travels with THIS
+    # corpus — is what the folder layer is rendered from.
+    strategy = get_strategy(strategy_id or plan.get("strategy", "hybrid"), root)
     template = strategy["folder_template"]
 
     writes: list[dict] = []  # {path, content, status}
@@ -109,6 +112,16 @@ def _scaffold_from_plan(
     )
 
     result = {"mode": "dry-run", "writes": [], "suggested": [], "skipped": []}
+    # P5: scaffold's `path_map` is the same canonical field apply and undo
+    # expose, adapted to what scaffold actually does — it never moves a
+    # file, but it does sometimes NOT write where you asked: the
+    # never-clobber rule sends the content to a `*.slopkeeper-suggested`
+    # sibling instead. So this maps {intended corpus path: path the content
+    # really lands at}, and only for the writes that differ — a map of
+    # identical pairs would be noise, and an agent that opens
+    # `docs/AGENTS.md` expecting its content after a suggested write is
+    # exactly the stale-path bug path_map exists to prevent.
+    path_map: dict[str, str] = {}
     for w in writes:
         target: Path = w["path"]
         status = "would_write"
@@ -121,11 +134,18 @@ def _scaffold_from_plan(
                 result["suggested"].append(str(sugg))
                 if execute:
                     sugg.write_text(w["content"], encoding="utf-8")
+                try:
+                    path_map[target.relative_to(root).as_posix()] = sugg.relative_to(
+                        root
+                    ).as_posix()
+                except ValueError:  # pragma: no cover - targets are under root
+                    pass
         elif execute:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(w["content"], encoding="utf-8")
         result["writes"].append({"path": str(target), "status": status})
     result["mode"] = "executed" if execute else "dry-run"
+    result["path_map"] = path_map
     if execute:
         # The tool layer itself is part of the tended state: record it so the
         # next `status` diff shows only real slop, not our own AGENTS.md files.

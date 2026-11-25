@@ -70,6 +70,7 @@ def _resolve_skills_dir(raw: str) -> Path:
             f"Known agents: {', '.join(sorted(AGENT_SKILLS_DIRS))}. "
             "Or pass a skills directory path to install into "
             "(the skill lands in <dir>/slopkeeper/).",
+            "slopkeeper skill install claude",
         )
     return candidate.resolve()
 

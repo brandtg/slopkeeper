@@ -213,7 +213,13 @@ def build_vectors(files: list[dict]) -> dict[str, Counter]:
 # miss (the status-quo re-vectorization), never an error, and never a
 # mixed-parameter match.
 
-VECTOR_CACHE_SCHEMA = "slopkeeper/vectors@1"
+# The cache is DERIVED state, and the schema string is the derivation
+# version: bump it whenever `_doc_tokens` changes what a file's tf MEANS,
+# so a cache written by an older tokenizer is a full miss rather than a
+# silent stale vector. @1 → @2 is P5's filetype batch: `.ipynb` went from
+# tokenizing raw JSON (every notebook full of `cell_type` and `metadata`)
+# to tokenizing its markdown cells and code signatures.
+VECTOR_CACHE_SCHEMA = "slopkeeper/vectors@2"
 
 
 def vector_cache_path(root: Path) -> Path:
@@ -660,6 +666,10 @@ def collect_similarity(
             "or organize smaller scopes; --force runs the blocked matcher "
             "anyway (candidate pairs only — it is O(Σ rare-token²), not "
             "O(n²), so past the old 3000 cap it is usually fine).",
+            # P4 made --force the documented override for this refusal, so
+            # it IS the suggested command — the blocked matcher is exact
+            # enough that running it is not the dangerous option here.
+            f"slopkeeper clusters {root} --force",
         )
     paths = [f["path"] for f in files]
     # One subtree index for every "which files live under this dir"
