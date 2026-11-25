@@ -34,16 +34,24 @@ from .models import SlopKeeperError, corpus_fingerprint
 from .similar import (
     DEFAULT_T1,
     MAX_FILES,
+    MEMORY_MAX_FILES,
     _cosine,
+    _norm,
     build_vectors,
     build_vectors_cached,
+    candidate_neighbors,
+    identical_groups,
     load_vector_cache,
+    rare_postings,
     tokenize,
     write_vector_cache,
 )
 from .status import _head_for, load_manifest, status
 
 TOOL_LAYER = {"AGENTS.md", "STATE.md", "INDEX.md", ".slopkeeperignore"}
+# A draft's duplicate losers archive here (P4, 4) — a journaled move, never
+# a delete; undo restores the file byte-exact.
+DUPLICATE_ARCHIVE = "archive/duplicates"
 
 
 def _file_entries(root: Path, rels: list[str], cap: int = 4000) -> list[dict]:
@@ -57,12 +65,22 @@ def _file_entries(root: Path, rels: list[str], cap: int = 4000) -> list[dict]:
     return out
 
 
-def draft(root: Path, min_sim: float | None = None, depth: int | None = None) -> dict:
+def draft(
+    root: Path,
+    min_sim: float | None = None,
+    depth: int | None = None,
+    force: bool = False,
+) -> dict:
     """Draft a partial delta plan for new slop, recursively by default.
 
     depth bounds the sweep: only new files within `depth` directory
     levels of the root are considered (1 = root + immediate
     subdirectories); None walks the whole corpus.
+
+    force (P4, 1) is the memory-bound override: the nearest-neighbour
+    scan is candidate-blocked past the old 3000 cap, so a re-tend on a
+    large corpus no longer refuses outright — it refuses only past
+    MEMORY_MAX_FILES unless --force.
     """
     root = root.resolve()
     if min_sim is None:
@@ -84,15 +102,15 @@ def draft(root: Path, min_sim: float | None = None, depth: int | None = None) ->
     new_files = st.get("new_files", [])
     total_new = st.get("new_count", len(new_files))
 
-    def _undrafted(drafted: int, unresolved: int) -> dict | None:
+    def _undrafted(drafted: int, unresolved: int, deduped: int = 0) -> dict | None:
         """Count new files that got NO draft outcome, with the reason.
 
-        Every considered file lands in moves or unresolved (below-
-        threshold candidates are IN unresolved, each with its score) —
-        so a gap here means files the draft never had a chance at:
-        beyond --depth, beyond status's new_files cap, or tool-layer.
+        Every considered file lands in moves, unresolved or dedup (a
+        byte-identical duplicate archived instead of filed) — so a gap here
+        means files the draft never had a chance at: beyond --depth, beyond
+        status's new_files cap, or tool-layer.
         """
-        lost = total_new - drafted - unresolved
+        lost = total_new - drafted - unresolved - deduped
         if lost <= 0:
             return None
         if depth is not None:
@@ -125,7 +143,32 @@ def draft(root: Path, min_sim: float | None = None, depth: int | None = None) ->
         if (depth is None or len(Path(f["path"]).parts) <= depth + 1)
         and Path(f["path"]).name not in TOOL_LAYER
     ]
-    if not new_slop:
+
+    # Duplicate slop (P4, 4): two brand-new files that are byte-identical
+    # are not two things to file — keep one, archive the rest into the
+    # duplicates folder as a journaled `dedup` move (never a delete; undo
+    # restores). They are removed from the drafted set so the same file is
+    # not both moved to a folder AND archived.
+    dedups: list[dict] = []
+    dedup_drops: set[str] = set()
+    if len(new_slop) >= 2:
+        for group in identical_groups(root, [f["path"] for f in new_slop]):
+            keeper = group[0]
+            for drop in group[1:]:
+                dedup_drops.add(drop)
+                dedups.append(
+                    {
+                        "op": "dedup",
+                        "keep": keeper,
+                        "drop": drop,
+                        "to": f"{DUPLICATE_ARCHIVE}/{drop}",
+                        "reason": f"draft: byte-identical duplicate of {keeper}",
+                    }
+                )
+        if dedup_drops:
+            new_slop = [f for f in new_slop if f["path"] not in dedup_drops]
+
+    if not new_slop and not dedups:
         return {
             "plan": None,
             "drafted_count": 0,
@@ -136,11 +179,14 @@ def draft(root: Path, min_sim: float | None = None, depth: int | None = None) ->
         }
 
     filed = [k for k in manifest.get("files", {}) if "/" in k]
-    if len(filed) > MAX_FILES:
+    if len(filed) > MEMORY_MAX_FILES and not force:
         raise SlopKeeperError(
             "corpus_too_big",
-            f"{len(filed)} filed files exceeds the draft cap of {MAX_FILES}",
-            "Partition per-directory instead.",
+            f"{len(filed)} filed files exceeds the draft memory bound of "
+            f"{MEMORY_MAX_FILES}",
+            "Partition per-directory instead, or pass --force to run the "
+            "blocked nearest-neighbour scan anyway (candidate pairs only, "
+            "not the full O(n²) sweep).",
         )
 
     # Vector cache: reuse cached per-doc tf whose sha256 matches
@@ -167,14 +213,32 @@ def draft(root: Path, min_sim: float | None = None, depth: int | None = None) ->
             for f in new_slop
         ]
     )
+    # The nearest-neighbour scan is the other O(n²): each new file used
+    # to price a cosine against every filed file. Past MAX_FILES it
+    # instead walks only the filed files sharing rare tokens with the
+    # query (a true match always shares rare content), turning the re-tend
+    # loop's cost into O(new × candidates) (P4, 1).
+    block = len(corpus_vecs) > MAX_FILES
+    corpus_norms = {rel: _norm(cv) for rel, cv in corpus_vecs.items()} if block else {}
+    postings = rare_postings(corpus_vecs) if block else {}
 
     moves: list[dict] = []
     unresolved: list[dict] = []
 
     for path, sv in slop_vecs.items():
         best_rel, best_sim = None, 0.0
-        for rel, cv in corpus_vecs.items():
-            s = _cosine(sv, cv)
+        if block:
+            candidates = candidate_neighbors(sv, postings)
+        else:
+            candidates = list(corpus_vecs.keys())
+        for rel in candidates:
+            cv = corpus_vecs.get(rel)
+            if cv is None:
+                continue
+            if block:
+                s = _cosine(sv, cv, na=None, nb=corpus_norms.get(rel))
+            else:
+                s = _cosine(sv, cv)
             if s > best_sim:
                 best_rel, best_sim = rel, s
         if best_rel is None or best_sim < min_sim:
@@ -222,15 +286,20 @@ def draft(root: Path, min_sim: float | None = None, depth: int | None = None) ->
         "draft": {
             "min_sim": min_sim,
             "depth": depth,
-            "considered": len(new_slop),
+            "considered": len(new_slop) + len(dedup_drops),
             "proposed": len(moves),
             "unresolved": len(unresolved),
+            "dedup": len(dedups),
         },
         "based_on": {
             "corpus_fingerprint": corpus_fingerprint(root),
             "inventory_at": st.get("last_tended"),
         },
         "moves": sorted(moves, key=lambda m: m["from"]),
+        # Duplicate slop archived instead of filed (P4, 4): a journaled
+        # move into the duplicates archive, validated for byte-identity and
+        # rendered distinctly at the gate.
+        "dedup": dedups,
         "edits": [],
         "keep": [],
         "unresolved": unresolved,
@@ -241,6 +310,7 @@ def draft(root: Path, min_sim: float | None = None, depth: int | None = None) ->
         "plan": plan,
         "drafted_count": len(moves),
         "unresolved_count": len(unresolved),
+        "dedup_count": len(dedups),
         "new_count": total_new,
-        "undrafted": _undrafted(len(moves), len(unresolved)),
+        "undrafted": _undrafted(len(moves), len(unresolved), len(dedups)),
     }

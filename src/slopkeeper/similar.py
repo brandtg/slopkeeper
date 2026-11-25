@@ -37,7 +37,106 @@ DEFAULT_T1 = 0.25
 # so a chain of loosely-related files cannot grow into one blob.
 DEFAULT_RATIO = 0.5
 MIN_NAME_TOKEN = 3
-MAX_FILES = 3000  # O(n^2); beyond this, refuse loudly rather than crawl
+# Candidate blocking (P4, 0.2.9) turned the O(n²) matcher into a scan of
+# pairs that share rare tokens, so the old second cliff is now a memory
+# bound. MAX_FILES is the point past which the FULL all-pairs matcher is
+# abandoned for the blocked one; MEMORY_MAX_FILES is the true ceiling,
+# past which the command refuses unless --force (the corpus will not fit
+# the inverted index + vectors in RAM at a sane size). The refusal text
+# and the per-directory escape hatch are unchanged from before.
+MAX_FILES = 3000
+MEMORY_MAX_FILES = 50000
+# A token is "rare" (a blocking key) when it lives in at most this
+# fraction of documents; the floor keeps a handful of structural tokens
+# (a name everyone shares) out of the candidate set where they would
+# regenerate the O(n²) blowup the blocking exists to avoid.
+BLOCK_DF_FRACTION = 0.2
+BLOCK_DF_FLOOR = 32
+# A pair must share at least this many rare tokens to be a candidate.
+BLOCK_MIN_RARE_SHARED = 2
+
+
+def _is_rare(df_count: int, n: int) -> bool:
+    """A token is a blocking key when it appears in few enough documents."""
+    return df_count <= max(BLOCK_DF_FLOOR, int(n * BLOCK_DF_FRACTION))
+
+
+def candidate_pairs(vecs: dict[str, Counter], min_shared: int = BLOCK_MIN_RARE_SHARED):
+    """Candidate (a, b) pairs that share ≥ `min_shared` rare tokens.
+
+    The inverted token→docs index (a stdlib dict) replaces the all-pairs
+    scan: a pair can only be a real match if it shares high-idf (rare)
+    content, so the cosine is computed on the pairs that share ≥K rare
+    tokens and every other pair is never priced. This is what lifts
+    MAX_FILES from a correctness cliff to a memory bound (P4): the
+    candidate set is proportional to Σ df(t)² over RARE t only, not n².
+    Returns a set of ordered (a, b) tuples (a < b).
+    """
+    n = len(vecs)
+    postings: dict[str, list[str]] = {}
+    for rel in sorted(vecs):
+        for t in vecs[rel]:
+            postings.setdefault(t, []).append(rel)
+    rare: dict[str, list[str]] = {}
+    for t, docs in postings.items():
+        if len(docs) >= 2 and _is_rare(len(docs), n):
+            rare[t] = docs
+    # shared-count over rare-token postings; only pairs seen ≥K times stay.
+    counts: dict[tuple[str, str], int] = {}
+    for docs in rare.values():
+        for i in range(len(docs)):
+            a = docs[i]
+            for j in range(i + 1, len(docs)):
+                b = docs[j]
+                key = (a, b) if a < b else (b, a)
+                counts[key] = counts.get(key, 0) + 1
+    return {pair for pair, c in counts.items() if c >= min_shared}
+
+
+def _neighbor_adjacency(pairs) -> dict[str, set[str]]:
+    adj: dict[str, set[str]] = {}
+    for a, b in pairs:
+        adj.setdefault(a, set()).add(b)
+        adj.setdefault(b, set()).add(a)
+    return adj
+
+
+def rare_postings(vecs: dict[str, Counter]) -> dict[str, list[str]]:
+    """Inverted rare-token → docs index over `vecs` (a blocking table).
+
+    The per-query companion to `candidate_pairs`: build once over the
+    filed corpus, then ask each new vector who its rare-token neighbours
+    are. Common tokens (the name everyone shares) are left out of the
+    table, so a query never walks a posting of length n.
+    """
+    n = len(vecs)
+    postings: dict[str, list[str]] = {}
+    for rel in sorted(vecs):
+        for t in vecs[rel]:
+            postings.setdefault(t, []).append(rel)
+    return {t: docs for t, docs in postings.items() if _is_rare(len(docs), n)}
+
+
+def candidate_neighbors(
+    query: Counter,
+    postings: dict[str, list[str]],
+    min_shared: int = BLOCK_MIN_RARE_SHARED,
+) -> list[str]:
+    """Docs in `postings` sharing ≥`min_shared` rare tokens with `query`.
+
+    The draft nearest-neighbour scan priced this way: an O(candidates)
+    cosine instead of an O(filed) one, on the same argument that a pair
+    reaching t1 must share rare content (P4, 1).
+    """
+    counts: dict[str, int] = {}
+    for t in query:
+        docs = postings.get(t)
+        if not docs:
+            continue
+        for d in docs:
+            counts[d] = counts.get(d, 0) + 1
+    return [d for d, c in counts.items() if c >= min_shared]
+
 
 STOPWORDS = frozenset(
     """
@@ -239,18 +338,39 @@ def similarity_clusters(
     vecs: dict[str, Counter],
     t1: float = DEFAULT_T1,
     ratio: float = DEFAULT_RATIO,
+    adjacency: dict[str, set[str]] | None = None,
 ) -> list[list[str]]:
-    """Greedy single-link with a mean-similarity floor (anti-chaining)."""
+    """Greedy single-link with a mean-similarity floor (anti-chaining).
+
+    `adjacency` (P4 candidate blocking) is the rel→candidate-neighbours
+    map from `candidate_pairs`. When given, a vector only ever compares
+    against clusters holding one of its candidates — a pair that shares
+    no rare tokens can never clear t1, so pruning them is a speed win,
+    not a recall change (the same clusters fall out, at a fraction of the
+    cosine calls). None (the default, and every corpus under MAX_FILES)
+    compares every cluster exactly as before.
+    """
     clusters: list[list[str]] = []
     # Every norm, once: the greedy pass re-uses each vector as both side
     # of a comparison many times over, and a norm is a full pass over the
     # vector's terms.
     norms = {rel: _norm(v) for rel, v in vecs.items()}
+    # cluster index -> members, plus a member -> which clusters to probe,
+    # so a blocked run reads only the clusters its candidates live in.
+    member_clusters: dict[str, set[int]] = {}
     for rel in sorted(vecs):
         v = vecs[rel]
         nv = norms[rel]
+        if adjacency is None:
+            probe = range(len(clusters))
+        else:
+            wanted: set[int] = set()
+            for nb in adjacency.get(rel, ()):
+                wanted |= member_clusters.get(nb, set())
+            probe = sorted(wanted)
         best_i, best_s = -1, 0.0
-        for i, members in enumerate(clusters):
+        for i in probe:
+            members = clusters[i]
             sims = sorted(
                 (_cosine(v, vecs[m], nv, norms[m]) for m in members), reverse=True
             )
@@ -259,8 +379,10 @@ def similarity_clusters(
                     best_s, best_i = sims[0], i
         if best_i >= 0:
             clusters[best_i].append(rel)
+            member_clusters.setdefault(rel, set()).add(best_i)
         else:
             clusters.append([rel])
+            member_clusters[rel] = {len(clusters) - 1}
     return [sorted(c) for c in clusters if len(c) >= 2]
 
 
@@ -399,45 +521,85 @@ def stale_version_pairs(root: Path, paths: list[str]) -> list[dict]:
     return sorted(out, key=lambda e: e["file"])
 
 
-def identical_subtrees(root: Path, paths: list[str], min_files: int = 2) -> list[dict]:
-    """Directories whose file lists + content hashes are identical.
+def _subtree_signature_files(root: Path, paths: list[str]) -> dict[str, list[str]]:
+    """Every directory → the list of corpus-relative files under it.
 
-    The vendored-copy case: four copies of one design system dominate
-    the clusters. Signature = sorted (basename, content-hash) pairs —
-    flat, so a copy with rearranged subdirs still matches (v1;
-    structure-aware signatures can come later). Dirs whose files are
-    unreadable are skipped, never guessed.
+    The recursive companion to the flat `by_parent` map (P4): a copied
+    tree one level deep is invisible to a per-directory comparison but
+    obvious once each directory owns its whole subtree's file list. Built
+    by walking each path's ancestor chain once, so it costs O(files ×
+    depth), not O(dirs × files).
     """
-    by_dir: dict[str, list[str]] = {}
+    under: dict[str, list[str]] = {}
     for p in paths:
-        by_dir.setdefault(str(Path(p).parent), []).append(p)
+        parts = Path(p).parts
+        for i in range(1, len(parts)):  # "." (i=0) is never a candidate dir
+            anc = "/".join(parts[:i])
+            under.setdefault(anc, []).append(p)
+    return under
+
+
+def identical_subtrees(root: Path, paths: list[str], min_files: int = 2) -> list[dict]:
+    """Directories whose WHOLE subtree (relative path + content) matches.
+
+    The vendored-copy case: four copies of one design system dominate the
+    clusters. Signature = the sorted `relative-path:content-hash` list of
+    every file in the subtree (P4, 5) — so a copy is caught no matter how
+    deep its files sit, and a rearranged subtree still matches (the
+    relative path, not the on-disk order, is what is hashed). Dirs whose
+    files are unreadable are skipped, never guessed.
+
+    A directory qualifies at `min_files` files. To keep the report about
+    COPIES rather than nesting, a directory whose subtree is identical to
+    an already-reported directory that contains it is dropped: the four
+    `vendor/<name>/` copies are reported once, not `vendor` plus each
+    child. The shallowest identical directory of a group is kept.
+    """
+    under = _subtree_signature_files(root, paths)
+    # Memoized content hashes: a shared file hashes once across all the
+    # ancestor signatures that include it.
+    hashes: dict[str, str | None] = {}
+
+    def _hash(rel: str) -> str | None:
+        if rel not in hashes:
+            hashes[rel] = _content_hash(root, rel)
+        return hashes[rel]
+
     sigs: dict[str, list[tuple[str, int]]] = {}
-    for d, members in sorted(by_dir.items()):
+    for d, members in sorted(under.items()):
         if len(members) < min_files:
             continue
         parts = []
         ok = True
+        prefix = d + "/"
         for p in sorted(members):
-            h = _content_hash(root, p)
+            h = _hash(p)
             if h is None:
                 ok = False
                 break
-            parts.append(f"{Path(p).name}:{h}")
+            parts.append(
+                f"{p[len(prefix) :] if p.startswith(prefix) else Path(p).name}:{h}"
+            )
         if not ok:
             continue
         sigs.setdefault("|".join(parts), []).append((d, len(members)))
-    out = []
+    out: list[dict] = []
     for dirs in sigs.values():
         if len(dirs) < 2:
             continue
-        dirs.sort()
-        out.append(
-            {
-                "dir": dirs[0][0],
-                "copies": [d for d, _ in dirs[1:]],
-                "files": dirs[0][1],
-            }
-        )
+        # Keep only the shallowest directory of each identical group as the
+        # representative; a deeper member is inside an already-reported
+        # subtree (vendor/one under vendor) and adds no information.
+        dirs.sort(key=lambda x: (x[0].count("/"), x[0]))
+        kept: list[str] = []
+        for d, _n in dirs:
+            if any(d == k or d.startswith(k + "/") for k in kept):
+                continue
+            kept.append(d)
+        if len(kept) < 2:
+            continue
+        kept.sort()
+        out.append({"dir": kept[0], "copies": kept[1:], "files": len(under[kept[0]])})
     return sorted(out, key=lambda g: g["dir"])
 
 
@@ -463,6 +625,8 @@ def collect_similarity(
     files: list[dict],
     with_dupes: bool = True,
     sha_of=None,
+    force: bool = False,
+    min_shared: int = BLOCK_MIN_RARE_SHARED,
 ) -> dict:
     """Full hint document for the clusters command.
 
@@ -477,33 +641,37 @@ def collect_similarity(
     up a cache the same walk could have hit was the third full read of
     the tree in one command. None (the default) hashes on demand, for
     callers that arrive with a bare file list.
+
+    Scale (P4, 1): under MAX_FILES every vector is compared to every
+    cluster (the original matcher, exact). Past MAX_FILES the matcher
+    switches to candidate blocking — only pairs sharing ≥`min_shared`
+    rare tokens are ever priced — so a corpus of tens of thousands runs
+    in memory rather than refusing. The hard ceiling is now MEMORY_MAX_FILES
+    (the index + vectors will not fit below sane limits); past THAT the
+    command refuses `similarity_cap` unless --force, and the recovery
+    still names per-directory clustering as the cheap escape.
     """
-    if len(files) > MAX_FILES:
+    if len(files) > MEMORY_MAX_FILES and not force:
         raise SlopKeeperError(
             "similarity_cap",
-            f"{len(files)} files exceeds the similarity cap of {MAX_FILES}; "
-            "partition per-directory instead.",
+            f"{len(files)} files exceeds the similarity memory bound of "
+            f"{MEMORY_MAX_FILES}; the blocked matcher will not fit in RAM.",
             "Cluster a subdirectory instead (`slopkeeper clusters <root>/<dir>`), "
-            "or organize smaller scopes; the O(n^2) matcher needs this cap.",
+            "or organize smaller scopes; --force runs the blocked matcher "
+            "anyway (candidate pairs only — it is O(Σ rare-token²), not "
+            "O(n²), so past the old 3000 cap it is usually fine).",
         )
     paths = [f["path"] for f in files]
-    # One parent index for every "which files live in this dir" question
-    # below. Both the collapse set and the appended subtree rows asked it
-    # by scanning the whole path list per directory — O(dirs × files)
-    # with the same answer every time.
-    by_parent: dict[str, list[str]] = {}
-    for p in paths:
-        by_parent.setdefault(str(Path(p).parent), []).append(p)
-    # Identical subtrees (Phase 11) collapse to ONE cluster entry: their
-    # files leave the vector input entirely and reappear as a single
-    # labeled row naming every copy — four copies of a vendored design
-    # system stop being four clusters of noise.
+    # One subtree index for every "which files live under this dir"
+    # question below (identical subtrees now own their whole subtree).
+    under = _subtree_signature_files(root, paths)
+    # Identical subtrees (Phase 11, recursive in P4) collapse to ONE
+    # cluster entry: their files leave the vector input entirely and
+    # reappear as a single labeled row naming every copy — four copies of
+    # a vendored design system stop being four clusters of noise.
     subtrees = identical_subtrees(root, paths) if with_dupes else []
     collapsed = {
-        p
-        for g in subtrees
-        for d in [g["dir"], *g["copies"]]
-        for p in by_parent.get(d, ())
+        p for g in subtrees for d in [g["dir"], *g["copies"]] for p in under.get(d, ())
     }
     cluster_files = [f for f in files if f["path"] not in collapsed]
     # The cached payload is per-doc tf — pure function of file CONTENT.
@@ -521,7 +689,12 @@ def collect_similarity(
 
     vecs, fresh = build_vectors_cached(cluster_files, cache_docs, sha_of)
     write_vector_cache(root, params, cache_docs, fresh)
-    clusters = similarity_clusters(vecs)
+    # Blocking engages only past MAX_FILES: under it the all-pairs matcher
+    # is both exact and cheap, so behavior there is bit-identical to 0.2.8.
+    adjacency = None
+    if len(vecs) > MAX_FILES:
+        adjacency = _neighbor_adjacency(candidate_pairs(vecs, min_shared=min_shared))
+    clusters = similarity_clusters(vecs, adjacency=adjacency)
     labeled = [
         {
             "label": cluster_label(c) or "(unlabeled)",
@@ -540,7 +713,7 @@ def collect_similarity(
                     f"(+{len(g['copies'])} identical copies)"
                 ),
                 "size": g["files"],
-                "files": sorted(by_parent.get(g["dir"], ())),
+                "files": sorted(under.get(g["dir"], ())),
                 "copies": g["copies"],
             }
         )

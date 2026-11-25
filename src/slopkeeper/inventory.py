@@ -195,6 +195,7 @@ def collect(
     max_files: int = DEFAULT_MAX_FILES,
     *,
     scan=None,
+    scope: str | None = None,
 ) -> dict:
     """Walk root and build the inventory document (no envelope).
 
@@ -203,8 +204,25 @@ def collect(
     the corpus, so the walk happens once per command. Omit it and
     collect runs its own. Either way the fingerprint in the document is
     the digest of THAT walk.
+
+    `scope` (P4, 2, `inventory --scope inbox`) bounds the document to one
+    corpus-relative directory subtree: only its files, dirs and the scope
+    fingerprint are reported — the same view a scoped plan is authored
+    against, so the plan and the inventory it came from agree on what is
+    in scope.
     """
     root = root.resolve()
+    if scope is not None:
+        # Fold a scope-bound walk. A caller-supplied scan is ignored here
+        # (it walked the whole corpus); scoping is its own single pass.
+        scan = scan_corpus(
+            root,
+            want_sha=True,
+            want_head=True,
+            want_kind=True,
+            report=WalkReport(),
+            scope=scope,
+        )
     if scan is None or not _scan_is_complete(scan):
         scan = scan_corpus(
             root,
@@ -375,6 +393,11 @@ def collect(
         inventory["stats"]["skipped_unstatable_paths"] = fp_health[
             "skipped_unstatable_paths"
         ]
+
+    if scope is not None:
+        # The scoped view names its boundary, so the plan authored from it
+        # and the inventory agree on what "in scope" meant.
+        inventory["scope"] = scope
 
     if not fast and len(files) <= 800:
         inventory["references"] = scan_references(root, rel_paths)

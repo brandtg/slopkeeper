@@ -857,6 +857,7 @@ def apply_plan(
     strict_references: bool = False,
     journal_path: Path | None = None,
     allow_symlinks: bool = False,
+    strict_case: bool = False,
 ) -> dict:
     """Dry-run or execute a plan (tending lock).
 
@@ -889,6 +890,7 @@ def apply_plan(
             strict_references=strict_references,
             journal_path=journal_path,
             allow_symlinks=allow_symlinks,
+            strict_case=strict_case,
         )
     with tend_lock(root) as lock:
         data = _apply_plan(
@@ -900,6 +902,7 @@ def apply_plan(
             strict_references=strict_references,
             journal_path=journal_path,
             allow_symlinks=allow_symlinks,
+            strict_case=strict_case,
         )
     if lock.unavailable:
         add_warning(data, "no_locking_available")
@@ -930,6 +933,7 @@ def _apply_plan(
     strict_references: bool = False,
     journal_path: Path | None = None,
     allow_symlinks: bool = False,
+    strict_case: bool = False,
 ) -> dict:
     root = corpus_root.resolve()
     plan = load_plan(plan_path)
@@ -939,7 +943,12 @@ def _apply_plan(
         allow_partial=allow_partial,
         require_based_on=True,
         allow_symlinks=allow_symlinks,
+        strict_case=strict_case,
     )
+    # A bounded tend (P4, 2) compares the fingerprint of ITS subtree, not
+    # the whole corpus: a change in a sibling scope is not drift against
+    # this plan, so a queue of scoped tends does not invalidate itself.
+    scope = plan.get("scope")
     # provenance: the hash of the exact plan bytes being applied —
     # recorded in the manifest, the journal header, and checked against
     # the last render. load_plan just read this file, so it is hashable.
@@ -963,7 +972,7 @@ def _apply_plan(
     # silently, so the two digests being compared could describe two
     # different corpora and still "pass". The count refuses the tend
     # before the comparison is even meaningful.
-    current, fp_health = corpus_fingerprint_detail(root)
+    current, fp_health = corpus_fingerprint_detail(root, scope=scope)
     unstatable = _refuse_corpus_churn(fp_health, force)
     recorded = based_on_binding(plan)
     if not recorded:
@@ -1217,7 +1226,7 @@ def _apply_plan(
     # plan ≠ gate in the header). P3's single-pass scanner makes the
     # extra walk free; until then the audit trail costs one more hashing
     # pass over the corpus.
-    at_execute, exec_health = corpus_fingerprint_detail(root)
+    at_execute, exec_health = corpus_fingerprint_detail(root, scope=scope)
     unstatable = max(unstatable, _refuse_corpus_churn(exec_health, force))
     journal = journal_path or _default_journal(root)
     journal.parent.mkdir(parents=True, exist_ok=True)
@@ -1232,10 +1241,13 @@ def _apply_plan(
                 "ts": time.time(),
                 # B5: plan binding / gate digest / at-execute digest —
                 # the three instants one tend spans (a torn or edited
-                # journal still says which corpus it belongs to).
+                # journal still says which corpus it belongs to). Under a
+                # bounded tend (P4, 2) these are the SCOPE digests and
+                # `scope` names the subtree they describe.
                 "plan_fingerprint": recorded,
                 "gate_fingerprint": current,
                 "execute_fingerprint": at_execute,
+                **({"scope": scope} if scope else {}),
             },
         )
         for src, dst in _execution_order(chains):

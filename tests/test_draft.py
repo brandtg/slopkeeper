@@ -119,10 +119,15 @@ class TestDraftGates(TempCase):
         plan_path = write_plan(self.root)
         apply_plan(plan_path, self.root, execute=True)
         (self.root / "fresh-slop.md").write_text("# fresh slop\n")
-        # draft.py imports MAX_FILES into its own namespace, so the cap is
-        # patchable here without materializing 3000 real files.
-        with mock.patch.object(draft_module, "MAX_FILES", 2):
+        # draft.py imports MEMORY_MAX_FILES into its own namespace, so the
+        # cap is patchable here without materializing tens of thousands of
+        # real files. The blocked scan makes it a memory bound, not a cliff.
+        with mock.patch.object(draft_module, "MEMORY_MAX_FILES", 2):
             expect_code(self, lambda: draft(self.root), "corpus_too_big")
+            # --force overrides the memory bound (P4: blocked candidate
+            # scan, not the O(n²) sweep the bound guards).
+            out = draft(self.root, force=True)
+            self.assertIsNotNone(out["plan"])
 
     def test_low_confidence_unresolved_names_the_score(self):
         # An unresolved file must say WHY: which neighbor was found and how

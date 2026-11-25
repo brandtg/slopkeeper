@@ -266,6 +266,20 @@ def _read_entry(
     return buf
 
 
+def _scope_under_scope(prefix: str, scope: str) -> bool:
+    """Is directory `prefix` ("." for the root) the scope or below it?"""
+    if prefix == "." or not prefix:
+        return False
+    return prefix == scope or prefix.startswith(scope + "/")
+
+
+def _scope_ancestor(prefix: str, scope: str) -> bool:
+    """Is `prefix` a strict ancestor of `scope` (the path we must descend)?"""
+    if prefix == "." or not prefix:
+        return True
+    return scope.startswith(prefix + "/")
+
+
 def walk_visits(
     root: Path,
     *,
@@ -273,6 +287,7 @@ def walk_visits(
     want_head: bool = False,
     want_kind: bool = False,
     report: WalkReport | None = None,
+    scope: str | None = None,
 ):
     """The corpus traversal: one `os.walk`, one stat per file, `DirVisit`s.
 
@@ -286,6 +301,13 @@ def walk_visits(
     fills the first HEAD_BYTES, `want_kind` fills the `kinds.classify`
     answer. `report` collects the pruned-away facts (see WalkReport);
     pass None and the walk keeps them to a throwaway report.
+
+    `scope` (P4, 2) bounds the walk to one corpus-relative directory and
+    its subtree: only that directory and its descendants are visited, so
+    a bounded tend of a 60k tree pays for one subtree, not the whole
+    corpus. The walk still prunes skip-list / ignored / nested-corpus
+    members exactly as it does unsafely; the only change is the descent
+    is narrowed to the scope path.
     """
     root = Path(root)
     ignore = load_ignore(root)
@@ -296,6 +318,14 @@ def walk_visits(
         dpath = Path(dirpath)
         rel_dir = dpath.relative_to(root)
         prefix = rel_dir.as_posix() if rel_dir.parts else ""
+
+        if scope is not None:
+            if not _scope_under_scope(prefix, scope) and not _scope_ancestor(
+                prefix, scope
+            ):
+                # A sibling subtree: never entered when scoped.
+                dirnames[:] = []
+                continue
 
         kept_dirs: list[str] = []
         symlinked: list[tuple[str, str]] = []
@@ -318,6 +348,17 @@ def walk_visits(
                 report.nested.append(rel)
                 continue
             kept_dirs.append(d)
+        if (
+            scope is not None
+            and _scope_ancestor(prefix, scope)
+            and not _scope_under_scope(prefix, scope)
+        ):
+            # An ancestor on the way to the scope: follow only the one
+            # child that leads in, and yield none of this directory's own
+            # files (they are siblings of the scope, not inside it).
+            next_part = scope[len(prefix) + 1 if prefix else 0 :].split("/")[0]
+            dirnames[:] = [d for d in kept_dirs if d == next_part]
+            continue
         kept_dirs.sort()
         # os.walk recurses through THIS list, so pruning and sorting it
         # is not cosmetic: it is what keeps a skip-list directory, an
@@ -484,8 +525,14 @@ def scan_corpus(
     want_head: bool = False,
     want_kind: bool = False,
     report: WalkReport | None = None,
+    scope: str | None = None,
 ) -> CorpusScan:
-    """Run the one traversal and hold every entry (see CorpusScan)."""
+    """Run the one traversal and hold every entry (see CorpusScan).
+
+    `scope` (P4, 2) restricts the walk to one corpus-relative directory
+    subtree; every fold over the result (fingerprint, the inventory
+    document, the manifest) then describes that scope and nothing else.
+    """
     root = Path(root)
     scan = CorpusScan(root, report)
     for visit in walk_visits(
@@ -494,6 +541,7 @@ def scan_corpus(
         want_head=want_head,
         want_kind=want_kind,
         report=scan.report,
+        scope=scope,
     ):
         scan.visits.append(visit)
         for e in visit.files:
@@ -502,17 +550,22 @@ def scan_corpus(
     return scan
 
 
-def prepare(root: Path) -> CorpusScan:
+def prepare(root: Path, scope: str | None = None) -> CorpusScan:
     """The full-facility scan: hashes, heads, kinds, every report facet.
 
     `doctor` — and `clusters`, which wants the hashes for its vector
     cache — calls this once and answers every survey it has from the
     result. `inventory.collect` builds its own narrower scan when it is
-    handed none.
+    handed none. `scope` (P4, 2) bounds the whole command to one subtree.
     """
     report = WalkReport(non_regular=True, ignored_files=True, hidden_children=True)
     return scan_corpus(
-        root, want_sha=True, want_head=True, want_kind=True, report=report
+        root,
+        want_sha=True,
+        want_head=True,
+        want_kind=True,
+        report=report,
+        scope=scope,
     )
 
 
@@ -562,11 +615,16 @@ def fingerprint_from_visits(
     return f"{CURRENT_FP_PREFIX}:{h.hexdigest()[:32]}:{count}", health
 
 
-def fingerprint_scan(root: Path) -> tuple[str, dict]:
-    """(fingerprint, health) — the streaming fold, nothing materialized."""
+def fingerprint_scan(root: Path, scope: str | None = None) -> tuple[str, dict]:
+    """(fingerprint, health) — the streaming fold, nothing materialized.
+
+    `scope` (P4, 2) digests only one corpus-relative subtree: a bounded
+    tend binds to the part of the corpus it actually governs, so a change
+    in a sibling scope is not drift against this plan.
+    """
     report = WalkReport()
     return fingerprint_from_visits(
-        walk_visits(root, want_sha=True, report=report), report
+        walk_visits(root, want_sha=True, report=report, scope=scope), report
     )
 
 

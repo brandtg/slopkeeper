@@ -26,12 +26,12 @@ def _cand(out: dict, cand_id: str) -> dict:
 
 
 class TestProposeCandidates(TempCase):
-    def test_shape_three_candidates_all_counts(self):
+    def test_shape_five_candidates_all_counts(self):
         out = build_candidates(self.root)
-        self.assertEqual(len(out["candidates"]), 3)
+        self.assertEqual(len(out["candidates"]), 5)
         self.assertEqual(
             {c["id"] for c in out["candidates"]},
-            {"by-project", "by-kind", "hybrid"},
+            {"by-project", "by-role", "by-topic", "by-kind", "hybrid"},
         )
         for c in out["candidates"]:
             for key in (
@@ -39,10 +39,52 @@ class TestProposeCandidates(TempCase):
                 "citation_break_count",
                 "code_anchor_count",
                 "unresolved_estimate",
+                "orphaned_estimate",
             ):
                 self.assertIn(key, c)
             self.assertTrue(c["strategy"])
             self.assertTrue(c["strategy_name"])
+
+    def test_unknown_candidate_raises_slopkeeper_error(self):
+        # P4 (7): a caller typo surfaces the machine code, not a raw
+        # ValueError that would land as `internal`.
+        from slopkeeper.models import SlopKeeperError
+
+        with self.assertRaises(SlopKeeperError) as cm:
+            candidate_moves(self.root, "by-magic")
+        self.assertEqual(cm.exception.code, "propose_unknown_candidate")
+
+    def test_by_role_keeps_role_dirs_whole(self):
+        # A top-level dir carrying AGENTS.md/README.md is a standing role
+        # → its subtree stays; a bare dir with no marker is unresolved.
+        write(self.root / "research-desk/AGENTS.md", "# research desk\n")
+        write(self.root / "research-desk/notes.md", "n\n")
+        write(self.root / "loosepile/x.md", "x\n")  # no marker → unresolved
+        out = build_candidates(self.root)
+        by_role = _cand(out, "by-role")
+        # spark-1.2.3 and lead-gen carry READMEs → roles → stay (0 moves);
+        # research-desk stays; the rest is unresolved.
+        self.assertEqual(by_role["move_count"], 0)
+        moved = candidate_moves(self.root, "by-role")
+        self.assertNotIn("research-desk/notes.md", moved)
+        self.assertNotIn("spark-1.2.3/README.md", moved)
+        self.assertGreaterEqual(by_role["orphaned_estimate"], 1)
+
+    def test_by_topic_groups_clusters(self):
+        # Three tightly-related new docs form a topic cluster → they share
+        # one topics/ folder; unrelated files are unresolved.
+        for name in ("market-analysis-audit", "market-analysis-findings"):
+            write(
+                self.root / f"{name}.md",
+                f"# {name}\n\nchurn retention funnel onboarding market analysis\n" * 3,
+            )
+        moved = candidate_moves(self.root, "by-topic")
+        # The two market-analysis files land in the same topic folder.
+        self.assertIn("market-analysis-audit.md", moved)
+        self.assertEqual(
+            moved["market-analysis-audit.md"], moved["market-analysis-findings.md"]
+        )
+        self.assertTrue(moved["market-analysis-audit.md"].startswith("topics/"))
 
     def test_by_project_keeps_project_subtrees_whole(self):
         # A README marks a project: its whole subtree stays put under

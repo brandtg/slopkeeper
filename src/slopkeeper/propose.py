@@ -2,14 +2,14 @@
 #
 # SPDX-License-Identifier: MIT
 
-"""`propose`: candidate layouts with breakage costs (Phase 10).
+"""`propose`: candidate layouts with breakage costs (Phase 10, P4).
 
-The layout fork — by project or by kind? is moving the data sources
-worth what it breaks? — becomes data: 2-3 candidate partitions, each
-with a move count, a citation-break count, a code-anchor count and an
-unresolved estimate. Output is ADVISORY JSON: it never authors a plan;
-the agent picks a layout, writes the plan (rules or moves), and the
-human still gates.
+The layout fork — by project, by role, by topic, or by kind? is moving
+the data sources worth what it breaks? — becomes data: five candidate
+partitions, each with a move count, a citation-break count, a
+code-anchor count, an unresolved estimate and an orphaned estimate.
+Output is ADVISORY JSON: it never authors a plan; the agent picks a
+layout, writes the plan (rules or moves), and the human still gates.
 
 Each candidate implements one strategy's MECHANICAL core — the part of
 the rubric that needs no judgment:
@@ -18,6 +18,18 @@ the rubric that needs no judgment:
   package/pyproject files ... never split a project's internal
   structure." Dirs carrying a marker file keep their whole subtree in
   place; everything else has no project signal and is left unresolved.
+- by-role (role-bots): "what IS this pile" as a bot workspace
+  collection. A top-level dir directly holding its own AGENTS.md or
+  README.md is a standing role (the rubric gives every role folder an
+  AGENTS.md — its presence is the only judgment-free signal a tool can
+  read); that whole subtree stays. Files under no role dir have no
+  role signal → unresolved, never guessed: the unresolved count IS the
+  answer about the pile.
+- by-topic (topics): "partition by subject" as a deterministic pass —
+  the TF-IDF content clusters (filename + title + head tokens) name
+  `topics/<label>` folders; unclustered files stay unresolved. The
+  topics rubric is judgment-heavy, so this is the comparison-cost
+  estimate, never a suggested plan.
 - by-kind (by-kind): the mechanical floor — every file sorts into its
   kind dir (docs/data/scripts/media, misc for the unknown), structure
   flattened, nothing left unresolved.
@@ -40,18 +52,31 @@ Counts, per candidate, over the same read-only scan:
   moved file — the candidate disturbs them; `__file__` math cannot be
   rewritten by any pass.
 - unresolved_estimate: files the candidate leaves with NO dest.
+- orphaned_estimate: the same files counted as a cost — where judgment
+  still has to land before this layout is real. by-kind and hybrid
+  orphan nothing (0) and the number says so rather than pretending the
+  layout is free; by-role and by-topic orphan exactly the files that
+  carry no role signal or share no vocabulary.
 
 `--scan-path` / `--external-root` add citing directories (an ignored
 subtree, a skills store, a cron dir) to the citation scan — a break
 count that ignores skills answers the fork question wrong.
+
+An unknown candidate name is refused (propose_unknown_candidate)
+rather than silently returning no moves. by-topic clusters with the
+same candidate blocking `clusters` uses past MAX_FILES, so `propose`
+scales with the corpus instead of hitting the all-pairs wall; below
+the cap it is the exact matcher, unchanged.
 """
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from . import kinds
 from .anchors import scan_code_anchors
+from .models import SlopKeeperError
 from .references import (
     CitationIndex,
     _PER_FILE_CAP,
@@ -76,7 +101,7 @@ from .strategies import get_strategy
 KIND_EXTS: dict[str, frozenset[str]] = kinds.KIND_EXTS
 KIND_DIR = {"docs": "docs", "data": "data", "code": "scripts", "media": "media"}
 
-# projects.json's detection signals, as direct dir contents. A marker
+# Projects.json's detection signals, as direct dir contents. A marker
 # at the corpus ROOT does not make the root a project.
 PROJECT_MARKERS = {
     "README.md",
@@ -89,11 +114,77 @@ PROJECT_MARKERS = {
     "pom.xml",
 }
 
+# role-bots.json's mechanical floor: a top-level dir that already carries
+# its own AGENTS.md or README.md is a standing role (the rubric says each
+# role folder gets an AGENTS.md; presence of one is the only judgment-free
+# signal a tool can read). Everything else has no role signal → unresolved.
+ROLE_MARKERS = {"README.md", "AGENTS.md"}
+
+# A topic folder label, slugified to a single path segment.
+_NON_SLUG_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _slug(text: str) -> str:
+    return _NON_SLUG_RE.sub("-", text.lower()).strip("-")[:40] or "topic"
+
+
 CANDIDATES = [
     ("by-project", "projects"),
+    ("by-role", "role-bots"),
+    ("by-topic", "topics"),
     ("by-kind", "by-kind"),
     ("hybrid", "hybrid"),
 ]
+
+
+def _role_dirs(rel_paths: list[Path]) -> set[str]:
+    """Top-level dirs directly holding an AGENTS.md/README.md (role-bots)."""
+    return {
+        rp.parts[0]
+        for rp in rel_paths
+        if len(rp.parts) == 2 and rp.name in ROLE_MARKERS
+    }
+
+
+def _topic_dirs(rel_paths: list[Path], min_size: int = 2) -> dict[str, str]:
+    """{rel: "topics/<label>"} from the similarity clusters ≥min_size.
+
+    The topics rubric's mechanical floor — "partition by subject" — as a
+    deterministic pass: TF-IDF content clusters (filename + title + head
+    tokens) name the topics, one folder each. Judgment-heavy by nature, so
+    this is the comparison-cost estimate, never a suggested plan. Files in
+    no cluster are left unresolved by the caller.
+
+    Past MAX_FILES the matcher runs candidate-blocked (same as
+    `clusters`, P4): blocked pairs are a subset of all-pairs, so a topic
+    folder is never a fabricated merge, and `propose` scales with the
+    corpus instead of refusing with similarity_cap.
+    """
+    from .similar import (
+        MAX_FILES,
+        _neighbor_adjacency,
+        build_vectors,
+        candidate_pairs,
+        cluster_label,
+        similarity_clusters,
+    )
+
+    files = [{"path": rp.as_posix()} for rp in rel_paths]
+    if not files:
+        return {}
+    vecs = build_vectors(files)
+    adjacency = (
+        _neighbor_adjacency(candidate_pairs(vecs)) if len(vecs) > MAX_FILES else None
+    )
+    clusters = similarity_clusters(vecs, adjacency=adjacency)
+    out: dict[str, str] = {}
+    for c in sorted(clusters, key=lambda c: (-len(c), c[0])):
+        if len(c) < min_size:
+            continue
+        label = _slug(cluster_label(c) or "topic")
+        for rel in c:
+            out[rel] = f"topics/{label}"
+    return out
 
 
 def _corpus_rel_paths(root: Path) -> list[Path]:
@@ -129,10 +220,15 @@ def _dest_map(root: Path, cand_id: str) -> dict[str, str | None]:
     "Stay" is spelled as the file's own dir, so a dest equal to the
     current dir is not a move — a corpus already in a candidate's shape
     moves nothing under it (the honest move count).
+
+    Unknown candidate → propose_unknown_candidate (a caller typo is loud,
+    not a silent empty candidate).
     """
     root = Path(root)
     rel_paths = _corpus_rel_paths(root)
     roots = _project_roots(rel_paths)
+    role_dirs = _role_dirs(rel_paths) if cand_id == "by-role" else set()
+    topics = _topic_dirs(rel_paths) if cand_id == "by-topic" else {}
     dest: dict[str, str | None] = {}
     for rp in rel_paths:
         rel_str = rp.as_posix()
@@ -140,6 +236,16 @@ def _dest_map(root: Path, cand_id: str) -> dict[str, str | None]:
         in_proj = _in_project(rp, roots)
         if cand_id == "by-project":
             d: str | None = str(rp.parent) if in_proj else None
+        elif cand_id == "by-role":
+            # A file under a top-level role dir (AGENTS.md/README.md) is
+            # the role's — its whole subtree stays. No role signal → the
+            # rubric's own rule: unresolved, never guessed.
+            d = str(rp.parent) if rp.parts and rp.parts[0] in role_dirs else None
+        elif cand_id == "by-topic":
+            # Clustered files land in their topic folder; unclustered are
+            # unresolved (the topics rubric is judgment-heavy — this is the
+            # mechanical comparison core, not a suggested plan).
+            d = topics.get(rel_str, None)
         elif cand_id == "by-kind":
             d = KIND_DIR[kind] if kind else "misc"
         elif cand_id == "hybrid":
@@ -148,7 +254,13 @@ def _dest_map(root: Path, cand_id: str) -> dict[str, str | None]:
             else:
                 d = KIND_DIR.get(kind) if kind else None
         else:
-            raise ValueError(f"unknown candidate {cand_id!r}")
+            raise SlopKeeperError(
+                "propose_unknown_candidate",
+                f"unknown candidate {cand_id!r}",
+                "Known candidates: "
+                + ", ".join(cid for cid, _ in CANDIDATES)
+                + " (see `slopkeeper propose`).",
+            )
         dest[rel_str] = d
     return dest
 
@@ -240,6 +352,7 @@ def _counts_for(
             d = "/".join(parts[:i])
             if d in anchors:
                 anchored_hit.add(d)
+    unresolved_n = sum(1 for d in dest.values() if d is None)
     return {
         "move_count": len(moved),
         # Breaks the pass does NOT fix (ambiguous lines, not_utf8 citers,
@@ -249,7 +362,13 @@ def _counts_for(
         "citation_break_count": breaks,
         "citation_rewrites": rewrites_n,
         "code_anchor_count": len(anchored_hit),
-        "unresolved_estimate": sum(1 for d in dest.values() if d is None),
+        "unresolved_estimate": unresolved_n,
+        # P4 (7): "files this layout would orphan unresolved" — the count
+        # the agent needs to read the fork honestly. For the mechanical
+        # cores (role-bots, topics) this is where judgment still has to
+        # land; a by-kind/hybrid layout orphans nothing, and the number
+        # says so rather than pretending the layout is free.
+        "orphaned_estimate": unresolved_n,
     }
 
 
@@ -286,6 +405,7 @@ def candidate_moves(root: Path, cand_id: str) -> dict[str, str]:
     The equivalent-plan construction for tests (and any consumer that
     wants the concrete layout behind a count): moves are
     [{from: rel, to: dest/<basename>}], preserve-name like rule
-    expansion.
+    expansion. An unknown candidate is refused (propose_unknown_candidate)
+    with the valid list.
     """
     return _moved(_dest_map(Path(root).resolve(), cand_id))
