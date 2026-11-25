@@ -180,6 +180,25 @@ the JSON subcommands documented here; they are scriptable and stable.)
    `--allow-symlinks` on `plan validate` / `plan render` / `apply` —
    never a clobber license (an existing destination stays
    `plan_dst_exists`-refused even with the flag).
+9. **An import is a citation nothing fixes** (0.3.0). `import utils.helpers`
+   names `utils/helpers.py`, and the citation rewrite pass will NEVER edit
+   it: a module path is code, not a path token, and safely rewriting one is
+   AST work the stdlib-only core deliberately does not do. So the cost is
+   REPORTED instead — `refs` lists importers as `kind: "import"`,
+   `inventory` carries an `imports` map, `plan validate` counts
+   `import_stale` / `import_retargeted`, and `plan render` prints a
+   `## 🔌 Import citations` section. When the gate shows import risk for a
+   move, author an `edits` entry per statement (an ordinary edit, so
+   exactly-once validation protects it) or get explicit human sign-off on
+   breaking them. Never let it go unmentioned because "the tool will fix
+   references".
+10. **A verify command is shell code from the plan** (0.3.0). `plan render`
+    prints every `verify` / `verify_command` verbatim with its working
+    directory; do not approve a plan whose commands you have not read, and
+    do not add a command you cannot explain to the owner. Checks run only
+    under `--execute` (a dry run reports `would_verify`), and the first
+    non-zero exit rolls the whole tend back (`verify_failed`, exit 2)
+    unless `--no-auto-undo` — which keeps the changes and stays loud.
 
 ## Fixture hygiene (repo tests)
 
@@ -326,7 +345,11 @@ intentional name. When you add a fixture or an example, invent an
      → fix every error code it gives you (a plan without
        based_on.corpus_fingerprint is one of them: plan_no_based_on).
        Moves crossing symlinked paths refuse here too (symlink_escape;
-       --allow-symlinks for a deliberate traversal). Then:
+       --allow-symlinks for a deliberate traversal). Read
+       `import_risk_moves` / `import_stale` / `import_retargeted` while
+       you are here (0.3.0): imports the moves break and the rewrite pass
+       will never fix — each needs an edit or explicit sign-off (see
+       "Working with code corpora"). Then:
    slopkeeper plan render <plan.json> <root> --out plan.md
      → HUMAN GATE: show plan.md. Wait for approval. An unbound plan
        renders a loud "WARNING — plan carries no corpus binding" block
@@ -360,6 +383,17 @@ intentional name. When you add a fixture or an example, invent an
        the move is an atomic no-replace link/unlink), and an edit whose
        `find` no longer occurs exactly once at write time is recorded
        `edit_stale` rather than guessed at (B3).
+       When the plan declares `verify` (or a folder declares
+       `verify_command`), the commands run AFTER all of that — in a
+       shell, at the corpus or folder root — and the first non-zero exit
+       rolls the ENTIRE tend back through the journal and raises
+       `verify_failed` (exit 2) with the captured stdout/stderr tails in
+       `data.verify` (0.3.0; `--no-auto-undo` keeps the changes and stays
+       loud). On a git corpus, tracked files move with `git mv` and
+       sources with uncommitted changes refuse the tend (`git_dirty`,
+       `--force`/`--no-git`); `data.git` reports the commit, how each
+       move ran, and what the index looks like afterwards. See "Working
+       with code corpora".
 
 8. slopkeeper scaffold <plan.json> <root> --execute
      → writes AGENTS.md roster + per-folder AGENTS.md/STATE.md.
@@ -578,6 +612,15 @@ tokens proportional to the slop shot in, not the corpus size:
        the reason, and the next-step hint says so. A zero-move draft
        (everything went unresolved) is still a valid plan: validate it
        and apply --execute — the backlog is recorded for the human.
+       `--suggest-code-edits` (0.3.0) additionally fills the draft's
+       `edits` with the path literals code builds out of SEPARATE strings
+       — `join(base, "sub", "data")` holds no path token, so the rewrite
+       pass cannot reach it and the call would keep building the old path
+       after the move. Each suggestion is an ordinary edit (exactly-once
+       validated, human-approved); the payload's `code_edits` /
+       `code_edit_stats` report what was proposed and, just as loudly,
+       what was refused (f-string holes, multi-line runs, ambiguous
+       finds).
 
 3. Triage. Fix the draft: reclassify wrong moves, resolve the
    unresolved ones (they're the actual judgment work), add folder
@@ -848,6 +891,11 @@ find/replace pairs for it:
           "safe to move" from "you typoed" (exists: false) from
           "ambiguous, tool refused to guess". Still ok: true — each is
           a valid query result, not an error.
+          Import STATEMENTS naming the path come back separately as
+          "import_count" + "imports" rows ({file, line, text,
+          kind: "import", import_lang, spec}) — same question ("what
+          references this?"), different answer, because the rewrite pass
+          fixes the citations and never an import (0.3.0).
           A directory name includes citations of paths under it.
           Citations flagged "external": true sit outside the corpus
           (absolute file path). A slashed name that exists nowhere in
@@ -944,6 +992,192 @@ with its reason (`no_change`: both ends moved and the relative form is
 identical; `ambiguous_basename`; `not_utf8`; ...) — no more
 unexplained silence.
 
+## Working with code corpora (0.3.0)
+
+A corpus is often a codebase, or a directory of scripts nobody has ever
+organized. SlopKeeper's journal, undo, fingerprint gate and human gate are
+exactly the parts a code mover needs, so 0.3.0 adds the four things that
+were missing — and stops deliberately short of becoming a refactoring
+tool. The division of labour is the project's whole thesis: **the tool
+detects and guarantees, the agent decides and authors, the human
+approves.**
+
+### Import citations: detected, reported, NEVER rewritten
+
+`import utils.helpers` names `utils/helpers.py` as surely as a Markdown
+link names `docs/api.md` — and moving that file breaks it. It is not a
+path token (no slash, no extension), so the citation rewrite pass does not
+see it and never will: editing a module path safely is AST work, and the
+core is stdlib-only. So an import is its own citation kind, `kind:
+"import"`, and the tool's job is to make the cost **legible before the
+human approves** instead of discovering it after.
+
+Detected, and resolved against the corpus tree:
+
+| language | statements | resolves to |
+|---|---|---|
+| python | `import a.b.c`, `from a.b import c, d`, `from . import x`, `importlib.import_module("a.b")` | `a/b/c.py`, `a/b/c/__init__.py`, or the directory — the most specific file that exists; leading dots resolve up from the citing file |
+| js/ts | `import x from "./y"`, `import "./y"`, `export * from "./y"`, `require("./y")`, `import("./y")` | only RELATIVE specifiers (a bare one names a package), with the usual extension and `index.*` fallbacks |
+| go | `import "example.com/m/pkg/util"` and the grouped form | the package DIRECTORY, through the `go.mod` module prefix when present |
+| rust | `mod foo;`, `use crate::a::b;`, `use self::x;`, `use a::b;` | the sibling `foo.rs` / `foo/mod.rs`; `use` paths under the crate root (`src/` if present) |
+
+Where to read them:
+
+- `refs <root> <path>` — `import_count` and `imports`, each row
+  `{file, line, text, kind: "import", import_lang, spec}`, beside the
+  prose `citations`. `citation_count` is still the citation count alone:
+  the two differ in whether apply repairs them, so they are never merged.
+- `inventory <root>` (not `--fast`, ≤ 800 files) — `imports`, a
+  `{target: [{file, line, spec, lang}]}` map PARALLEL to `references`
+  (deliberately separate: reading an import edge as a citation edge would
+  promise a repair that never happens), and `stats.imports`
+  (`files_scanned`, `statements`, `resolved`, `unresolved`, `langs`). An
+  unresolved import is NORMAL — stdlib and third-party — so it is counted
+  and is never an error.
+- `plan validate <plan> <root>` — `import_risk_moves`, `import_stale`,
+  `import_retargeted`, and the `import_risk` envelope warning; every row
+  (with its `evidence`) lands in the `--out` JSON.
+- `plan render` (and the REPL's `/render`) — a `## 🔌 Import citations`
+  section: the counts per move and the file:line of each statement.
+
+The risk question is not "does the path move" but **"does the statement
+still resolve after it does"**: every import whose target a move touches
+is re-resolved against the post-move tree, from the importer's post-move
+directory.
+
+- `stale` — resolves to nothing. The code will not import it, and nothing
+  in apply fixes that.
+- `retargeted` — resolves to a DIFFERENT file. The statement still runs
+  and now means something else: the worse failure, and the one nobody
+  notices.
+- No row at all when the importer moves WITH its target: a directory
+  renamed around its own importers keeps their relative statements
+  resolving, and that tend is free — the gate says so by silence.
+
+**Your move when the gate shows import risk:** author an `edits` entry per
+statement (`{"file": "app/main.py", "find": "import utils.helpers",
+"replace": "import lib.utils.helpers"}`) — ordinary edits, so the existing
+exactly-once validation refuses anything ambiguous — or get the human's
+explicit sign-off on breaking them. A plan that moves imported files and
+says nothing about it is the failure mode this section exists to kill.
+
+### Anchor edits: `draft --suggest-code-edits`
+
+`os.path.join(base, "sub", "data")` builds `sub/data` out of three
+literals, so it contains **no path token** and the rewrite pass cannot
+reach it — the call keeps building the old path after the move. The anchor
+scan has detected those calls since Phase 9; `--suggest-code-edits` turns
+the detection into a proposal: for each literal run whose prefix composes
+a directory the plan moves, draft writes an ordinary `edits` entry
+replacing exactly those literals with one literal holding the new path
+(`"sub", "data"` → `"archive/sub/data"`).
+
+They are suggestions on a plan you edit and a human approves, and they
+pass through every edit gate that exists (`edit_stale` /
+`edit_ambiguous`). The generator refuses, and COUNTS, what it cannot do
+safely: `skipped_wildcard` (an f-string hole — `f"v{v}"` is a runtime
+value; detecting it is fine, freezing it to text would be the worst edit
+this tool could make), `skipped_multiline`, `skipped_ambiguous` (a find
+that is not unique in the file), `skipped_quote`. `code_edits` and
+`code_edit_stats` are on the draft payload even when zero — "no edits
+suggested" and "four runs found, all refused" are different facts.
+
+### Verifying a tend: `verify` and `verify_command`
+
+Topology was never the whole story: a plan can move every file cleanly and
+leave the corpus unbuildable. A plan may now carry shell commands, and
+`apply --execute` runs them **after** the moves, rewrites and edits:
+
+```json
+"verify": [
+  "pytest -q",
+  {"command": "npm test", "cwd": "web", "name": "web suite", "timeout": 300}
+]
+```
+
+and any folder entry may carry `"verify_command": "pytest -q"` (a string
+or a list), which joins the same ordered run with that folder as its
+working directory. `cwd` is corpus-relative; `timeout` defaults to 600s
+and is capped at 3600s (apply holds the tend lock while checks run, so an
+unbounded check is an unbounded lock). A malformed entry refuses with
+`plan_bad_verify`.
+
+- **The gate prints every command verbatim** in `## 🧪 Verification`, with
+  its working directory and origin. These are shell commands from a plan
+  file: the human gate is the trust boundary, and a check nobody read is a
+  check that surprises someone at the first failure.
+- **A dry run never runs them.** `apply` without `--execute` reports
+  `would_verify` and touches nothing.
+- Executed results carry `verify`: `{status, ran, commands}` where
+  `status` is `passed | passed_with_skips | skipped`, and each command row
+  carries `{name, command, cwd, status, returncode, stdout, stderr}` with
+  the captured TAILS (the tail is where a pytest summary or a build error
+  actually lives). Every result is also journaled as a `verify` op, so the
+  recovery record says what the corpus looked like, not only where its
+  files were.
+- **The first non-zero exit (or timeout) stops the run and UNDOES the
+  whole tend** through the journal: apply raises `verify_failed` (exit 2)
+  with the captured output in `data.verify.failed`, and
+  `data.verify.auto_undone` is `true`. That is the all-or-nothing promise
+  extended from topology to semantics.
+- `--no-auto-undo` keeps the changes so you can debug inside the broken
+  state. It is still `verify_failed`, still exit 2, still prints the exact
+  undo as `error.suggested_command` — a corpus that does not pass its own
+  checks never reads as a success.
+- A tend that already failed mid-run SKIPS the checks (`status:
+  "skipped"`, note `partial-apply`, warning `verify_skipped_partial`): a
+  check that fails because half a plan applied would report a broken
+  corpus and blame the plan.
+- A folder check whose directory does not exist yet is skipped with
+  `verify_skipped_missing_cwd` — folders are scaffolded AFTER apply — not
+  failed, and not silently passed.
+- Rollback reverses what the JOURNAL recorded: this tend's moves, rewrites
+  and edits. A file the check itself created (a cache, a build output, a
+  report) was never part of the tend and stays where it is; the tool does
+  not delete, and does not guess.
+
+### Git cooperation
+
+When the corpus is a git repository — and only then, and only if the `git`
+binary is present: it is probed once per tend, and every failure degrades
+to the pre-0.3.0 filesystem behavior — apply cooperates with git:
+
+- **Tracked FILES move with `git mv`**, so the index records a rename
+  instead of a deletion plus an untracked file. **Directories always move
+  on disk**: `git mv` moves what git tracks and would leave untracked or
+  ignored content behind inside the old directory, and a mover that
+  silently leaves files is the failure this tool exists to prevent. Git
+  detects those renames by content at diff time, which is what rename
+  detection is for.
+- **A source with uncommitted changes refuses** the tend with `git_dirty`
+  before anything moves — the fingerprint gate binds contents and cannot
+  see the index. Commit or stash and re-run; review and pass `--force` to
+  move anyway (the count then rides `data.git.dirty_sources` with the
+  `git_dirty_forced` warning); or pass `--no-git` to keep git out of the
+  tend.
+- **Untracked slop is never dirty.** Filing the files an agent just
+  dropped is the primary workflow, so `??` entries never trigger the
+  refusal, and a file staged as new (`A`) moves freely.
+- The execute envelope carries `data.git`: `{repo, cooperated, head,
+  moved_via_git, moved_via_fs, dirty_sources, staged, renamed, added,
+  modified, deleted, untracked}`, and the journal header records the
+  commit the tend ran against (`git_head`). `--no-git` still reports the
+  block (with `cooperated: false`), because it describes the corpus, not
+  the flags. A repo whose git could not be probed at all adds the
+  `git_unavailable` warning.
+- **Undo stays git-agnostic**: the journal is the source of truth and undo
+  never shells out. A git-cooperated tend STAGED its renames, and a
+  rollback cannot unstage them, so undo reports `warnings:
+  ["git_index_staged_moves"]` and its `next` hint names the two escape
+  hatches — `git reset` to unstage, `git checkout -- .` to restore tracked
+  files from HEAD.
+
+Non-goals, on purpose: no AST or semantic rewriting (the agent authors the
+edits; an optional `slopkeeper[code]` extra is where a parser would
+live), no package managers, no lockfile rewriting beyond plain-text
+citations, no IDE rename semantics. SlopKeeper detects and guarantees; you
+decide.
+
 ## Error codes you will see
 
 | code | meaning | your move |
@@ -1028,6 +1262,9 @@ unexplained silence.
 | `propose_unknown_candidate` | `candidate_moves(root, "<id>")` (or an internal call) named a candidate that does not exist | known candidates: by-project, by-role, by-topic, by-kind, hybrid — see `slopkeeper propose` |
 | `skill_unknown_agent` | `skill install` target is neither a known agent nor a path-like string | use a known agent (claude, opencode, hermes) or pass a skills directory path — the skill lands in `<dir>/slopkeeper/` |
 | `skill_target_not_dir` | `skill install` destination exists as a file | remove it or pass a different skills directory |
+| `plan_bad_verify` | a `verify` entry (or a folder's `verify_command`) is not a string or an object with `command` and optional `cwd`/`name`/`timeout`, has an unknown key, an empty command, a non-positive or over-ceiling timeout, or a `cwd` outside the corpus | a verify entry is `"pytest -q"` or `{"command": "npm test", "cwd": "web", "name": "web tests", "timeout": 300}`; `slopkeeper plan schema` shows the shape (P6, Slice C) |
+| `verify_failed` | a plan/folder `verify_command` exited non-zero (or timed out) after `apply --execute` — by default the WHOLE tend is rolled back through the journal first, so the corpus is exactly as it was | read `data.verify.failed.stdout`/`stderr` (the captured tails are the answer), fix the plan or the code, re-render, apply again. To debug inside the broken state instead, re-apply with `--no-auto-undo` (the changes then stay, and `data.verify.auto_undone` is false) |
+| `git_dirty` | the corpus is a git repo and a move source has uncommitted changes (worktree or index) — refused BEFORE any move, because the fingerprint gate binds contents and cannot see staged state | commit or stash the changes and re-run; review them and pass `--force` to move anyway; or `--no-git` to skip git cooperation for this tend (P6, Slice D) |
 
 ## Sizing
 

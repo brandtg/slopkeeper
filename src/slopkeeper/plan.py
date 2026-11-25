@@ -30,6 +30,7 @@ from .models import (
     state_dir,
 )
 from .ignore import IGNORE_NAME, corpus_walk, glob_to_regex, load_ignore
+from .verify import normalize_verify
 from .references import (
     CitationIndex,
     _PER_FILE_CAP,
@@ -426,6 +427,15 @@ def validate_plan(
             'Set "remove_emptied": true to have apply remove directories '
             "the plan emptied (journaled, undoable), or drop the field.",
         )
+
+    # P6 (Slice C): the verification commands, normalized ONCE here so
+    # validate, the human gate and apply cannot disagree about what runs.
+    # A string, a list of strings, or a list of {command, cwd?, name?,
+    # timeout?} objects all land as canonical objects; a folder's
+    # `verify_command` merges into the same ordered run with the folder as
+    # its working directory. An empty result REMOVES the key rather than
+    # storing [] — a corpus with no checks must not grow envelope keys.
+    verify_cmds = normalize_verify(plan.get("verify"), root, where="plan.verify")
     if Path(_req(plan, "corpus_root")).resolve() != root:
         raise SlopKeeperError(
             "plan_wrong_root",
@@ -1416,9 +1426,10 @@ def validate_plan(
                 f"folder {f['path']}: unknown kind {kind!r}",
                 f"kind must be one of {sorted(VALID_FOLDER_KINDS)}",
             )
+        path = safe_relpath(f["path"], root).as_posix()
         folders.append(
             {
-                "path": safe_relpath(f["path"], root).as_posix(),
+                "path": path,
                 "kind": kind,
                 "role": str(f.get("role", "")).strip(),
                 "boundaries": [
@@ -1426,8 +1437,31 @@ def validate_plan(
                 ],
                 "state_md": bool(f.get("state_md", kind == "bot")),
                 "agents_md": f.get("agents_md"),
+                # P6 (Slice C): the folder's own checks. `scaffold` never
+                # runs them (it writes files); `apply --execute` does, with
+                # this folder as the working directory — which is the
+                # whole point: a `role-bots` folder verifies itself.
+                "verify_command": f.get("verify_command"),
             }
         )
+        if f.get("verify_command") is not None:
+            # The folder's commands join the one ordered run, after the
+            # plan-level ones, and carry the folder as their cwd. Read
+            # from the ORIGINAL entry (`f`): the normalized dict above
+            # keeps the key verbatim, and `path` here is the validated,
+            # root-relative form the command will actually run in.
+            verify_cmds.extend(
+                normalize_verify(
+                    f.get("verify_command"),
+                    root,
+                    where=f"folder {path!r} verify_command",
+                    folder=path,
+                )
+            )
+    if verify_cmds:
+        plan["verify"] = verify_cmds
+    else:
+        plan.pop("verify", None)  # absent, not empty: no envelope grows the key
     plan["folders"] = folders
     plan["moves"] = normalized
     # B8 advisory: directories the plan empties file by file, with
@@ -1673,6 +1707,38 @@ def emptied_dir_suggestions(root: Path, plan: dict) -> list[dict]:
 _REWRITE_COVERED_STATUSES = ("rewrite", "no_change", "edit_covered")
 
 
+def _gate_verify_cmds(plan: dict) -> list[dict]:
+    """The commands the gate must show, validated plan or not.
+
+    A plan that went through `validate_plan` carries the merged, canonical
+    `verify` list, and that is what the gate prints. A hand-built plan (the
+    golden tests, a caller rendering markdown directly) has only the raw
+    fields — and the one promise this feature makes is that NO command runs
+    that the human did not see, so the folder entries are shown best-effort
+    rather than silently missing from the approval document.
+    """
+    if plan.get("verify") is not None:
+        return list(plan["verify"])
+    out: list[dict] = []
+    for f in plan.get("folders", []) or []:
+        if not isinstance(f, dict):
+            continue
+        raw = f.get("verify_command")
+        if raw is None:
+            continue
+        for item in raw if isinstance(raw, list) else [raw]:
+            if isinstance(item, str):
+                out.append(
+                    {"command": item, "cwd": f.get("path"), "folder": f.get("path")}
+                )
+            elif isinstance(item, dict) and item.get("command"):
+                entry = dict(item)
+                entry.setdefault("cwd", f.get("path"))
+                entry.setdefault("folder", f.get("path"))
+                out.append(entry)
+    return out
+
+
 def render_markdown(
     plan: dict,
     reference_report: dict | None = None,
@@ -1680,6 +1746,7 @@ def render_markdown(
     footer: str | None = None,
     stragglers: list[dict] | None = None,
     code_anchor_risks: list[dict] | None = None,
+    import_risks: list[dict] | None = None,
     emptied_dirs: list[dict] | None = None,
     summary_only: bool | None = None,
 ) -> str:
@@ -1702,6 +1769,14 @@ def render_markdown(
     output: moves whose source is (or contains) a directory built in
     code. Informational — the gate shows the cost, the human decides.
 
+    import_risks (P6 Slice A), when given, is import_move_risks()' output:
+    moves whose source is imported by code that will stop resolving. The
+    distinction from code_anchor_risks is the whole point of showing it —
+    the rewrite pass fixes a path literal in code, and has never in this
+    tool's history fixed an import statement, so these citations break
+    silently unless the human sees them here. Informational, never
+    blocking; the full rows are in `plan validate --out`.
+
     emptied_dirs (B8), when given, is emptied_dir_suggestions()' output:
     directories the plan empties file by file, with destination
     breakdowns and a ready-to-paste prefix_rewrites suggestion when one
@@ -1717,6 +1792,9 @@ def render_markdown(
     _STRAGGLER_DIRS = 10
     _STRAGGLER_EXAMPLES = 5
     _REWRITE_ROW_CAP = 500
+    # Import evidence rows: the per-move counts above are always exact;
+    # this caps only the file:line table, which `--out` carries in full.
+    _IMPORT_EVIDENCE_CAP = 40
     # P4 (3): a rule-expanded plan can carry tens of thousands of moves;
     # past the cap the STDOUT render drops to the Summary table (where
     # things go) and defers the per-move detail to `--out`. `summary_only`
@@ -1841,6 +1919,48 @@ def render_markdown(
                 '(use "preserve": "tree" on the rule to keep them)'
             )
     lines.append("")
+    # P6 (Slice C): the verification commands, printed VERBATIM before the
+    # human approves. This is the safety boundary for the one feature that
+    # runs shell commands from a plan file: an operator who cannot see
+    # `pytest -q` in the gate cannot approve it knowingly, and a check
+    # nobody read is a check that will surprise someone at the first
+    # failure. The rollback promise rides beside it, so what a failure
+    # COSTS is legible too.
+    verify_cmds = _gate_verify_cmds(plan)
+    if verify_cmds:
+        lines.append("## 🧪 Verification — runs after apply, in a shell")
+        lines.append("")
+        lines.append(
+            f"{len(verify_cmds)} command(s) run against the corpus once the "
+            "moves, rewrites and edits are done. The first non-zero exit "
+            "stops the run and UNDOES the whole tend (exit 2, "
+            "`verify_failed`) unless apply is passed `--no-auto-undo`."
+        )
+        lines.append("")
+        lines.append("| # | command | runs in | timeout | from |")
+        lines.append("|---|---|---|---|---|")
+        for i, v in enumerate(verify_cmds, 1):
+            # `.get` everywhere, with the same defaults verify.py fills:
+            # `render_markdown` is documented never to touch disk and the
+            # golden tests (and any caller with a hand-built plan) call it
+            # with UNNORMALIZED entries. A gate that KeyError'd on a plan
+            # it was about to display would be the worst kind of bug.
+            command = v.get("command") or ""
+            if not command:
+                continue
+            origin = f"folder `{v.get('folder')}`" if v.get("folder") else "plan"
+            timeout = v.get("timeout")
+            lines.append(
+                f"| {i} | `{_cell(command)}` | `{_cell(v.get('cwd') or '.')}` "
+                f"| {timeout if timeout else '—'}s | {origin} |"
+            )
+        lines.append("")
+        lines.append(
+            "⚠️ These are shell commands from the plan, not sandboxed. If "
+            "you do not recognize every one of them, do not approve the "
+            "plan — remove the entry or ask the agent to justify it."
+        )
+        lines.append("")
     if plan.get("partial"):
         lines.append("- **Scope: PARTIAL** — delta plan; only the listed files move.")
         lines.append("")
@@ -2028,6 +2148,51 @@ def render_markdown(
             "but `__file__` math is computed, not written — moving these "
             "dirs costs code changes. Evidence: `refs` or doctor "
             "code_anchors."
+        )
+        lines.append("")
+
+    if import_risks:
+        stale = sum(r.get("stale", 0) for r in import_risks)
+        retargeted = sum(r.get("retargeted", 0) for r in import_risks)
+        lines.append("## 🔌 Import citations — code that imports what moves")
+        lines.append("")
+        lines.append(
+            f"{stale} import statement(s) will break and {retargeted} will "
+            "silently mean something else. The rewrite pass NEVER edits an "
+            "import: a module path is code, not a citation."
+        )
+        lines.append("")
+        lines.append("| move | importers | stale | retargeted | languages |")
+        lines.append("|---|---|---|---|---|")
+        for r in import_risks:
+            langs = ", ".join(r.get("langs") or []) or "—"
+            lines.append(
+                f"| `{r['from']}` → `{r['to']}` | {r.get('importer_count', 0)} "
+                f"| {r.get('stale', 0)} | {r.get('retargeted', 0)} | {langs} |"
+            )
+        lines.append("")
+        evidence = [(r, e) for r in import_risks for e in (r.get("evidence") or [])]
+        if evidence:
+            lines.append("Where the statements live:")
+            lines.append("")
+            lines.append("| importer | import | language | outcome |")
+            lines.append("|---|---|---|---|")
+            for _r, e in evidence[:_IMPORT_EVIDENCE_CAP]:
+                lines.append(
+                    f"| `{e['file']}`:{e['line']} | `{_cell(e['spec'])}` "
+                    f"| `{e['lang']}` | {e['status']} |"
+                )
+            if len(evidence) > _IMPORT_EVIDENCE_CAP:
+                lines.append(
+                    f"…and {len(evidence) - _IMPORT_EVIDENCE_CAP} more "
+                    "(`plan validate --out` carries every row)."
+                )
+            lines.append("")
+        lines.append(
+            "Informational, never blocking. An import whose file moves WITH "
+            "its importer is not listed — only the statements that stop "
+            "resolving are. Fixing one is an edit you (or your agent) "
+            "author: `refs <root> <path>` lists the exact lines."
         )
         lines.append("")
 
@@ -2343,6 +2508,16 @@ PLAN_TEMPLATE = {
     # plan empties file by file. Absent/false = advisory suggestions
     # only; the gate lists exactly what would be removed.
     "remove_emptied": False,
+    # P6 (Slice C): the corpus's own checks, run by `apply --execute` after
+    # the moves, rewrites and edits. A failing command ROLLS THE TEND BACK
+    # (exit 2, verify_failed) unless --no-auto-undo. A bare string, or
+    # objects with "command" and optional "cwd" (corpus-relative), "name",
+    # "timeout" (seconds). Folders may carry their own "verify_command"
+    # (see AGENT_GUIDE.md, "Verifying a tend") — it runs with the folder as
+    # its working directory. Left EMPTY here on purpose: unlike a move, an
+    # entry in this list is shell code the human gate must approve, so it
+    # is never a copy-paste placeholder.
+    "verify": [],
     "edits": [
         {
             "file": "stay_put_file.md",

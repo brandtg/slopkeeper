@@ -62,6 +62,8 @@ from .plan import (
     preflight_destinations,
     validate_plan,
 )
+from . import gitops
+from .verify import run_verify
 from .references import (
     CitationIndex,
     _apply_line_replacements,
@@ -867,6 +869,72 @@ def _execution_order(chains: dict[str, str]) -> list[tuple[str, str]]:
     return order
 
 
+def _verify_error(
+    failure: dict,
+    rows: list[dict],
+    journal: Path,
+    root: Path,
+    plan_path: Path,
+    undone: bool,
+    extra: dict | None = None,
+) -> SlopKeeperError:
+    """The `verify_failed` error, with the check's own words in `data`.
+
+    "The verification command failed" is not an error an agent can act
+    on; the captured tail of stdout/stderr is. It rides the envelope's
+    `data` (the same level the success path uses) rather than being
+    squeezed into a message string, and `undone` says which world the
+    caller is in: True and the corpus is back exactly as it was, False
+    and the changes are still on disk (`--no-auto-undo`) with the undo
+    command as the way out.
+    """
+    where = failure.get("folder") or failure.get("cwd") or "."
+    rc = failure.get("returncode")
+    outcome = failure["status"]
+    if undone:
+        recovery = (
+            "The corpus was rolled back through the journal — it is exactly "
+            "as it was before apply. Fix the plan or the check, re-render, "
+            "and apply again; `plan render` prints every verify command "
+            "before you approve."
+        )
+        suggested = f"slopkeeper plan render {plan_path} {root}"
+    else:
+        recovery = (
+            "CHANGES ARE KEPT (--no-auto-undo): the corpus is in the "
+            "post-apply state and its own check does not pass. Read the "
+            "captured output, then undo the tend or fix the code — the "
+            "journal below restores every move, rewrite and edit."
+        )
+        suggested = f"slopkeeper undo {journal} {root} --execute"
+    return SlopKeeperError(
+        "verify_failed",
+        f"verify command failed: {failure['command']} "
+        f"(cwd {where}, {outcome}, exit {rc if rc is not None else '—'})",
+        recovery,
+        suggested,
+        data={
+            "verify": {
+                "status": "failed",
+                "auto_undone": undone,
+                "ran": len(rows),
+                "commands": rows,
+                "failed": {
+                    "name": failure["name"],
+                    "command": failure["command"],
+                    "cwd": failure["cwd"],
+                    "returncode": failure.get("returncode"),
+                    "stdout": failure.get("stdout", ""),
+                    "stderr": failure.get("stderr", ""),
+                    "note": failure.get("note"),
+                },
+            },
+            "journal": str(journal),
+            **(extra or {}),
+        },
+    )
+
+
 def apply_plan(
     plan_path: Path,
     corpus_root: Path,
@@ -877,6 +945,8 @@ def apply_plan(
     journal_path: Path | None = None,
     allow_symlinks: bool = False,
     strict_case: bool = False,
+    auto_undo: bool = True,
+    use_git: bool = True,
 ) -> dict:
     """Dry-run or execute a plan (tending lock).
 
@@ -890,6 +960,17 @@ def apply_plan(
     allow_symlinks (CLI --allow-symlinks) is the deliberate traversal
     flag for the A2 move-path containment policy; default False refuses
     moves through or onto symlinks (symlink_escape).
+
+    auto_undo (CLI --no-auto-undo, P6 Slice C) decides what a failed
+    `verify` command costs: by default the whole tend is rolled back
+    through the journal and the apply exits 2 with `verify_failed`, so a
+    corpus whose checks do not pass is a corpus that was never touched.
+    With auto_undo False the changes STAY (loudly flagged) for an operator
+    who wants to debug inside the broken state.
+
+    use_git (CLI --no-git, P6 Slice D) is the kill switch for git
+    cooperation on a repo corpus — `git mv` per move and the dirty-source
+    refusal. Git is probe-based and fail-soft; this only turns it off.
 
     A tend that ran WITHOUT the lock (a platform with no fcntl) says so
     on its own envelope — `warnings: ["no_locking_available"]` (B7).
@@ -910,6 +991,8 @@ def apply_plan(
             journal_path=journal_path,
             allow_symlinks=allow_symlinks,
             strict_case=strict_case,
+            auto_undo=auto_undo,
+            use_git=use_git,
         )
     with tend_lock(root) as lock:
         data = _apply_plan(
@@ -922,6 +1005,8 @@ def apply_plan(
             journal_path=journal_path,
             allow_symlinks=allow_symlinks,
             strict_case=strict_case,
+            auto_undo=auto_undo,
+            use_git=use_git,
         )
     if lock.unavailable:
         add_warning(data, "no_locking_available")
@@ -953,6 +1038,8 @@ def _apply_plan(
     journal_path: Path | None = None,
     allow_symlinks: bool = False,
     strict_case: bool = False,
+    auto_undo: bool = True,
+    use_git: bool = True,
 ) -> dict:
     root = corpus_root.resolve()
     plan = load_plan(plan_path)
@@ -1214,6 +1301,60 @@ def _apply_plan(
                 "or grant write access — nothing was moved.",
             )
 
+    # 2c. Git cooperation (P6, Slice D) — probed ONCE, on the execute path
+    # only. A repo corpus moves its tracked FILES through `git mv` (so the
+    # rename lands in the index) and refuses to move a source with
+    # uncommitted changes unless --force: the fingerprint gate binds
+    # contents to the plan and says nothing about the index, so staged
+    # state is drift this tool would otherwise walk over. Directories stay
+    # on the filesystem path — `git mv` moves what git TRACKS and would
+    # leave untracked or ignored content behind inside the old directory,
+    # which is the one thing a mover must never do (see gitops's module
+    # notes). Every failure here degrades to the pre-0.3.0 behavior; git
+    # is an enhancement, never a dependency.
+    git_state = {
+        "repo": False,
+        "available": False,
+        "cooperating": False,
+        "head": None,
+        "tracked": frozenset(),
+        "untracked": frozenset(),
+        "reason": "not_a_git_repo",
+    }
+    git_moves = 0
+    git_fs_moves = 0
+    git_dirty: list[str] = []
+    if execute and (root / ".git").exists():
+        # Probed even when cooperation is switched off: HEAD is worth
+        # recording in the journal of any tend that ran in a repo, and
+        # `data.git` should describe the corpus, not the flags.
+        git_state = gitops.probe(root)
+        git_state["cooperating"] = bool(git_state["available"] and use_git)
+        if not use_git:
+            git_state["reason"] = "disabled"
+        if git_state["cooperating"]:
+            git_dirty = gitops.dirty_sources(root, sorted(chains))
+            if git_dirty and not force:
+                raise SlopKeeperError(
+                    "git_dirty",
+                    f"{len(git_dirty)} move source(s) have uncommitted "
+                    f"changes in git: {git_dirty[:5]}"
+                    + (" …" if len(git_dirty) > 5 else ""),
+                    "git sees work here that the fingerprint gate cannot: "
+                    "moving these would leave staged state pointing at "
+                    "paths that no longer exist. Commit or stash the "
+                    "changes and re-run, review them and pass --force to "
+                    "move anyway, or use --no-git to skip git cooperation "
+                    "for this tend.",
+                    f"slopkeeper apply {plan_path} {root} --execute --force",
+                )
+
+    # 2d. The verification plan (P6, Slice C) — decided here, run after the
+    # last write. A dry run reports the commands instead of running them:
+    # these are shell commands from a plan file, and a dry run that
+    # executed them would be the worst kind of surprise.
+    verify_cmds = plan.get("verify") or []
+
     if not execute:
         dry = {
             "mode": "dry-run",
@@ -1224,6 +1365,17 @@ def _apply_plan(
             "reference_risks": ref_report,
             "fingerprint": current,
         }
+        if verify_cmds:
+            dry["would_verify"] = [
+                {
+                    "name": v["name"],
+                    "command": v["command"],
+                    "cwd": v["cwd"] or ".",
+                    "timeout": v["timeout"],
+                    **({"folder": v["folder"]} if v.get("folder") else {}),
+                }
+                for v in verify_cmds
+            ]
         if unstatable:
             # B6: the dry run says it too — a churny corpus is worth
             # knowing about before the human approves the render.
@@ -1271,6 +1423,12 @@ def _apply_plan(
     journal = journal_path or _default_journal(root)
     journal.parent.mkdir(parents=True, exist_ok=True)
     moved, edits_applied, errors, rewrote = [], [], [], []
+    # The verify run's outcome, assembled inside the journal span below.
+    verify_rows: list[dict] = []
+    verify_failure: dict | None = None
+    verify_status: str | None = None
+    verify_note: str | None = None
+    verify_flags: list[str] = []
     with journal.open("a", encoding="utf-8") as jf:
         _journal_write(
             jf,
@@ -1287,6 +1445,20 @@ def _apply_plan(
                 "plan_fingerprint": recorded,
                 "gate_fingerprint": current,
                 "execute_fingerprint": at_execute,
+                # P6 Slice D: the commit this tend ran against, and that
+                # git cooperation was in play at all. The journal stays the
+                # source of truth for undo (which never shells out), but a
+                # tend in a repo is a tend that may have STAGED moves in
+                # the index — and undo needs that fact to tell the operator
+                # so, hours or weeks later, from the header alone.
+                **(
+                    {
+                        "git_head": git_state["head"],
+                        "git_cooperated": git_state["cooperating"],
+                    }
+                    if git_state["repo"]
+                    else {}
+                ),
                 **({"scope": scope} if scope else {}),
             },
         )
@@ -1338,8 +1510,23 @@ def _apply_plan(
                             errno.EEXIST, "Destination exists", str(dst_abs)
                         )
                     shutil.move(str(src_abs), str(dst_abs))
+                    git_fs_moves += 1
+                elif git_state["cooperating"] and src in git_state["tracked"]:
+                    # P6 Slice D: a TRACKED file moves through git, so the
+                    # index records a rename instead of a loss. Any git
+                    # refusal (an untracked-looking path, a submodule, a
+                    # git that dislikes something) falls back to the
+                    # atomic no-clobber move below, which is exactly what
+                    # ran before 0.3.0 — cooperation can only improve the
+                    # outcome, never break the tend.
+                    if gitops.move_file(root, src, dst):
+                        git_moves += 1
+                    else:
+                        _move_no_clobber(src_abs, dst_abs)
+                        git_fs_moves += 1
                 else:
                     _move_no_clobber(src_abs, dst_abs)
+                    git_fs_moves += 1
             except FileExistsError as err:
                 errors.append(
                     {
@@ -1391,16 +1578,33 @@ def _apply_plan(
             for rep in reps:
                 per_line.setdefault(rep["line"], []).append(rep)
             ok = True
+            # The undo recipe, richer than the plan's rows: each entry
+            # carries `col`, the offset its `new` landed at IN THE LINE AS
+            # IT STOOD at that moment. Reversing by counting occurrences
+            # (the old way) is not exact — a line that already mentioned
+            # the destination before the tend ("see utils/x.py, moved to
+            # lib/x.py") ends up holding the new string more times than the
+            # rewrite introduced, so the check refused and the revert was
+            # skipped, leaving the file citing a path that undo had just
+            # unmoved. Splicing at a recorded offset is exact, and the
+            # auto-undo's "byte-identical" promise rests on it.
+            jreps: list[dict] = []
             for lineno in sorted(per_line):
                 idx = lineno - 1
                 if idx >= len(lines):
                     ok = False
                     break
                 for rep in per_line[lineno]:
-                    if rep["old"] not in lines[idx]:
+                    pos = lines[idx].find(rep["old"])
+                    if pos < 0:
                         ok = False
                         break
-                    lines[idx] = lines[idx].replace(rep["old"], rep["new"], 1)
+                    lines[idx] = (
+                        lines[idx][:pos]
+                        + rep["new"]
+                        + lines[idx][pos + len(rep["old"]) :]
+                    )
+                    jreps.append({**rep, "col": pos})
                 if not ok:
                     break
             if not ok:
@@ -1422,7 +1626,7 @@ def _apply_plan(
                         "ts": time.time(),
                         "op": "rewrite",
                         "file": report_rel,
-                        "replacements": reps,
+                        "replacements": jreps,
                         "count": len(reps),
                     },
                 )
@@ -1473,9 +1677,17 @@ def _apply_plan(
                     }
                 )
                 continue
+            # Where the substitution lands, recorded so undo splices the
+            # right span. `hits == 1` makes `find` unique going in, but the
+            # RESULT need not be: replace a short path with a longer one and
+            # the new string may already appear elsewhere in the file, and
+            # `replace(replace, find, 1)` on the way back would revert that
+            # other occurrence instead.
+            at = text.find(find)
+            replaced = str(e["replace"])
             try:
                 fp.write_text(
-                    text.replace(find, str(e["replace"]), 1), encoding="utf-8"
+                    text[:at] + replaced + text[at + len(find) :], encoding="utf-8"
                 )
             except OSError as err:
                 errors.append({"file": final, "error": f"OSError: {err}"})
@@ -1489,6 +1701,7 @@ def _apply_plan(
                         "file": final,
                         "find": e["find"],
                         "replace": e["replace"],
+                        "at": at,
                         "sha256_before": before,
                     },
                 )
@@ -1540,6 +1753,56 @@ def _apply_plan(
                     )
                     continue
                 removed_dirs.append(d)
+
+        # 4d. The verify loop (P6, Slice C): the corpus's own checks, run
+        # INSIDE the journal span so each result is durable before the next
+        # one, and the recovery record says what the corpus looked like and
+        # not only where its files were. Skipped when the tend already
+        # failed mid-run: a check that fails because half a plan applied
+        # would report a broken corpus and blame the plan, and the partial
+        # path is already loud (T5) with `next` pointing at the undo.
+        if verify_cmds and errors:
+            verify_status, verify_note = "skipped", "partial-apply"
+            verify_flags.append("verify_skipped_partial")
+        elif verify_cmds:
+            verify_rows, verify_failure = run_verify(verify_cmds, root)
+            for row in verify_rows:
+                try:
+                    _journal_write(jf, {"ts": time.time(), "op": "verify", **row})
+                except OSError as err:
+                    errors.append(
+                        {"error": f"verify ran but journal write failed: {err}"}
+                    )
+            if verify_failure is not None:
+                verify_status = "failed"
+            elif any(r["status"] == "skipped_missing_cwd" for r in verify_rows):
+                verify_status = "passed_with_skips"
+            else:
+                verify_status = "passed"
+
+    # 4e. What a failed check costs. This is the differentiator the audit
+    # names: the all-or-nothing promise finally covers SEMANTICS, not just
+    # topology, because a corpus whose own checks do not pass is put back
+    # exactly as it was — the journal, written a line at a time and fsync'd
+    # as it went, is what makes an auto-rollback safe rather than hopeful.
+    # Undo runs HERE, not through the public undo_journal: apply_plan holds
+    # the tend lock across this whole span, and flock conflicts per
+    # open-file-description, so re-acquiring it would deadlock against
+    # ourselves (models.tend_lock says the same about nesting).
+    if verify_failure is not None and auto_undo:
+        _undo_journal(journal, root, execute=True, force=True)
+        raise _verify_error(
+            verify_failure,
+            verify_rows,
+            journal,
+            root,
+            plan_path,
+            True,
+            extra={
+                "moved_count": len(moved),
+                "errors": errors,
+            },
+        )
 
     # 5. Record the tended state so `status` can diff future slop cheaply.
     unresolved = [
@@ -1616,6 +1879,70 @@ def _apply_plan(
         }
     if render_warning:
         executed["render_warning"] = render_warning
+    if verify_cmds:
+        # P6 Slice C: what the corpus's own checks said. `commands` carries
+        # every row including the captured tails, so the agent reading a
+        # passing tend can still see what ran, and one that failed got the
+        # same rows on the error envelope. `status` is
+        # passed | failed | passed_with_skips | skipped.
+        executed["verify"] = {
+            "status": verify_status,
+            "ran": len(verify_rows),
+            "commands": verify_rows,
+        }
+        if verify_note:
+            executed["verify"]["note"] = verify_note
+        for flag in verify_flags:
+            add_warning(executed, flag)
+        if verify_status == "passed_with_skips":
+            # The folder a check pointed at does not exist yet (folders
+            # are scaffolded after apply) — reported, never folded into
+            # "passed" as if the check had run.
+            add_warning(executed, "verify_skipped_missing_cwd")
+    if git_state["repo"]:
+        # P6 Slice D: the git block, present whenever the corpus IS a repo
+        # — including a tend that cooperated with it, one that was told not
+        # to (--no-git) and one where git itself was unavailable. Absent
+        # only for a non-repo corpus, so `data.git` is never a coin flip.
+        executed["git"] = {
+            "repo": True,
+            "cooperated": git_state["cooperating"],
+            "head": git_state["head"],
+            "moved_via_git": git_moves,
+            "moved_via_fs": git_fs_moves,
+            "dirty_sources": len(git_dirty),
+            **gitops.status_counts(root),
+        }
+        if not git_state["cooperating"] and git_state["reason"] != "disabled":
+            # A repo whose git could not be probed (no binary, a git that
+            # cannot read the index) moves everything on the filesystem
+            # instead. Legitimate — and the kind of thing that must never
+            # be inferred from a missing field.
+            add_warning(executed, "git_unavailable")
+        if git_dirty:
+            # --force moved files git considered dirty. The count survives;
+            # silence was the bug (the B6/B7 pattern).
+            add_warning(executed, "git_dirty_forced")
+    if verify_failure is not None:
+        # --no-auto-undo: the checks failed and the operator chose to keep
+        # the changes. Still an error, still exit 2, still with the
+        # captured output — a tend whose corpus does not pass its own
+        # checks must never read as success — but the undo is now the
+        # caller's decision, so it is the suggested command.
+        raise _verify_error(
+            verify_failure,
+            verify_rows,
+            journal,
+            root,
+            plan_path,
+            False,
+            extra={
+                "moved_count": len(moved),
+                "errors": errors,
+                "path_map": executed.get("path_map"),
+                "git": executed.get("git"),
+            },
+        )
     return executed
 
 
@@ -1656,6 +1983,10 @@ def _undo_journal(
     corrupt = 0
     mid_corrupt = 0
     tend_id = ""
+    # P6 Slice D: whether the tend being undone moved through git (see the
+    # header parse below) — and so whether its renames are still staged.
+    git_cooperated = False
+    git_head: str | None = None
     try:
         # B2: read the recovery record forgivingly. errors="replace" so
         # even an undecodable byte becomes a malformed LINE (counted and
@@ -1686,8 +2017,19 @@ def _undo_journal(
             if i != last_content:
                 mid_corrupt += 1
             continue
-        if entry.get("op") == "plan" and isinstance(entry.get("tend_id"), str):
-            tend_id = entry["tend_id"]
+        if entry.get("op") == "plan":
+            if isinstance(entry.get("tend_id"), str):
+                tend_id = entry["tend_id"]
+            # P6 Slice D: the journal still says whether this tend moved
+            # through git. Undo itself never touches git — the journal is
+            # the source of truth — but a git-cooperated tend STAGED those
+            # moves in the index, and a rollback cannot unstage them. The
+            # file is back and the index is not, which is exactly the kind
+            # of half-state an operator should be told about rather than
+            # discover at commit time.
+            if entry.get("git_cooperated"):
+                git_head = entry.get("git_head")
+                git_cooperated = True
         entries.append(entry)
     if not entries:
         raise SlopKeeperError("journal_empty", "nothing to undo")
@@ -1737,6 +2079,13 @@ def _undo_journal(
             per_line: dict[int, list[dict]] = {}
             for rep in e.get("replacements", []):
                 per_line.setdefault(rep["line"], []).append(rep)
+            # Journals from 0.3.0 on record where each substitution landed
+            # (`col`), so the revert splices that exact span back. An older
+            # journal has no offsets, and the only handle there is counting
+            # occurrences — conservative, and it stays exactly as it was.
+            exact = all(
+                isinstance(r.get("col"), int) for r in e.get("replacements", [])
+            )
             ok = True
             for lineno, reps in per_line.items():
                 idx = lineno - 1
@@ -1744,6 +2093,12 @@ def _undo_journal(
                     ok = False
                     break
                 for rep in reps:
+                    if exact:
+                        col = rep["col"]
+                        if lines[idx][col : col + len(rep["new"])] != rep["new"]:
+                            ok = False
+                            break
+                        continue
                     expected = sum(1 for r in reps if r["new"] == rep["new"])
                     if lines[idx].count(rep["new"]) != expected:
                         ok = False
@@ -1756,8 +2111,19 @@ def _undo_journal(
             if execute:
                 for lineno in sorted(per_line, reverse=True):
                     idx = lineno - 1
-                    for rep in per_line[lineno]:
-                        lines[idx] = lines[idx].replace(rep["new"], rep["old"], 1)
+                    order = (
+                        list(reversed(per_line[lineno])) if exact else per_line[lineno]
+                    )
+                    for rep in order:
+                        if exact:
+                            col = rep["col"]
+                            lines[idx] = (
+                                lines[idx][:col]
+                                + rep["old"]
+                                + lines[idx][col + len(rep["new"]) :]
+                            )
+                        else:
+                            lines[idx] = lines[idx].replace(rep["new"], rep["old"], 1)
                 try:
                     fp.write_text("".join(lines), encoding="utf-8", newline="")
                 except OSError:
@@ -1776,6 +2142,30 @@ def _undo_journal(
                 text = fp.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 ops.append({"file": e["file"], "status": "unreadable"})
+                continue
+            at = e.get("at")
+            if isinstance(at, int):
+                # 0.3.0 journals carry the offset the edit landed at, so the
+                # revert splices that exact span instead of trusting the
+                # first occurrence of `replace` to be the one we wrote.
+                if text[at : at + len(e["replace"])] != e["replace"]:
+                    ops.append({"file": e["file"], "status": "already_changed"})
+                    continue
+                if execute:
+                    try:
+                        fp.write_text(
+                            text[:at] + e["find"] + text[at + len(e["replace"]) :],
+                            encoding="utf-8",
+                        )
+                    except OSError:
+                        ops.append({"file": e["file"], "status": "unreadable"})
+                        continue
+                ops.append(
+                    {
+                        "file": e["file"],
+                        "status": "reverted" if execute else "would_revert",
+                    }
+                )
                 continue
             if e["replace"] in text:
                 if execute:
@@ -1904,6 +2294,17 @@ def _undo_journal(
             result["journal_corrupt_mid_lines"] = mid_corrupt
             if not execute:
                 add_warning(result, "journal_corrupt_needs_force")
+    if git_cooperated:
+        # P6 Slice D: the files are back; the git INDEX is not. `git mv`
+        # staged this tend's renames and undo deliberately never shells
+        # out — the journal is the source of truth — so without this the
+        # operator would find staged moves for files that are already home
+        # at commit time. `git reset` unstages them; `git checkout -- .`
+        # remains the parallel escape hatch for a tracked file (AGENT_GUIDE).
+        result["git_cooperated"] = True
+        if git_head:
+            result["git_head"] = git_head
+        add_warning(result, "git_index_staged_moves")
     if content_changed_rows:
         # B1: the per-row flags are the detail; this is the count an
         # agent keys off without walking `operations`.

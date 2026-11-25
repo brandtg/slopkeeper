@@ -90,8 +90,10 @@ The commands:
 - **doctor** — preflight: size, messiness, strategy suggestion, token
   estimate, advice. Start here.
 - **inventory** — structured JSON of the corpus: files, heads, titles,
-  dir stats, date/prefix/ext clusters, and a cross-reference index of
-  which files mention which filenames. Token-conscious modes for big
+  dir stats, date/prefix/ext clusters, a cross-reference index of
+  which files mention which filenames, and (0.3.0) a parallel `imports`
+  index of which files IMPORT which — python, js/ts, go and rust
+  statements resolved against the tree. Token-conscious modes for big
   corpora (`--fast --summary`, or `--out` to land the full JSON in a
   file with counts alone on stdout).
 - **clusters** — similarity hints for the planning agent: TF-IDF content
@@ -101,7 +103,10 @@ The commands:
   grep-before-move check behind reference integrity. The payload is
   honest about the query (`exists`, `ambiguous`, `ambiguous_paths`) and
   about its own limits (`truncated_files` + the `citation_scan_truncated`
-  warning when a file was read only as far as the 512 KiB cap).
+  warning when a file was read only as far as the 512 KiB cap). Import
+  statements naming the path come back separately (`import_count`,
+  `imports` with `kind: "import"`) — same question, different answer,
+  because the rewrite pass fixes citations and never an import.
   `--dangling` lists path-ish citations that resolve to nothing.
 - **propose** — the layout fork as data: mechanical candidate partitions
   (by-project, by-role, by-topic, by-kind, hybrid), each priced with move
@@ -115,8 +120,12 @@ The commands:
   `roots add/remove/list`, feeding `status --all` for scheduled tending.
 - **draft** — auto-drafts a delta plan for the new slop. A starting
   point for the agent to reclassify, not a decision.
+  `--suggest-code-edits` also proposes the path literals code builds out
+  of separate strings (`join(base, "sub", "data")` holds no path token, so
+  the rewrite pass cannot reach it) as ordinary plan edits.
 - **plan** — the only write path. A JSON document of `moves` (from → to +
-  reason), `keep`, `unresolved`, `folders` (to scaffold), and the corpus
+  reason), `keep`, `unresolved`, `folders` (to scaffold), `verify` (shell
+  checks to run after the tend), and the corpus
   fingerprint it was authored against — required: validate and apply
   refuse an unbound plan (`plan_no_based_on`; `plan render` warns, never
   fabricates). Validated hard: path escapes,
@@ -136,7 +145,13 @@ The commands:
   (a file edited after the tend comes back flagged `content_changed`);
   flags every move cited from stay-put files. `data.path_map` gives the
   `{old: new}` dict for the moves that happened, so a caller's cached
-  paths survive a tend.
+  paths survive a tend. A plan (or any folder it declares) may carry
+  `verify` commands: they run after the moves, rewrites and edits, and
+  the first non-zero exit ROLLS THE WHOLE TEND BACK through the journal
+  (`verify_failed`, exit 2, captured output in `data.verify`) unless
+  `--no-auto-undo`. On a git corpus, tracked files move with `git mv`,
+  and sources with uncommitted changes refuse the tend (`git_dirty`;
+  `--force` / `--no-git`) — `data.git` reports the commit and the index.
 - **move** — one bulk move (src dst root): builds the one-move plan,
   runs it through the same validate → gate → journal machinery, and
   renders the human gate. Dry-run by default; `--execute` runs it.
@@ -148,8 +163,10 @@ The commands:
   undo never reverts a neighbor tend. The journaled sha256s are verified
   on restore: a file edited after the tend still comes back, flagged
   `content_changed`. `data.path_map` is the inverse of apply's
-  `{post-tend: restored}`. Takes one journal; name it (see
-  `.slopkeeper/journal-*.jsonl`).
+  `{post-tend: restored}`. Undo never shells out to git, so when the tend
+  used `git mv` it warns (`git_index_staged_moves`) and tells you to
+  `git reset` — the files come home from the journal, the index from git.
+  Takes one journal; name it (see `.slopkeeper/journal-*.jsonl`).
 - **strategies** — partitioning rubric packs the agent reads: `role-bots`
   (folder-as-bot), `topics`, `projects`, `by-kind` (mechanical baseline),
   `hybrid` (default). Your own pack is a file, not a release: drop
@@ -174,10 +191,11 @@ tending it by hand. It drives the exact same functions as the JSON
 subcommands (no new write path); every `--execute` stops for an explicit
 y/N, and the default is no. Since 0.2.10 that claim is tested, not
 aspirational: `/render` calls the same `build_gate_report` the CLI's
-`plan render` does (rewrite summary, stragglers, anchor risks), `/refs`
-answers the honest query questions and takes `--dangling`, and `/apply`
-takes `--force`, `--strict-references` and `--allow-partial`. A human and
-an agent looking at the same corpus see the same thing.
+`plan render` does (rewrite summary, stragglers, anchor and import
+risks), `/refs` answers the honest query questions and takes
+`--dangling`, and `/apply` takes `--force`, `--strict-references` and
+`--allow-partial`. A human and an agent looking at the same corpus see
+the same thing.
 
 ```text
 $ slopkeeper
@@ -216,6 +234,14 @@ work — point your agent at AGENT_GUIDE.md.
   the tend, empty dirs it created pruned. Nothing is ever deleted.
 - Strategies are JSON rubric packs, not code: the agent reads them like
   documentation, and new strategies are new files, not releases.
+- Code corpora get the same discipline without a parser dependency. Imports
+  are detected, resolved and priced — never rewritten, because silently
+  editing an `import` line is how a tidy tool breaks a build; the agent
+  decides with `import_risk_moves` in front of them. String-built paths,
+  which no rewrite pass can reach, come back as ordinary plan edits. The
+  tend's own `verify` commands have the last word — a non-zero exit rolls
+  the whole tend back through the journal — and on a git repo tracked files
+  move with `git mv` behind a dirty check, so the diff stays reviewable.
 
 ## For developers
 

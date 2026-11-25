@@ -70,6 +70,7 @@ def draft(
     min_sim: float | None = None,
     depth: int | None = None,
     force: bool = False,
+    suggest_code_edits: bool = False,
 ) -> dict:
     """Draft a partial delta plan for new slop, recursively by default.
 
@@ -81,6 +82,16 @@ def draft(
     scan is candidate-blocked past the old 3000 cap, so a re-tend on a
     large corpus no longer refuses outright — it refuses only past
     MEMORY_MAX_FILES unless --force.
+
+    suggest_code_edits (P6, Slice B) fills the draft's `edits` with the
+    path literals code builds out of SEPARATE strings — `join(base, "sub",
+    "data")` holds no path token, so the citation rewrite pass never sees
+    it and the call keeps building the old path after the move. Anchors
+    used to be detection with no follow-through; this makes them a
+    proposal. Every emitted edit goes through the same exactly-once
+    validation as a hand-authored one (and the generator pre-filters the
+    finds that are not unique), so the safety story is unchanged: the
+    agent reviews, the human gates, the tool refuses anything ambiguous.
     """
     root = root.resolve()
     if min_sim is None:
@@ -314,7 +325,7 @@ def draft(
         "folders": [],
     }
     write_vector_cache(root, params, cache_docs, fresh)
-    return {
+    result = {
         "plan": plan,
         "drafted_count": len(moves),
         "unresolved_count": len(unresolved),
@@ -322,3 +333,16 @@ def draft(
         "new_count": total_new,
         "undrafted": _undrafted(len(moves), len(unresolved), len(dedups)),
     }
+    if suggest_code_edits:
+        # P6 Slice B: the anchors the rewrite pass cannot reach, turned
+        # into proposed edits. Counted in the payload either way — zero
+        # suggestions with code in the corpus is a fact worth seeing, not
+        # an absence.
+        from .anchors import suggest_anchor_edits  # local: keeps import cycles out
+
+        edits, code_stats = suggest_anchor_edits(root, plan)
+        plan["edits"] = edits
+        plan["draft"]["code_edits"] = len(edits)
+        result["code_edits"] = len(edits)
+        result["code_edit_stats"] = code_stats
+    return result

@@ -14,6 +14,7 @@ from helpers import (
     TempCase,
     prune_slopkeeper,
     snapshot_tree,
+    write,
     write_edit_plan,
     write_plan,
 )
@@ -255,6 +256,160 @@ class TestManifestRefresh(TempCase):
         undone = undo_journal(Path(out["journal"]), self.root, execute=True)
         self.assertEqual(undone["manifest"], "rebuilt")
         self.assertEqual(load_manifest(self.root)["schema"], "slopkeeper/manifest@2")
+
+
+class TestReversalPrecision(TempCase):
+    """P6: the auto-undo promise is BYTE-IDENTITY, which needs exact reversal.
+
+    Counting occurrences of `new` (the pre-0.3.0 reversal check) breaks on the
+    ordinary sentence "moved acme_dossier.md to research/acme_dossier.md": the
+    line already contained the destination, so the check refused, the revert
+    was skipped, and the file stayed citing a path undo had just unmoved. The
+    journal now carries where each substitution landed, and these fixtures are
+    that case.
+    """
+
+    def _plan(self, **over) -> Path:
+        plan = {
+            "schema": "slopkeeper/plan@1",
+            "corpus_root": str(self.root),
+            "strategy": "hybrid",
+            "based_on": {"corpus_fingerprint": corpus_fingerprint(self.root)},
+            "moves": [
+                {
+                    "from": "acme_dossier.md",
+                    "to": "research/acme_dossier.md",
+                    "reason": "reference pile",
+                }
+            ],
+            "keep": [
+                "NOTES.md",
+                "WATCHLIST.md",
+                "globex_dossier.md",
+                "handoff-tp2.md",
+                "ledger_wb.html",
+                "spark-1.2.3",
+                "docs",
+                "lead-gen",
+            ],
+            "unresolved": [],
+            "folders": [],
+        }
+        plan.update(over)
+        p = self.root.parent / "plan.json"
+        p.write_text(json.dumps(plan), encoding="utf-8")
+        return p
+
+    def test_rewrite_reverts_a_line_that_already_mentioned_the_destination(self):
+        write(
+            self.root / "acme_dossier.md",
+            "# Acme\n\nflows.\n",
+        )
+        # The URL is urlish-excluded, so it is NOT a citation and nothing is
+        # journaled for it — but it does put the destination string on the
+        # line before the tend. Counting occurrences of `new` then sees two
+        # where the rewrite introduced one, the old reversal refused, and the
+        # file stayed pointing at research/ after undo had unmoved the file.
+        note = (
+            "See acme_dossier.md, mirrored at "
+            "https://x.example/research/acme_dossier.md for the copy.\n"
+        )
+        write(self.root / "NOTES.md", note)
+        before = prune_slopkeeper(snapshot_tree(self.root))
+        out = apply_plan(self._plan(), self.root, execute=True)
+        self.assertIn(
+            "See research/acme_dossier.md,",
+            (self.root / "NOTES.md").read_text(),
+            "fixture must actually produce the rewrite",
+        )
+        undone = undo_journal(Path(out["journal"]), self.root, execute=True)
+        self.assertEqual(
+            [o["status"] for o in undone["operations"] if o.get("file") == "NOTES.md"],
+            ["reverted"],
+            "the rewrite must revert, not be skipped as already_changed",
+        )
+        self.assertEqual(prune_slopkeeper(snapshot_tree(self.root)), before)
+
+    def test_edit_reverts_the_occurrence_it_wrote(self):
+        # `alpha` already appears in the file BEFORE the edit, so a reversal
+        # that takes the first occurrence of the replaced text corrupts the
+        # wrong word.
+        write(self.root / "acme_dossier.md", "# Acme\n\nflows.\n")
+        note = "alpha was here, and the config points at TODO-x\n"
+        write(self.root / "NOTES.md", note)
+        plan = self._plan(
+            edits=[
+                {
+                    "file": "NOTES.md",
+                    "find": "TODO-x",
+                    "replace": "alpha",
+                    "reason": "anchor edit",
+                }
+            ]
+        )
+        out = apply_plan(plan, self.root, execute=True)
+        self.assertEqual(
+            (self.root / "NOTES.md").read_text(),
+            "alpha was here, and the config points at alpha\n",
+        )
+        undone = undo_journal(Path(out["journal"]), self.root, execute=True)
+        self.assertEqual(
+            [o["status"] for o in undone["operations"] if o.get("file") == "NOTES.md"],
+            ["reverted"],
+        )
+        self.assertEqual((self.root / "NOTES.md").read_text(), note)
+
+    def test_journal_without_offsets_still_reverts_the_old_way(self):
+        # Backward compatibility: a 0.2.x journal has no `col`/`at`, and the
+        # occurrence-counting reversal is all there is. Unambiguous lines must
+        # still come back exactly.
+        write(self.root / "acme_dossier.md", "# Acme\n\nflows.\n")
+        write(self.root / "NOTES.md", "See acme_dossier.md for flows.\n")
+        before = prune_slopkeeper(snapshot_tree(self.root))
+        out = apply_plan(self._plan(), self.root, execute=True)
+        jpath = Path(out["journal"])
+        lines = [json.loads(x) for x in jpath.read_text().splitlines() if x.strip()]
+        for entry in lines:
+            for rep in entry.get("replacements") or []:
+                rep.pop("col", None)
+            entry.pop("at", None)
+        jpath.write_text("".join(json.dumps(e) + "\n" for e in lines), encoding="utf-8")
+        undone = undo_journal(jpath, self.root, execute=True)
+        self.assertEqual(
+            [o["status"] for o in undone["operations"] if o.get("file") == "NOTES.md"],
+            ["reverted"],
+        )
+        self.assertEqual(prune_slopkeeper(snapshot_tree(self.root)), before)
+
+    def test_offsets_are_what_make_the_ambiguous_line_revertible(self):
+        # Same collision as above, WITHOUT the offsets: the counting check is
+        # conservative and refuses (already_changed) rather than revert the
+        # wrong occurrence. This is the hole the `col` field closes, and the
+        # reason a refused revert is the only safe answer when the journal
+        # cannot say where the substitution landed.
+        write(self.root / "acme_dossier.md", "# Acme\n\nflows.\n")
+        write(
+            self.root / "NOTES.md",
+            "See acme_dossier.md, mirrored at "
+            "https://x.example/research/acme_dossier.md for the copy.\n",
+        )
+        out = apply_plan(self._plan(), self.root, execute=True)
+        jpath = Path(out["journal"])
+        lines = [json.loads(x) for x in jpath.read_text().splitlines() if x.strip()]
+        for entry in lines:
+            for rep in entry.get("replacements") or []:
+                rep.pop("col", None)
+        jpath.write_text("".join(json.dumps(e) + "\n" for e in lines), encoding="utf-8")
+        undone = undo_journal(jpath, self.root, execute=True)
+        self.assertEqual(
+            [o["status"] for o in undone["operations"] if o.get("file") == "NOTES.md"],
+            ["already_changed"],
+        )
+        self.assertIn(
+            "https://x.example/research/acme_dossier.md",
+            (self.root / "NOTES.md").read_text(),
+            "a refused revert must leave the file exactly as it was",
+        )
 
 
 if __name__ == "__main__":

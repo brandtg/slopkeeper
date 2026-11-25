@@ -656,6 +656,7 @@ def _cmd_render(s, arg, lines, out) -> None:
     from .anchors import anchored_move_risks
     from .apply import _run_artifacts, build_gate_report
     from .plan import straggler_report
+    from .references import import_move_risks
 
     if s.plan_path is None or s.dirty:
         _p(out, "Decisions changed — /plan first (it validates and saves).")
@@ -674,6 +675,10 @@ def _cmd_render(s, arg, lines, out) -> None:
         rewrite_summary,
         stragglers=straggler_report(root, plan),
         code_anchor_risks=anchored_move_risks(root, plan),
+        # P6 (Slice A): the human gate is the one place an import the
+        # rewrite pass will never fix becomes visible before it breaks.
+        # The REPL is the human's surface, so it shows it too.
+        import_risks=import_move_risks(root, plan),
         emptied_dirs=plan.get("emptied_dir_suggestions") or [],
     )
     _p(out, md)

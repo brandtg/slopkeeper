@@ -33,7 +33,7 @@ from pathlib import Path
 
 from . import kinds
 from .models import add_warning
-from .references import scan_references
+from .references import scan_imports, scan_references
 
 # HEAD_BYTES is re-exported: status.py imports the head budget from
 # this module, and the number belongs to the pass that reads it.
@@ -589,6 +589,36 @@ def collect(
             # claim as from a whole one. Counted, like every other cap here.
             inventory["stats"]["reference_scan_truncated_files"] = len(
                 set(scan_truncated)
+            )
+            add_warning(inventory, "citation_scan_truncated")
+
+        # P6 Slice A: the OTHER cross-reference index — which files IMPORT
+        # which. Separate from `references` on purpose: an import is a
+        # citation the rewrite pass never fixes, so merging the two maps
+        # would let an agent read "cited by 3 files, the pass rewrites
+        # them" for edges nothing repairs. Keyed the same way (a path or a
+        # directory); each row is the importer, its line, the spec as
+        # written, and the language, which is the whole answer to "what
+        # breaks if this moves?".
+        import_truncated: list[str] = []
+        imports = scan_imports(root, rel_paths, import_truncated)
+        import_stats = imports.pop("stats")
+        inventory["imports"] = {
+            target: [
+                {
+                    "file": row["file"],
+                    "line": row["line"],
+                    "spec": row["spec"],
+                    "lang": row["lang"],
+                }
+                for row in rows
+            ]
+            for target, rows in imports.items()
+        }
+        inventory["stats"]["imports"] = import_stats
+        if import_truncated:
+            inventory["stats"]["import_scan_truncated_files"] = len(
+                set(import_truncated)
             )
             add_warning(inventory, "citation_scan_truncated")
 

@@ -48,6 +48,7 @@ from .plan import (
     write_render_sidecar,
 )
 from .propose import build_candidates
+from .references import import_move_risks
 from .roots import add_root, load_roots, remove_root
 from .scan import prepare
 from .scaffold import scaffold_from_plan
@@ -60,6 +61,13 @@ from .strategies import get_strategy, list_strategies, pack_dirs
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_VALIDATION = 2
+
+# Error codes that mean "the contract was refused and the corpus is
+# untouched" without being a `plan_*` validation failure (the standing
+# prefix rule in main()). `verify_failed` is here because a tend rolled
+# back by its own failing check leaves the disk exactly as it was — the
+# agent has a plan to fix, not a half-applied tend to recover from.
+VALIDATION_CODES = {"verify_failed"}
 
 
 def _resolve_dir(raw: str) -> Path:
@@ -349,6 +357,7 @@ def cmd_draft(args) -> int:
         min_sim=args.min_sim,
         depth=args.depth,
         force=getattr(args, "force", False),
+        suggest_code_edits=getattr(args, "suggest_code_edits", False),
     )
     if data.get("plan") is None:
         # T7: the envelope is token-bounded accounting — the draft body
@@ -387,6 +396,19 @@ def cmd_draft(args) -> int:
                 "dedup moves into archive/duplicates/ (archived, never "
                 "deleted; undo restores)."
             )
+        if "code_edits" in data:
+            # P6 Slice B: the suggestions are counted on the payload even
+            # when zero, with the skip reasons beside them — "no edits
+            # suggested" and "4 runs found, all refused as ambiguous" are
+            # different facts an agent acts on differently.
+            payload["code_edits"] = data["code_edits"]
+            payload["code_edit_stats"] = data["code_edit_stats"]
+            if data["code_edits"]:
+                hint += (
+                    f" {data['code_edits']} code path literal(s) the rewrite "
+                    "pass cannot reach were proposed as edits — review each "
+                    "find/replace in the plan file before rendering."
+                )
         if data.get("undrafted"):
             payload["undrafted"] = data["undrafted"]
             und = data["undrafted"]
@@ -409,6 +431,7 @@ def cmd_refs(args) -> int:
     from .references import (
         dangling_citations,
         external_citation_lines,
+        import_citation_lines,
         refs_lookup,
     )
 
@@ -490,10 +513,13 @@ def cmd_refs(args) -> int:
     ext_hits = external_citation_lines(
         scan_dirs, args.basename, per_file_cap=args.per_file, truncated=truncated
     )
+    # ONE walk for the lookup and the import scan (they read the same
+    # corpus; the walk is the contract, not the list).
+    rel_paths = _all_rel_paths(root)
     lookup = refs_lookup(
         root,
         args.basename,
-        _all_rel_paths(root),
+        rel_paths,
         per_file_cap=args.per_file,
         truncated=truncated,
     )
@@ -545,6 +571,13 @@ def cmd_refs(args) -> int:
         if row["status"] == "scanned":
             row["hits"] = prefix_counts.get(row["path"], 0)
     hits += ext_hits
+    # P6 Slice A: the import edges pointing at this path, in the SAME
+    # {file, line, text} shape as a citation row plus kind: "import" — an
+    # agent asking "does anything reference this?" gets prose citations and
+    # import statements in one read, and can tell them apart by `kind`.
+    import_rows = import_citation_lines(
+        root, args.basename, rel_paths, per_file_cap=args.per_file
+    )
     payload = {
         "basename": args.basename,
         # A5: citation_count 0 is three different facts — "safe
@@ -556,6 +589,13 @@ def cmd_refs(args) -> int:
         "ambiguous_paths": lookup["ambiguous_paths"],
         "citation_count": len(hits),
         "citations": hits,
+        # P6 Slice A: the import statements naming this path, reported
+        # beside the citations and counted separately, because the two
+        # differ in the one way that matters here — the rewrite pass fixes
+        # the citations and has never in this tool's history fixed an
+        # import. `plan render` prices them; `apply` does not.
+        "import_count": len(import_rows),
+        "imports": import_rows,
         "scan_paths": [str(d) for d in scan_dirs],
         "scan_path_results": scan_rows,
     }
@@ -578,7 +618,10 @@ def cmd_refs(args) -> int:
                 "— declare external_roots (or scan_paths) to rewrite them in "
                 "the plan. A --scan-path inside the tool-layer skip list "
                 "(.git, .slopkeeper, .venv, node_modules, ...) is never read "
-                "and reported as scan_path_skip_list.",
+                "and reported as scan_path_skip_list. Rows with "
+                '"kind": "import" are import STATEMENTS: the automatic pass '
+                "never rewrites them, so declare an edit for each (or let "
+                "plan render price the cost) before moving the file.",
             ),
         )
     )
@@ -854,6 +897,11 @@ def cmd_plan_validate(args) -> int:
     stragglers = straggler_report(root, plan)
     # Phase 9: informational cost rows for moves of code-anchored dirs.
     anchor_risks = anchored_move_risks(root, plan)
+    # P6 Slice A: moves that break import statements. Informational like
+    # the anchor rows, and the same reason to show them here: nothing in
+    # apply will ever rewrite an import, so a plan that breaks 40 of them
+    # has to be legible before a human approves it.
+    import_risks = import_move_risks(root, plan)
     # B8: emptied-by-file dirs ride on the validated plan itself.
     emptied = plan.get("emptied_dir_suggestions") or []
     data = {
@@ -868,8 +916,16 @@ def cmd_plan_validate(args) -> int:
         "straggler_dirs": len(stragglers),
         "straggler_files": sum(s["count"] for s in stragglers),
         "code_anchored_moves": len(anchor_risks),
+        "import_risk_moves": len(import_risks),
         "emptied_dirs": len(emptied),
     }
+    if import_risks:
+        # Only when non-zero: `import_stale` is the number an agent acts
+        # on (statements that will not resolve), and its absence must mean
+        # "nothing broke", not "not counted".
+        data["import_stale"] = sum(r["stale"] for r in import_risks)
+        data["import_retargeted"] = sum(r["retargeted"] for r in import_risks)
+        add_warning(data, "import_risk")
     if plan.get("scope"):
         data["scope"] = plan["scope"]
     if plan.get("dedup"):
@@ -893,6 +949,7 @@ def cmd_plan_validate(args) -> int:
                     **plan,
                     "stragglers": stragglers,
                     "code_anchor_risks": anchor_risks,
+                    "import_risks": import_risks,
                 },
                 indent=1,
             ),
@@ -955,6 +1012,10 @@ def cmd_plan_render(args) -> int:
     stragglers = straggler_report(root, plan)
     # Phase 9: moves of code-anchored dirs — informational cost rows.
     anchor_risks = anchored_move_risks(root, plan)
+    # P6 Slice A: import statements the moves break. The rewrite pass is
+    # silent about these by design, so the gate is the only place a human
+    # can see the cost before approving it.
+    import_risks = import_move_risks(root, plan)
     # B8: emptied-by-file dirs and their destination breakdowns ride on
     # the validated plan.
     emptied = plan.get("emptied_dir_suggestions") or []
@@ -967,6 +1028,7 @@ def cmd_plan_render(args) -> int:
         rewrite_summary,
         stragglers=stragglers,
         code_anchor_risks=anchor_risks,
+        import_risks=import_risks,
         emptied_dirs=emptied,
         summary_only=False,
     )
@@ -1003,6 +1065,7 @@ def cmd_plan_render(args) -> int:
                 rewrite_summary,
                 stragglers=stragglers,
                 code_anchor_risks=anchor_risks,
+                import_risks=import_risks,
                 emptied_dirs=emptied,
                 summary_only=True,
             )
@@ -1076,6 +1139,8 @@ def cmd_apply(args) -> int:
         strict_references=args.strict_references,
         allow_symlinks=args.allow_symlinks,
         strict_case=getattr(args, "strict_case", False),
+        auto_undo=not getattr(args, "no_auto_undo", False),
+        use_git=not getattr(args, "no_git", False),
     )
     if args.rewrites_out:
         # B1: the line-level rewrite detail as JSON, matching
@@ -1136,13 +1201,24 @@ def cmd_undo(args) -> int:
     # undo was the last command without it): after a restore, the corpus
     # and its manifest were rewritten, so the agent's next act is to look.
     if data["mode"] == "executed":
-        nxt = next_step(
-            "status",
-            f"slopkeeper status {root}",
+        hint = (
             f"Restored {len(data['operations'])} op(s); read data.path_map for the"
             " {post-tend: restored} pairs and re-check the corpus before"
-            " re-applying.",
+            " re-applying."
         )
+        if data.get("git_cooperated"):
+            # P6 (Slice D): undo restored the FILES and deliberately did
+            # not touch git — the journal is the source of truth, and a
+            # tool that shells out during the recovery path is a recovery
+            # path that can fail twice. The staged renames the tend left in
+            # the index are real leftovers, so the payload says what to do
+            # about them instead of letting someone find them at commit.
+            hint += (
+                " This tend moved through git: the index still STAGES those "
+                "renames (`git reset` unstages them; `git checkout -- .` "
+                "restores any tracked file from HEAD)."
+            )
+        nxt = next_step("status", f"slopkeeper status {root}", hint)
     else:
         nxt = next_step(
             "undo",
@@ -1390,6 +1466,15 @@ def build_parser() -> argparse.ArgumentParser:
         "nearest-neighbour scan runs candidate-blocked, so a large corpus "
         "re-tends instead of refusing with corpus_too_big",
     )
+    sp.add_argument(
+        "--suggest-code-edits",
+        action="store_true",
+        help="propose plan edits for path literals built in code (P6, "
+        "Slice B): join(base, 'sub', 'data') holds no path token, so the "
+        "citation rewrite pass never sees it and the call keeps building "
+        "the old path after a move. Every suggestion is an ordinary edit — "
+        "exactly-once validated, reviewed by you, approved by the human",
+    )
     sp.set_defaults(func=cmd_draft)
 
     sp = sub.add_parser(
@@ -1504,7 +1589,8 @@ def build_parser() -> argparse.ArgumentParser:
     v.add_argument(
         "--out",
         default=None,
-        help="write the validated plan (expanded moves + stragglers) as JSON here",
+        help="write the validated plan (expanded moves, stragglers, "
+        "code_anchor_risks + import_risks) as JSON here",
     )
     v.add_argument(
         "--strict-case",
@@ -1588,6 +1674,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="refuse (plan_dst_case_collision) case-insensitive destination "
         "collisions — for a corpus headed for a mounted case-insensitive volume",
     )
+    sp.add_argument(
+        "--no-auto-undo",
+        action="store_true",
+        help="keep the changes when a plan/folder verify_command fails "
+        "(P6, Slice C). Default: the tend is rolled back through the "
+        "journal and the apply exits 2 with verify_failed — a corpus whose "
+        "own checks do not pass is a corpus that was never touched. Use "
+        "this to debug INSIDE the broken state; the envelope still prints "
+        "the exact undo.",
+    )
+    sp.add_argument(
+        "--no-git",
+        action="store_true",
+        help="skip git cooperation for this tend (P6, Slice D): no `git mv` "
+        "per move, no refusal of sources with uncommitted changes "
+        "(git_dirty). Default on a repo corpus is to cooperate; git is "
+        "probe-based, so a machine without git behaves exactly as before",
+    )
     sp.set_defaults(func=cmd_apply)
 
     sp = sub.add_parser("undo", help="reverse a journal's moves (dry-run default)")
@@ -1666,16 +1770,29 @@ def main(argv=None) -> int:
     try:
         return args.func(args)
     except SlopKeeperError as e:
-        emit_json(
-            {
-                "tool": "slopkeeper",
-                "version": VERSION,
-                "command": getattr(args, "command", ""),
-                "ok": False,
-                "error": e.as_dict(),
-            }
-        )
-        return EXIT_VALIDATION if e.code.startswith("plan_") else EXIT_ERROR
+        err_envelope = {
+            "tool": "slopkeeper",
+            "version": VERSION,
+            "command": getattr(args, "command", ""),
+            "ok": False,
+            "error": e.as_dict(),
+        }
+        if getattr(e, "data", None) is not None:
+            # P6: some failures carry structured data the agent must read,
+            # not just a sentence to parse — a failed verify command's
+            # captured output, the git block of the tend that rolled back.
+            # Same key, same level as the success path's `data`, so an
+            # agent's parser has one shape to know.
+            err_envelope["data"] = e.data
+        emit_json(err_envelope)
+        # Exit 2 is the "the plan/contract was refused, nothing to clean
+        # up" class; `plan_*` is the standing rule, and verify_failed joins
+        # it deliberately (P6, Slice C): the tend was rolled back through
+        # the journal, so the corpus is exactly where it was and the agent
+        # has a plan to fix, not a half-done tend to recover from.
+        if e.code.startswith("plan_") or e.code in VALIDATION_CODES:
+            return EXIT_VALIDATION
+        return EXIT_ERROR
     except Exception as e:  # noqa: BLE001 — the agent needs the envelope even on bugs
         emit_json(
             {
